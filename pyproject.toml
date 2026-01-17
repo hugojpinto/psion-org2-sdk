@@ -1,0 +1,163 @@
+# =============================================================================
+# Psion SDK - Cross-Development Toolchain for Psion Organiser II
+# =============================================================================
+# This is the main project configuration file for the Psion SDK.
+# It defines package metadata, dependencies, and tool configurations.
+#
+# The SDK provides tools to develop machine code programs for the Psion
+# Organiser II series of vintage handheld computers using the HD6303 CPU.
+# =============================================================================
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "psion-sdk"
+version = "1.0.0"
+description = "Cross-development toolchain for Psion Organiser II (HD6303 assembler, OPK builder, serial transfer)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Hugo José Pinto", email = "hugo.pinto@gmail.com" }
+]
+keywords = [
+    "psion",
+    "organiser",
+    "hd6303",
+    "assembler",
+    "retro",
+    "vintage",
+    "cross-compiler",
+    "embedded"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Assemblers",
+    "Topic :: Software Development :: Embedded Systems",
+    "Topic :: System :: Hardware",
+]
+dependencies = [
+    "click>=8.0.0",       # CLI framework
+    "pyserial>=3.5",      # Serial communication (for pslink)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "mypy>=1.0.0",
+    "ruff>=0.1.0",
+]
+
+# =============================================================================
+# CLI Entry Points
+# =============================================================================
+# These define the command-line tools that will be installed with the package:
+#   psasm  - HD6303 assembler (assembly source -> object code)
+#   pscc   - Small-C compiler (C source -> assembly code)
+#   psopk  - OPK builder (object code -> pack image)
+#   pslink - Transfer tool (pack image -> Psion device via serial)
+# =============================================================================
+[project.scripts]
+psasm = "psion_sdk.cli.psasm:main"
+pscc = "psion_sdk.cli.pscc:main"
+psopk = "psion_sdk.cli.psopk:main"
+pslink = "psion_sdk.cli.pslink:main"
+
+[project.urls]
+Homepage = "https://github.com/psion-sdk/psion-sdk"
+Documentation = "https://github.com/psion-sdk/psion-sdk#readme"
+Repository = "https://github.com/psion-sdk/psion-sdk"
+
+# =============================================================================
+# Hatch Build Configuration
+# =============================================================================
+[tool.hatch.build.targets.wheel]
+packages = ["src/psion_sdk"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/include",
+    "/examples",
+    "/tests",
+    "/specs",
+]
+
+# =============================================================================
+# Pytest Configuration
+# =============================================================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+# =============================================================================
+# Mypy Type Checking Configuration
+# =============================================================================
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+strict_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = ["serial.*"]
+ignore_missing_imports = true
+
+# =============================================================================
+# Ruff Linter and Formatter Configuration
+# =============================================================================
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # Pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["psion_sdk"]
+
+# =============================================================================
+# Coverage Configuration
+# =============================================================================
+[tool.coverage.run]
+source = ["src/psion_sdk"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]

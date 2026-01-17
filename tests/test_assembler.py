@@ -1,0 +1,929 @@
+# =============================================================================
+# test_assembler.py - Full Assembler Integration Tests
+# =============================================================================
+# End-to-end integration tests for the complete HD6303 assembler.
+# These tests verify the full pipeline from source code to OB3 output.
+#
+# Test coverage includes:
+#   - Complete program assembly
+#   - Include file processing
+#   - Error reporting with line numbers
+#   - Command-line interface
+#   - Edge cases and boundary conditions
+# =============================================================================
+
+import pytest
+import tempfile
+import os
+from pathlib import Path
+
+from psion_sdk.assembler import Assembler
+from psion_sdk.errors import (
+    AssemblerError,
+    AssemblySyntaxError,
+    UndefinedSymbolError,
+    DuplicateSymbolError,
+    AddressingModeError,
+)
+
+
+# =============================================================================
+# Full Assembly Pipeline Tests
+# =============================================================================
+
+class TestFullPipeline:
+    """Test the complete assembly pipeline from source to OB3."""
+
+    def test_minimal_program(self):
+        """Assemble minimal valid program."""
+        source = "NOP"
+        asm = Assembler()
+        result = asm.assemble(source)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_program_with_org(self):
+        """Assemble program with explicit ORG."""
+        source = """
+            ORG $2100
+            NOP
+            RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        # Verify OB3 header
+        assert result[:3] == b"ORG"
+        # Verify address embedded
+        assert result[5:7] == bytes([0x21, 0x00])
+
+    def test_program_with_labels(self):
+        """Assemble program with multiple labels."""
+        source = """
+            ORG $2100
+START:      LDAA #$00
+            BEQ SKIP
+            INCA
+SKIP:       STAA $50
+END:        RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        assert result is not None
+
+    def test_program_with_data(self):
+        """Assemble program with data section."""
+        source = """
+            ORG $2100
+            LDX #DATA
+            RTS
+
+DATA:       FCB $01,$02,$03
+            FDB $1234
+            FCC "Test"
+            FCB 0
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        assert result is not None
+
+
+# =============================================================================
+# Symbol Table Tests
+# =============================================================================
+
+class TestSymbolTable:
+    """Test symbol table functionality."""
+
+    def test_get_symbol_table(self):
+        """Verify symbol table is accessible after assembly."""
+        source = """
+CONST1  EQU $10
+CONST2  EQU $20
+            ORG $2100
+START:      NOP
+END:        RTS
+        """
+        asm = Assembler()
+        asm.assemble(source)
+
+        symbols = asm.get_symbols()
+        assert "CONST1" in symbols
+        assert "CONST2" in symbols
+        assert "START" in symbols
+        assert "END" in symbols
+        assert symbols["CONST1"] == 0x10
+        assert symbols["CONST2"] == 0x20
+
+    def test_duplicate_label_error(self):
+        """Duplicate label should raise error."""
+        # Note: Assembler wraps specific errors in AssemblerError
+        source = """
+LABEL:      NOP
+LABEL:      RTS
+        """
+        asm = Assembler()
+        with pytest.raises(AssemblerError):
+            asm.assemble(source)
+
+    def test_case_insensitive_symbols(self):
+        """Symbols should be case-insensitive."""
+        source = """
+MyLabel:    NOP
+            JMP MYLABEL
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        assert result is not None
+
+
+# =============================================================================
+# Error Handling Tests
+# =============================================================================
+
+class TestErrorHandling:
+    """Test error handling and reporting."""
+
+    def test_syntax_error_line_number(self):
+        """Syntax errors should include line numbers."""
+        source = """
+            NOP
+            INVALID!!!
+            RTS
+        """
+        asm = Assembler()
+        with pytest.raises(AssemblySyntaxError) as exc_info:
+            asm.assemble(source)
+        # Error should mention line number
+        error_msg = str(exc_info.value)
+        # Line 3 has the error (counting from 1)
+        assert "line" in error_msg.lower() or "3" in error_msg
+
+    def test_undefined_symbol_error(self):
+        """Undefined symbol should raise error."""
+        # Note: Assembler wraps specific errors in AssemblerError
+        source = """
+            LDAA UNDEFINED
+        """
+        asm = Assembler()
+        with pytest.raises(AssemblerError):
+            asm.assemble(source)
+
+    def test_invalid_addressing_mode(self):
+        """Invalid addressing mode should raise error."""
+        source = """
+            NOP #$10    ; NOP doesn't take operand
+        """
+        asm = Assembler()
+        with pytest.raises((AddressingModeError, AssemblySyntaxError)):
+            asm.assemble(source)
+
+
+# =============================================================================
+# Include File Tests
+# =============================================================================
+
+class TestIncludeFiles:
+    """Test INCLUDE directive functionality."""
+
+    def test_include_file(self):
+        """Test including external file."""
+        # Create temporary include file
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.inc', delete=False
+        ) as inc_file:
+            inc_file.write("CONST EQU $42\n")
+            inc_path = inc_file.name
+
+        try:
+            source = f'''
+                INCLUDE "{inc_path}"
+                LDAA #CONST
+            '''
+            asm = Assembler()
+            result = asm.assemble(source)
+            # Should have LDAA #$42
+            code = result[7:]  # Skip OB3 header
+            assert code == bytes([0x86, 0x42])
+        finally:
+            os.unlink(inc_path)
+
+    def test_include_with_search_path(self):
+        """Test include file with search path."""
+        # Create temporary directory with include file
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inc_path = Path(tmpdir) / "test.inc"
+            inc_path.write_text("MYCONST EQU $55\n")
+
+            source = '''
+                INCLUDE "test.inc"
+                LDAA #MYCONST
+            '''
+            asm = Assembler(include_paths=[tmpdir])
+            result = asm.assemble(source)
+            code = result[7:]
+            assert code == bytes([0x86, 0x55])
+
+
+# =============================================================================
+# Listing Output Tests
+# =============================================================================
+
+class TestListingOutput:
+    """Test assembly listing generation."""
+
+    def test_generate_listing(self):
+        """Test listing generation."""
+        source = """
+            ORG $2100
+START:      LDAA #$41
+            RTS
+        """
+        asm = Assembler()
+        asm.assemble(source)
+        listing = asm.get_listing()
+
+        # Listing should contain address, code bytes, and source
+        assert listing is not None
+        assert "2100" in listing or "21 00" in listing.lower()
+        assert "LDAA" in listing.upper()
+
+    def test_listing_shows_addresses(self):
+        """Listing should show correct addresses."""
+        source = """
+            ORG $3000
+            NOP
+            NOP
+        """
+        asm = Assembler()
+        asm.assemble(source)
+        listing = asm.get_listing()
+
+        # Should show addresses starting at $3000
+        assert "3000" in listing
+
+
+# =============================================================================
+# Command-Line Defines Tests
+# =============================================================================
+
+class TestDefines:
+    """Test command-line defines (-D option)."""
+
+    def test_predefined_symbol(self):
+        """Test assembly with predefined symbol."""
+        source = """
+            LDAA #VALUE
+        """
+        asm = Assembler(defines={"VALUE": 0x99})
+        result = asm.assemble(source)
+        code = result[7:]
+        assert code == bytes([0x86, 0x99])
+
+    def test_multiple_defines(self):
+        """Test multiple predefined symbols."""
+        source = """
+            LDAA #VAL1
+            LDAB #VAL2
+        """
+        asm = Assembler(defines={"VAL1": 0x11, "VAL2": 0x22})
+        result = asm.assemble(source)
+        code = result[7:]
+        assert code == bytes([0x86, 0x11, 0xC6, 0x22])
+
+
+# =============================================================================
+# Binary Output Tests
+# =============================================================================
+
+class TestBinaryOutput:
+    """Test raw binary output (without OB3 header)."""
+
+    def test_binary_mode(self):
+        """Test binary output without header."""
+        source = """
+            ORG $2100
+            NOP
+            RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source, output_format='binary')
+        # Binary format should just be the raw bytes
+        assert result == bytes([0x01, 0x39])
+
+
+# =============================================================================
+# Complex Program Tests
+# =============================================================================
+
+class TestComplexPrograms:
+    """Test assembly of complex programs."""
+
+    def test_complete_psion_program(self):
+        """Test complete Psion program structure."""
+        source = """
+; ===========================================
+; Test Program for Psion Organiser II
+; ===========================================
+
+            ORG $2100
+
+; System call numbers
+DP_EMIT     EQU $10
+DP_PRNT     EQU $11
+KB_GETK     EQU $48
+
+; Main entry point
+START:
+            LDX #MESSAGE    ; Load message address
+            LDAA #DP_PRNT   ; Print function
+            SWI             ; Call OS
+
+WAITKEY:
+            LDAA #KB_GETK   ; Get key
+            SWI
+            CMPA #'Q'       ; Check for Q
+            BEQ EXIT
+            BRA WAITKEY
+
+EXIT:
+            RTS
+
+; Data section
+MESSAGE:    FCC "HELLO"
+            FCB 0
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+
+        # Verify it assembled successfully
+        assert result is not None
+        assert len(result) > 10
+
+        # Verify OB3 header
+        assert result[:3] == b"ORG"
+
+    def test_program_with_subroutines(self):
+        """Test program with subroutine calls."""
+        source = """
+            ORG $2100
+
+MAIN:       BSR INIT
+            BSR PROCESS
+            RTS
+
+INIT:       CLRA
+            CLRB
+            RTS
+
+PROCESS:    INCA
+            INCB
+            RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        assert result is not None
+
+    def test_program_with_lookup_table(self):
+        """Test program with lookup table."""
+        source = """
+            ORG $2100
+
+            LDX #TABLE
+            LDAB #3
+            ABX
+            LDAA 0,X
+            RTS
+
+TABLE:      FCB $10,$20,$30,$40,$50
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        assert result is not None
+
+
+# =============================================================================
+# Edge Case Tests
+# =============================================================================
+
+class TestEdgeCases:
+    """Test edge cases and boundary conditions."""
+
+    def test_empty_source(self):
+        """Empty source should produce minimal output."""
+        asm = Assembler()
+        result = asm.assemble("")
+        # Should still produce valid output (possibly just header)
+        assert result is not None
+
+    def test_only_comments(self):
+        """Source with only comments."""
+        source = """
+; This is a comment
+; Another comment
+* Star comment
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        assert result is not None
+
+    def test_very_long_program(self):
+        """Test assembly of large program."""
+        # Generate a program with many NOPs
+        lines = ["ORG $2100"]
+        for i in range(256):
+            lines.append(f"    NOP ; Instruction {i}")
+        lines.append("    RTS")
+
+        source = "\n".join(lines)
+        asm = Assembler()
+        result = asm.assemble(source)
+
+        # Should have 256 NOPs + 1 RTS
+        code = result[7:]
+        assert len(code) == 257
+
+    def test_address_wraparound(self):
+        """Test behavior near address boundaries."""
+        source = """
+            ORG $FFF0
+            NOP
+            NOP
+        """
+        asm = Assembler()
+        # This should assemble (may produce warning about address)
+        result = asm.assemble(source)
+        assert result is not None
+
+    def test_zero_page_boundary(self):
+        """Test direct vs extended addressing at boundary."""
+        source = """
+            LDAA $FF    ; Direct (zero page)
+            LDAA $100   ; Extended (beyond zero page)
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # First should be direct: $96 $FF
+        assert code[0] == 0x96
+        assert code[1] == 0xFF
+
+        # Second should be extended: $B6 $01 $00
+        assert code[2] == 0xB6
+        assert code[3] == 0x01
+        assert code[4] == 0x00
+
+
+# =============================================================================
+# File I/O Tests
+# =============================================================================
+
+class TestFileIO:
+    """Test file input/output operations."""
+
+    def test_assemble_from_file(self):
+        """Test assembling from a file."""
+        source = """
+            ORG $2100
+            NOP
+            RTS
+        """
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.asm', delete=False
+        ) as src_file:
+            src_file.write(source)
+            src_path = src_file.name
+
+        try:
+            asm = Assembler()
+            result = asm.assemble_file(src_path)
+            assert result is not None
+        finally:
+            os.unlink(src_path)
+
+    def test_write_output_file(self):
+        """Test writing output to file."""
+        source = """
+            ORG $2100
+            NOP
+        """
+        with tempfile.NamedTemporaryFile(
+            mode='wb', suffix='.ob3', delete=False
+        ) as out_file:
+            out_path = out_file.name
+
+        try:
+            asm = Assembler()
+            asm.assemble(source, output_path=out_path)
+
+            # Verify file was written
+            assert os.path.exists(out_path)
+            with open(out_path, 'rb') as f:
+                data = f.read()
+            assert data[:3] == b"ORG"
+        finally:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+
+
+# =============================================================================
+# Psion-Specific Integration Tests
+# =============================================================================
+
+class TestPsionIntegration:
+    """Tests specific to Psion Organiser II programs."""
+
+    def test_syscall_pattern(self):
+        """Test common syscall invocation pattern."""
+        source = """
+DP_EMIT EQU $10
+
+            LDAA #'A'
+            LDAB #DP_EMIT
+            SWI
+            RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # LDAA #'A' = $86 $41
+        assert code[0:2] == bytes([0x86, ord('A')])
+        # LDAB #$10 = $C6 $10
+        assert code[2:4] == bytes([0xC6, 0x10])
+        # SWI = $3F
+        assert code[4] == 0x3F
+        # RTS = $39
+        assert code[5] == 0x39
+
+    def test_display_buffer_access(self):
+        """Test accessing display buffer."""
+        source = """
+DISP_BUF    EQU $2000
+
+            LDX #DISP_BUF
+            LDAA #' '
+            STAA 0,X
+            RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        assert result is not None
+
+    def test_keyboard_polling_loop(self):
+        """Test keyboard polling loop pattern."""
+        source = """
+KB_TEST     EQU $4B
+KB_GETK     EQU $48
+
+POLL:       LDAA #KB_TEST
+            SWI
+            BCC POLL        ; Loop while no key
+            LDAA #KB_GETK
+            SWI             ; Get the key
+            RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        assert result is not None
+
+
+# =============================================================================
+# Forward Reference Tests
+# =============================================================================
+
+class TestForwardReferences:
+    """Test forward reference handling in two-pass assembly."""
+
+    def test_jsr_forward_reference_uses_extended_mode(self):
+        """JSR to forward-declared label should use extended mode consistently.
+
+        This tests a bug fix where pass 1 would assume extended mode (3 bytes)
+        for JSR to unknown labels, but pass 2 would use direct mode (2 bytes)
+        if the resolved address was <= $FF, causing symbol address mismatches.
+        """
+        source = """
+_entry:     BSR     _main
+            RTS
+_main:      JSR     _func
+            RTS
+_func:      LDAA    #$0C
+            RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        symbols = asm.get_symbols()
+        code = result[7:]  # Skip OB3 header
+
+        # Entry: BSR _main (2 bytes) + RTS (1 byte) = $0000-$0002
+        # _main at $0003: JSR _func (3 bytes for extended) + RTS (1 byte) = $0003-$0006
+        # _func at $0007: LDAA #$0C (2 bytes) + RTS (1 byte) = $0007-$0009
+
+        # Verify _func symbol points to where LDAA actually is
+        assert symbols['_FUNC'] == 0x07, f"_FUNC should be at $0007, got ${symbols['_FUNC']:04X}"
+
+        # Verify the JSR uses extended mode (opcode $BD) not direct mode ($9D)
+        # JSR is at offset 3 in the code (after BSR + RTS)
+        assert code[3] == 0xBD, f"JSR should use extended mode ($BD), got ${code[3]:02X}"
+
+        # Verify JSR target address matches _func symbol
+        jsr_target = (code[4] << 8) | code[5]
+        assert jsr_target == symbols['_FUNC'], \
+            f"JSR target ${jsr_target:04X} should match _FUNC ${symbols['_FUNC']:04X}"
+
+    def test_multiple_forward_references(self):
+        """Multiple JSRs to forward-declared labels should all use extended mode."""
+        source = """
+_start:     JSR     _func1
+            JSR     _func2
+            JSR     _func3
+            RTS
+_func1:     NOP
+            RTS
+_func2:     NOP
+            RTS
+_func3:     NOP
+            RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        symbols = asm.get_symbols()
+        code = result[7:]  # Skip OB3 header
+
+        # Each JSR should be 3 bytes (extended mode)
+        # _start: 3x JSR (9 bytes) + RTS (1 byte) = 10 bytes
+        # _func1 at $000A, _func2 at $000C, _func3 at $000E
+
+        assert symbols['_FUNC1'] == 0x0A, f"_FUNC1 should be at $000A"
+        assert symbols['_FUNC2'] == 0x0C, f"_FUNC2 should be at $000C"
+        assert symbols['_FUNC3'] == 0x0E, f"_FUNC3 should be at $000E"
+
+        # All JSRs should use extended mode ($BD)
+        assert code[0] == 0xBD, "First JSR should use extended mode"
+        assert code[3] == 0xBD, "Second JSR should use extended mode"
+        assert code[6] == 0xBD, "Third JSR should use extended mode"
+
+    def test_cpd_instruction_rejected(self):
+        """CPD instruction is NOT valid HD6303 - it's 68HC11 only.
+
+        The assembler must reject CPD as an unknown instruction. Users should
+        use SUBD instead, which sets identical flags (N, Z, V, C) for comparisons.
+        For SUBD #0, D is unchanged (D-0=D) while flags are set correctly.
+        """
+        source = """
+_start:     LDD     #1
+            CPD     #0          ; This should fail - CPD is not HD6303
+        """
+        asm = Assembler()
+
+        with pytest.raises(AssemblerError) as excinfo:
+            asm.assemble(source)
+
+        # Verify the error mentions CPD or unknown instruction
+        error_msg = str(excinfo.value).lower()
+        assert 'cpd' in error_msg or 'unknown' in error_msg or 'invalid' in error_msg, \
+            f"Error should mention CPD or unknown instruction, got: {excinfo.value}"
+
+    def test_subd_as_cpd_replacement(self):
+        """SUBD can be used as CPD replacement for comparisons.
+
+        SUBD sets identical condition flags as CPD (which is 68HC11-only).
+        For SUBD #0, D is unchanged because D - 0 = D, making it perfect
+        for boolean tests. SUBD is also more compact: 3 bytes for immediate
+        vs 4 bytes that CPD would have needed.
+        """
+        source = """
+_start:     LDD     #1          ; 3 bytes: CC 00 01
+            SUBD    #0          ; 3 bytes: 83 00 00 (sets Z if D==0)
+            BNE     _skip       ; 2 bytes
+_skip:      SUBD    0,X         ; 2 bytes: A3 00 (sets Z if D==mem)
+            BEQ     _end        ; 2 bytes
+_end:       RTS                 ; 1 byte
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        symbols = asm.get_symbols()
+        code = result[7:]  # Skip OB3 header
+
+        # _start at $0000
+        # LDD #1: 3 bytes ($0000-$0002)
+        # SUBD #0: 3 bytes ($0003-$0005)
+        # BNE _skip: 2 bytes ($0006-$0007)
+        # _skip at $0008
+        # SUBD 0,X: 2 bytes ($0008-$0009)
+        # BEQ _end: 2 bytes ($000A-$000B)
+        # _end at $000C
+        # RTS: 1 byte ($000C)
+
+        assert symbols['_START'] == 0x00, f"_START should be at $0000"
+        assert symbols['_SKIP'] == 0x08, f"_SKIP should be at $0008, got ${symbols['_SKIP']:04X}"
+        assert symbols['_END'] == 0x0C, f"_END should be at $000C, got ${symbols['_END']:04X}"
+
+        # Verify SUBD immediate generates 3 bytes (no prefix)
+        # At offset 3: should be 83 00 00
+        assert code[3] == 0x83, f"SUBD immediate opcode should be $83, got ${code[3]:02X}"
+        assert code[4] == 0x00, f"SUBD immediate high byte should be $00"
+        assert code[5] == 0x00, f"SUBD immediate low byte should be $00"
+
+        # Verify SUBD indexed generates 2 bytes (no prefix)
+        # At offset 8 (_skip): should be A3 00
+        assert code[8] == 0xA3, f"SUBD indexed opcode should be $A3, got ${code[8]:02X}"
+        assert code[9] == 0x00, f"SUBD indexed offset should be $00"
+
+    def test_jmp_no_direct_mode(self):
+        """JMP instruction only supports extended mode, not direct mode.
+
+        Even when target address is <= $FF, JMP must use extended mode (3 bytes)
+        because the HD6303 JMP instruction doesn't have a direct addressing mode.
+        Pass 1 must correctly calculate 3 bytes for JMP to avoid symbol mismatches.
+        """
+        source = """
+_target:    NOP
+            JMP     _target     ; backward ref to $0000, but JMP has no direct mode
+_after:     RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        symbols = asm.get_symbols()
+        code = result[7:]  # Skip OB3 header
+
+        # _target at $0000: NOP (1 byte)
+        # JMP at $0001: 3 bytes (extended only: 7E 00 00)
+        # _after at $0004: RTS (1 byte)
+
+        assert symbols['_TARGET'] == 0x00, f"_TARGET should be at $0000"
+        assert symbols['_AFTER'] == 0x04, f"_AFTER should be at $0004, got ${symbols['_AFTER']:04X}"
+
+        # Verify JMP uses extended mode (opcode $7E) with 2-byte address
+        assert code[1] == 0x7E, f"JMP opcode should be $7E (extended), got ${code[1]:02X}"
+        assert code[2] == 0x00 and code[3] == 0x00, "JMP target should be $0000"
+
+
+# =============================================================================
+# Model Support Tests
+# =============================================================================
+
+class TestModelSupport:
+    """Tests for target model support in assembler."""
+
+    def test_default_model_is_xp(self):
+        """Default target model should be XP."""
+        asm = Assembler()
+        assert asm.get_target_model() == "XP"
+        symbols = asm._codegen._symbols
+        assert "__MODEL__" in symbols
+        assert "__PSION_XP__" in symbols
+        assert "__PSION_2LINE__" in symbols
+        assert symbols["DISP_ROWS"].value == 2
+        assert symbols["DISP_COLS"].value == 16
+
+    def test_cli_model_lz(self):
+        """CLI model LZ should set 4-line display symbols."""
+        asm = Assembler(target_model="LZ")
+        assert asm.get_target_model() == "LZ"
+        symbols = asm._codegen._symbols
+        assert "__PSION_LZ__" in symbols
+        assert "__PSION_4LINE__" in symbols
+        assert symbols["DISP_ROWS"].value == 4
+        assert symbols["DISP_COLS"].value == 20
+
+    def test_cli_model_lz64(self):
+        """CLI model LZ64 should set 4-line display symbols."""
+        asm = Assembler(target_model="LZ64")
+        assert asm.get_target_model() == "LZ64"
+        symbols = asm._codegen._symbols
+        assert "__PSION_LZ64__" in symbols
+        assert "__PSION_4LINE__" in symbols
+        assert symbols["DISP_ROWS"].value == 4
+
+    def test_cli_model_cm(self):
+        """CLI model CM should set 2-line display symbols."""
+        asm = Assembler(target_model="CM")
+        assert asm.get_target_model() == "CM"
+        symbols = asm._codegen._symbols
+        assert "__PSION_CM__" in symbols
+        assert "__PSION_2LINE__" in symbols
+        assert symbols["DISP_ROWS"].value == 2
+
+    def test_model_directive(self):
+        """.MODEL directive should set model symbols."""
+        asm = Assembler()
+        source = """
+            .MODEL LZ64
+            ORG $8000
+            NOP
+            END
+        """
+        asm.assemble_string(source)
+        symbols = asm._codegen._symbols
+        assert "__PSION_LZ64__" in symbols
+        assert "__PSION_4LINE__" in symbols
+        assert symbols["DISP_ROWS"].value == 4
+
+    def test_cli_overrides_model_directive(self):
+        """CLI model should override .MODEL directive."""
+        asm = Assembler(target_model="CM")
+        source = """
+            .MODEL LZ
+            ORG $8000
+            NOP
+            END
+        """
+        asm.assemble_string(source)
+        # CLI takes precedence
+        symbols = asm._codegen._symbols
+        assert "__PSION_CM__" in symbols
+        assert "__PSION_2LINE__" in symbols
+        assert symbols["DISP_ROWS"].value == 2
+
+    def test_dot_prefixed_model_directive(self):
+        """.MODEL with dot prefix should work."""
+        asm = Assembler()
+        source = """
+            .MODEL LA
+            ORG $8000
+            NOP
+            END
+        """
+        asm.assemble_string(source)
+        symbols = asm._codegen._symbols
+        assert "__PSION_LA__" in symbols
+
+    def test_model_without_dot_prefix(self):
+        """MODEL without dot prefix should also work."""
+        asm = Assembler()
+        source = """
+            MODEL LZ
+            ORG $8000
+            NOP
+            END
+        """
+        asm.assemble_string(source)
+        symbols = asm._codegen._symbols
+        assert "__PSION_LZ__" in symbols
+
+    def test_conditional_assembly_with_model(self):
+        """Conditional assembly should work with model symbols."""
+        asm = Assembler(target_model="LZ")
+        source = """
+            ORG $8000
+            #IFDEF __PSION_4LINE__
+                LDAA #4
+            #ELSE
+                LDAA #2
+            #ENDIF
+            END
+        """
+        asm.assemble_string(source)
+        code = asm.get_code()
+        # LDAA #4 is opcode 86 04
+        assert code[0] == 0x86
+        assert code[1] == 0x04
+
+    def test_conditional_assembly_with_2line_model(self):
+        """Conditional assembly should select 2-line code for CM."""
+        asm = Assembler(target_model="CM")
+        source = """
+            ORG $8000
+            #IFDEF __PSION_4LINE__
+                LDAA #4
+            #ELSE
+                LDAA #2
+            #ENDIF
+            END
+        """
+        asm.assemble_string(source)
+        code = asm.get_code()
+        # LDAA #2 is opcode 86 02
+        assert code[0] == 0x86
+        assert code[1] == 0x02
+
+    def test_disp_rows_in_code(self):
+        """DISP_ROWS symbol should be usable in code."""
+        asm = Assembler(target_model="LZ")
+        source = """
+            ORG $8000
+            LDAA #DISP_ROWS
+            END
+        """
+        asm.assemble_string(source)
+        code = asm.get_code()
+        # LDAA #4 (DISP_ROWS for LZ)
+        assert code[0] == 0x86
+        assert code[1] == 0x04
+
+    def test_model_case_insensitive(self):
+        """Model names should be case-insensitive."""
+        asm = Assembler(target_model="lz")
+        assert asm.get_target_model() == "LZ"
+
+        asm2 = Assembler()
+        source = """
+            .model lz64
+            ORG $8000
+            NOP
+            END
+        """
+        asm2.assemble_string(source)
+        symbols = asm2._codegen._symbols
+        assert "__PSION_LZ64__" in symbols

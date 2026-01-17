@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Build artifacts
+*.ob3
+*.opk
+
+# Temporary test files (keep in /tmp)
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local development
+*.local
+.env
+
+# Temporary/scratch directories
+trash/
+
+# Forum post draft
+FORUM_POST.txt
+
+# Claude Code local settings (contains machine-specific paths)
+.claude/
