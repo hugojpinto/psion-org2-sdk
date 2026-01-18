@@ -234,6 +234,12 @@ class CodeGenerator(ASTVisitor):
         # Switch context
         self._switch_stack: list[str] = []  # break label for switch
 
+        # External OPL procedure declarations
+        # These are procedures declared with 'external' keyword that exist in
+        # OPL code on the device. Calls to these are transformed into QCode
+        # injection sequences at runtime.
+        self._external_funcs: set[str] = set()
+
     def generate(self, program: ProgramNode) -> str:
         """
         Generate assembly code from AST.
@@ -248,14 +254,19 @@ class CodeGenerator(ASTVisitor):
         self._globals = {}
         self._strings = []
         self._label_counter = 0
+        self._external_funcs = set()
 
         # Emit header (includes)
         self._emit_header()
 
-        # First pass: collect global variables
+        # First pass: collect global variables and external function declarations
         for decl in program.declarations:
             if isinstance(decl, VariableDeclaration) and decl.is_global:
                 self._add_global(decl)
+            elif isinstance(decl, FunctionNode) and decl.is_external:
+                # Track external OPL procedure declarations
+                # These will be called via QCode injection at runtime
+                self._external_funcs.add(decl.name)
 
         # Emit startup code - must be first executable code
         # Uses BSR (relative branch) so _main must follow immediately
@@ -517,6 +528,29 @@ class CodeGenerator(ASTVisitor):
 
         # Emit function label
         self._emit_label(f"_{func.name}")
+
+        # =====================================================================
+        # External OPL Support: Inject setup code at start of main()
+        # =====================================================================
+        # If any external OPL procedures are declared, we need to call
+        # _call_opl_setup at the VERY START of main(), BEFORE any stack
+        # modifications (local allocation, PSHX, etc.).
+        #
+        # This captures the "USR entry SP" which is used later to unwind
+        # the stack when calling external OPL procedures. The setup function
+        # calculates SP + 4 to point to the return address that leads back
+        # to the OPL interpreter.
+        #
+        # CRITICAL: This MUST be the first instruction in main(), before
+        # any local variables are allocated or frame pointer is saved.
+        # Otherwise the captured SP will be wrong and stack unwinding will
+        # fail catastrophically.
+        #
+        # Reference: dev_docs/PROCEDURE_CALL_RESEARCH.md
+        if func.name == "main" and self._external_funcs:
+            self._emit_comment("Initialize external OPL call support")
+            self._emit_comment("MUST be first - captures USR entry SP before any stack changes")
+            self._emit_instruction("JSR", "_call_opl_setup")
 
         # Function prologue - NEW LAYOUT for HD6303
         # Allocate locals FIRST, THEN save X, so locals are at positive offsets
@@ -1304,7 +1338,56 @@ class CodeGenerator(ASTVisitor):
             self._emit_instruction("STD", "0,X")
 
     def _generate_call(self, expr: CallExpression) -> None:
-        """Generate code for function call."""
+        """
+        Generate code for function call.
+
+        For regular C functions:
+        - Push arguments right-to-left
+        - JSR to the function
+        - Clean up stack after return
+
+        For external OPL procedures:
+        - No arguments (enforced by parser)
+        - Load procedure name string address into D
+        - Call _call_opl which handles QCode injection and resumption
+        - D register returns 0 (standard USR return)
+        """
+        # =====================================================================
+        # Check for external OPL procedure call
+        # =====================================================================
+        # External procedures are called via QCode injection. The _call_opl
+        # runtime function builds a synthetic QCode buffer containing:
+        #   1. The procedure call (e.g., "azMENU:")
+        #   2. USR(restore_address, saved_SP)
+        # It then unwinds the stack and exits to the OPL interpreter, which
+        # executes the buffer, calls the OPL procedure, then calls USR() to
+        # resume C execution.
+        if expr.function_name in self._external_funcs:
+            # Verify no arguments (should be enforced by parser, but double-check)
+            if expr.arguments:
+                raise CCodeGenError(
+                    f"external procedure '{expr.function_name}' cannot have arguments",
+                    expr.location,
+                )
+
+            # Create a string literal for the procedure name
+            # This will be used by _call_opl to build the QCode buffer
+            proc_name_label = self._new_label("_PROC")
+            self._strings.append((proc_name_label, expr.function_name))
+
+            self._emit_comment(f"Call external OPL procedure: {expr.function_name}")
+            # Load address of procedure name string into D
+            self._emit_instruction("LDD", f"#{proc_name_label}")
+            # Call the OPL invocation runtime
+            # This will unwind stack, call the OPL procedure, and resume here
+            self._emit_instruction("JSR", "_call_opl")
+            # D register now contains 0 (USR return value, discarded)
+            # Execution resumes here after OPL procedure completes
+            return
+
+        # =====================================================================
+        # Regular C function call
+        # =====================================================================
         # Push arguments right-to-left
         for arg in reversed(expr.arguments):
             self._generate_expression(arg)

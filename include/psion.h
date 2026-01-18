@@ -520,4 +520,123 @@ int max(int a, int b);
  */
 void exit(void);
 
+/* =============================================================================
+ * OPL Interoperability - The 'external' Keyword
+ * =============================================================================
+ *
+ * The 'external' keyword enables Small-C code to call OPL procedures that
+ * exist on the Psion device. This is the RECOMMENDED way to call OPL code.
+ *
+ * SYNTAX
+ * ------
+ *   external void procedureName();
+ *
+ * CONSTRAINTS
+ * -----------
+ *   - Return type MUST be void (OPL procedures don't return values to C)
+ *   - Parameters MUST be empty (use global variables for data exchange)
+ *   - Procedure name MUST be <= 8 characters (Psion identifier limit)
+ *
+ * EXAMPLE
+ * -------
+ *   // Declare external OPL procedures at file scope
+ *   external void azMENU();
+ *   external void azHELP();
+ *
+ *   void main() {
+ *       int score = 100;      // Local variables work normally
+ *
+ *       azMENU();             // Call looks like a normal C function!
+ *
+ *       // Execution resumes here after OPL procedure returns
+ *       // score is STILL 100! (local variables preserved)
+ *       print_int(score);
+ *
+ *       azHELP();             // Can call multiple external procedures
+ *   }
+ *
+ * HOW IT WORKS
+ * ------------
+ *   Under the hood, the compiler:
+ *   1. Injects setup code at the start of main() (transparent to user)
+ *   2. Transforms external calls into QCode injection sequences
+ *   3. The OPL interpreter runs the procedure and returns control to C
+ *   4. Stack is automatically preserved across the call
+ *
+ * DATA EXCHANGE
+ * -------------
+ *   Since external procedures cannot take parameters or return values,
+ *   use global variables for data exchange between C and OPL:
+ *
+ *   int g_score;              // Global variable for data exchange
+ *
+ *   external void azSCORE();  // OPL procedure reads g_score
+ *
+ *   void main() {
+ *       g_score = 42;         // Set before calling OPL
+ *       azSCORE();            // OPL reads g_score via PEEKW/POKEW
+ *   }
+ *
+ * PORTABILITY
+ * -----------
+ *   This feature is fully portable across all Psion II models:
+ *   CM, XP, LA, LZ, LZ64, and P350.
+ *
+ * Reference: dev_docs/PROCEDURE_CALL_RESEARCH.md
+ */
+
+/* =============================================================================
+ * Legacy OPL Functions (for advanced users)
+ * =============================================================================
+ * These functions provide low-level access to OPL procedure calling.
+ * For most users, the 'external' keyword above is RECOMMENDED instead.
+ */
+
+/*
+ * _call_opl_setup - Initialize call_opl support
+ *
+ * NOTE: When using the 'external' keyword, this is called AUTOMATICALLY
+ * by compiler-injected code. You do NOT need to call it manually!
+ *
+ * For legacy code using call_opl() directly, this function MUST be called
+ * as the very first statement in main(), BEFORE any local variables.
+ *
+ * Example (legacy usage):
+ *   void main() {
+ *       _call_opl_setup();  // MUST be first, before locals!
+ *       int x;              // Locals AFTER setup
+ *       call_opl("azMENU"); // Manual call_opl() invocation
+ *   }
+ */
+void _call_opl_setup(void);
+
+/*
+ * call_opl - Call an OPL procedure from C code (legacy interface)
+ *
+ * NOTE: For new code, use the 'external' keyword instead:
+ *   external void azMENU();
+ *   azMENU();  // Much cleaner syntax!
+ *
+ * This function calls an external OPL procedure by name. After the
+ * procedure completes, execution resumes at the next statement.
+ * LOCAL VARIABLES ARE PRESERVED across the call.
+ *
+ * Parameters:
+ *   name - Name of OPL procedure to call (max 8 characters)
+ *
+ * REQUIREMENTS:
+ *   - _call_opl_setup() MUST be called first in main(), BEFORE locals!
+ *   - Maximum procedure name length: 8 characters
+ *   - Uses default device (A:) for procedure lookup
+ *
+ * Example (legacy usage):
+ *   void main() {
+ *       _call_opl_setup();   // Required - MUST be first!
+ *       int score = 42;
+ *       call_opl("azMENU");  // Manual invocation
+ *       print_int(score);    // score is still 42!
+ *   }
+ */
+void call_opl(char *name);
+
 #endif /* _PSION_H */

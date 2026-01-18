@@ -116,7 +116,7 @@ from .breakpoints import (
     BreakpointManager,
     BreakEvent,
     BreakReason,
-    RegisterCondition,
+    Condition,
 )
 
 # Model configurations
@@ -183,7 +183,7 @@ __all__ = [
     "BreakpointManager",
     "BreakEvent",
     "BreakReason",
-    "RegisterCondition",
+    "Condition",
 
     # Models
     "PsionModel",

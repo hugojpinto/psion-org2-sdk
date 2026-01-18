@@ -283,6 +283,7 @@ class CParser:
                 CTokenType.INT,
                 CTokenType.CHAR,
                 CTokenType.VOID,
+                CTokenType.EXTERNAL,  # External OPL procedure declarations
             ):
                 if self._peek().type == CTokenType.SEMICOLON:
                     self._advance()  # consume the semicolon
@@ -296,12 +297,30 @@ class CParser:
 
     def _parse_top_level_declaration(self):
         """
-        Parse a top-level declaration (function or global variable).
+        Parse a top-level declaration (function, global variable, or external).
 
         Returns:
-            FunctionNode for functions, or list[VariableDeclaration] for
-            global variables (supports multi-variable declarations).
+            FunctionNode for functions (including external OPL declarations),
+            or list[VariableDeclaration] for global variables.
+
+        External declarations have the form:
+            external void procedureName();
+
+        Constraints for external declarations:
+        - Must have void return type (OPL procedures don't return values to C)
+        - Must have no parameters (OPL calling convention is different)
+        - Procedure name must be <= 8 characters (Psion limit)
+        - No body (declaration only, implemented in OPL)
         """
+        # =====================================================================
+        # Check for 'external' keyword - OPL procedure declaration
+        # =====================================================================
+        # External declarations allow C code to call OPL procedures.
+        # At runtime, calls to external functions are transformed into
+        # QCode injection sequences that invoke the OPL interpreter.
+        if self._match(CTokenType.EXTERNAL):
+            return self._parse_external_declaration()
+
         # Parse type specifiers
         type_info = self._parse_type_specifier()
         if type_info is None:
@@ -357,6 +376,123 @@ class CParser:
             return parse_type_specifiers(specifiers)
         except ValueError as e:
             raise CSyntaxError(str(e), self._peek().location)
+
+    def _parse_external_declaration(self) -> FunctionNode:
+        """
+        Parse an external OPL procedure declaration.
+
+        Syntax:
+            external void procedureName();
+
+        External declarations allow Small-C code to call OPL procedures that
+        exist in the Psion's installed OPL programs. At runtime, the compiler
+        generates QCode injection sequences to invoke the OPL interpreter.
+
+        Constraints:
+        - Return type MUST be void (OPL procedures don't return values to C)
+        - Parameters MUST be empty (OPL calling convention is incompatible)
+        - Procedure name MUST be <= 8 characters (Psion filesystem limit)
+        - No function body (this is a declaration, not a definition)
+
+        The generated code will:
+        1. Build a QCode buffer containing the procedure call
+        2. Unwind the C stack to the USR entry point
+        3. Execute the QCode (which calls the OPL procedure)
+        4. Resume C execution after the call
+
+        Reference: dev_docs/PROCEDURE_CALL_RESEARCH.md
+
+        Returns:
+            FunctionNode with is_external=True
+
+        Raises:
+            CSyntaxError: If the declaration violates external constraints
+        """
+        location = self._peek().location
+
+        # =====================================================================
+        # Parse and validate return type - MUST be void
+        # =====================================================================
+        # OPL procedures don't return values to C code. The USR() function
+        # returns a fixed value (0) which is discarded. Any data exchange
+        # between C and OPL must happen through global variables.
+        type_info = self._parse_type_specifier()
+        if type_info is None:
+            raise CSyntaxError(
+                "external declaration requires 'void' return type",
+                self._peek().location,
+                hint="external void procedureName();",
+            )
+
+        base_type, is_unsigned = type_info
+
+        # Validate that the return type is void
+        if base_type != BaseType.VOID:
+            raise CSyntaxError(
+                f"external procedures must have void return type, not '{base_type.name.lower()}'",
+                location,
+                hint="OPL procedures cannot return values to C code; use 'external void'",
+            )
+
+        # =====================================================================
+        # Parse procedure name
+        # =====================================================================
+        name_token = self._expect(CTokenType.IDENTIFIER, "procedure name")
+        name = name_token.value
+
+        # Validate name length (Psion filesystem limit)
+        # OPL procedure names are stored as 8-character filenames
+        if len(name) > 8:
+            raise CSyntaxError(
+                f"external procedure name '{name}' exceeds 8 character limit",
+                name_token.location,
+                hint="Psion procedure names are limited to 8 characters",
+            )
+
+        # =====================================================================
+        # Parse parameter list - MUST be empty
+        # =====================================================================
+        # OPL and C have incompatible calling conventions. OPL procedures
+        # receive parameters through global variables, not the stack.
+        # We require empty parentheses for syntactic consistency.
+        self._expect(CTokenType.LPAREN, "'('")
+
+        # Check for non-empty parameter list
+        if not self._check(CTokenType.RPAREN):
+            # Allow explicit void: external void foo(void);
+            if self._check(CTokenType.VOID) and self._peek(1).type == CTokenType.RPAREN:
+                self._advance()  # consume void
+            else:
+                raise CSyntaxError(
+                    "external procedures cannot have parameters",
+                    self._peek().location,
+                    hint="OPL uses global variables for data exchange, not parameters",
+                )
+
+        self._expect(CTokenType.RPAREN, "')'")
+
+        # =====================================================================
+        # Expect semicolon - external declarations have no body
+        # =====================================================================
+        # The actual implementation exists in OPL code on the device.
+        # This declaration just tells the C compiler that this name
+        # refers to an external OPL procedure.
+        self._expect(CTokenType.SEMICOLON, "';'")
+
+        # =====================================================================
+        # Create and return the FunctionNode
+        # =====================================================================
+        # The is_external flag tells the code generator to emit QCode
+        # injection sequences instead of normal JSR instructions.
+        return FunctionNode(
+            location=location,
+            name=name,
+            return_type=TYPE_VOID,
+            parameters=[],
+            body=None,
+            is_forward_decl=False,  # Not a forward decl - it's an external decl
+            is_external=True,
+        )
 
     def _parse_function(
         self,

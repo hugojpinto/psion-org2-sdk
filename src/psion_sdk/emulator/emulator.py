@@ -39,7 +39,7 @@ from .memory import Memory
 from .display import Display
 from .keyboard import Keyboard
 from .pack import Pack
-from .breakpoints import BreakpointManager, BreakEvent, BreakReason, RegisterCondition
+from .breakpoints import BreakpointManager, BreakEvent, BreakReason, Condition
 from .models import PsionModel, get_model, get_rom_path
 
 
@@ -149,6 +149,10 @@ class Emulator:
         # We wrap to pass CPU reference to breakpoints.check_instruction(cpu, pc, opcode)
         self.cpu.on_instruction = self._instruction_hook
 
+        # Connect memory hooks to breakpoint manager for watchpoints
+        self.cpu.on_memory_read = self._memory_read_hook
+        self.cpu.on_memory_write = self._memory_write_hook
+
         # State tracking
         self._is_running = False
         self._total_cycles = 0
@@ -167,6 +171,36 @@ class Emulator:
             True to continue execution, False to stop (breakpoint hit)
         """
         return self.breakpoints.check_instruction(self.cpu, pc, opcode)
+
+    def _memory_read_hook(self, address: int, value: int) -> bool:
+        """
+        Internal hook called on memory read.
+
+        This connects memory reads to the breakpoint manager for watchpoints.
+
+        Args:
+            address: Memory address being read
+            value: Value read from memory
+
+        Returns:
+            True to continue execution, False to stop (watchpoint hit)
+        """
+        return self.breakpoints.check_memory_read(self.cpu, address, value)
+
+    def _memory_write_hook(self, address: int, value: int) -> bool:
+        """
+        Internal hook called on memory write.
+
+        This connects memory writes to the breakpoint manager for watchpoints.
+
+        Args:
+            address: Memory address being written
+            value: Value being written
+
+        Returns:
+            True to continue execution, False to stop (watchpoint hit)
+        """
+        return self.breakpoints.check_memory_write(self.cpu, address, value)
 
     # =========================================================================
     # Program Loading
@@ -462,7 +496,7 @@ class Emulator:
             >>> cond_id = emu.add_condition('a', '==', 0)
         """
         return self.breakpoints.add_register_condition(
-            RegisterCondition(register, operator, value)
+            Condition(register, operator, value)
         )
 
     def clear_breakpoints(self) -> None:

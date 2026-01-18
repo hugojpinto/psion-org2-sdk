@@ -692,9 +692,45 @@ class MCPServer:
         )
 
         self._register_tool(
+            "search_memory",
+            tools.search_memory,
+            "Search for byte pattern in emulator memory",
+            {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID"
+                    },
+                    "pattern": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Bytes to search for (0-255 each)"
+                    },
+                    "start": {
+                        "type": "integer",
+                        "description": "Start address (default: 0)",
+                        "default": 0
+                    },
+                    "end": {
+                        "type": "integer",
+                        "description": "End address (default: 65535)",
+                        "default": 65535
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum matches to return (default: 20)",
+                        "default": 20
+                    }
+                },
+                "required": ["session_id", "pattern"]
+            }
+        )
+
+        self._register_tool(
             "set_breakpoint",
             tools.set_breakpoint,
-            "Set a breakpoint at an address",
+            "Set a breakpoint or watchpoint with optional condition",
             {
                 "type": "object",
                 "properties": {
@@ -704,13 +740,26 @@ class MCPServer:
                     },
                     "address": {
                         "type": "integer",
-                        "description": "Address for breakpoint (0-65535)"
+                        "description": "Memory address (0-65535)"
                     },
                     "type": {
                         "type": "string",
                         "enum": ["pc", "read", "write"],
-                        "description": "Breakpoint type: pc, read, or write",
+                        "description": "Type: pc (default), read, or write",
                         "default": "pc"
+                    },
+                    "when_register": {
+                        "type": "string",
+                        "description": "Optional condition register: a, b, d, x, sp, pc, flag_c, flag_v, flag_z, flag_n"
+                    },
+                    "when_op": {
+                        "type": "string",
+                        "enum": ["==", "!=", "<", "<=", ">", ">=", "&"],
+                        "description": "Optional condition operator (& is bitwise AND test)"
+                    },
+                    "when_value": {
+                        "type": "integer",
+                        "description": "Optional condition value"
                     }
                 },
                 "required": ["session_id", "address"]
@@ -720,7 +769,7 @@ class MCPServer:
         self._register_tool(
             "remove_breakpoint",
             tools.remove_breakpoint,
-            "Remove a breakpoint",
+            "Remove a breakpoint or watchpoint at an address",
             {
                 "type": "object",
                 "properties": {
@@ -730,10 +779,32 @@ class MCPServer:
                     },
                     "address": {
                         "type": "integer",
-                        "description": "Address of breakpoint to remove"
+                        "description": "Memory address (0-65535)"
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["all", "pc", "read", "write"],
+                        "description": "What to remove: all (default), pc, read, or write",
+                        "default": "all"
                     }
                 },
                 "required": ["session_id", "address"]
+            }
+        )
+
+        self._register_tool(
+            "list_breakpoints",
+            tools.list_breakpoints,
+            "List all active breakpoints, watchpoints, and register conditions",
+            {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID"
+                    }
+                },
+                "required": ["session_id"]
             }
         )
 

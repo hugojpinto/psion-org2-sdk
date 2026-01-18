@@ -2,7 +2,7 @@
 Breakpoint System Unit Tests
 ============================
 
-Tests for breakpoints, watchpoints, register conditions, and syscall hooks.
+Tests for breakpoints, watchpoints with optional conditions, and syscall hooks.
 
 Copyright (c) 2025 Hugo José Pinto & Contributors
 """
@@ -12,7 +12,7 @@ from psion_sdk.emulator import (
     BreakpointManager,
     BreakEvent,
     BreakReason,
-    RegisterCondition,
+    Condition,
 )
 
 
@@ -108,16 +108,17 @@ class TestPCBreakpoints:
         assert mgr.breakpoint_count == 0
 
     def test_list_breakpoints(self, mgr):
-        """list_breakpoints returns sorted list."""
+        """list_breakpoints returns sorted list of (address, condition) tuples."""
         mgr.add_breakpoint(0x8200)
         mgr.add_breakpoint(0x8000)
         mgr.add_breakpoint(0x8100)
 
         bp_list = mgr.list_breakpoints()
-        assert bp_list == [0x8000, 0x8100, 0x8200]
+        addresses = [addr for addr, cond in bp_list]
+        assert addresses == [0x8000, 0x8100, 0x8200]
 
     def test_duplicate_breakpoint(self, mgr):
-        """Adding same breakpoint twice is idempotent."""
+        """Adding same breakpoint twice replaces it."""
         mgr.add_breakpoint(0x8000)
         mgr.add_breakpoint(0x8000)
 
@@ -133,6 +134,18 @@ class TestPCBreakpoints:
         mgr.add_breakpoint(0x18000)  # 17-bit address
         assert mgr.has_breakpoint(0x8000)  # Masked to 16 bits
 
+    def test_conditional_breakpoint(self, mgr):
+        """Breakpoint with condition is stored."""
+        mgr.add_breakpoint(0x8000, condition=("a", "==", 0x42))
+
+        bp_list = mgr.list_breakpoints()
+        addr, cond = bp_list[0]
+        assert addr == 0x8000
+        assert cond is not None
+        assert cond.register == "a"
+        assert cond.operator == "=="
+        assert cond.value == 0x42
+
 
 # =============================================================================
 # Memory Watchpoint Tests
@@ -145,28 +158,38 @@ class TestWatchpoints:
     def mgr(self):
         return BreakpointManager()
 
+    @pytest.fixture
+    def cpu(self):
+        return MockCPU()
+
     def test_add_read_watchpoint(self, mgr):
         """add_read_watchpoint works."""
         mgr.add_read_watchpoint(0x0050)
-        assert 0x0050 in mgr.list_read_watchpoints()
+        addresses = [addr for addr, cond in mgr.list_read_watchpoints()]
+        assert 0x0050 in addresses
 
     def test_add_write_watchpoint(self, mgr):
         """add_write_watchpoint works."""
         mgr.add_write_watchpoint(0x0050)
-        assert 0x0050 in mgr.list_write_watchpoints()
+        addresses = [addr for addr, cond in mgr.list_write_watchpoints()]
+        assert 0x0050 in addresses
 
     def test_add_watchpoint_both(self, mgr):
         """add_watchpoint can set both."""
         mgr.add_watchpoint(0x0050, on_read=True, on_write=True)
-        assert 0x0050 in mgr.list_read_watchpoints()
-        assert 0x0050 in mgr.list_write_watchpoints()
+        read_addrs = [addr for addr, cond in mgr.list_read_watchpoints()]
+        write_addrs = [addr for addr, cond in mgr.list_write_watchpoints()]
+        assert 0x0050 in read_addrs
+        assert 0x0050 in write_addrs
 
     def test_remove_watchpoint(self, mgr):
         """remove_watchpoint removes both."""
         mgr.add_watchpoint(0x0050, on_read=True, on_write=True)
         mgr.remove_watchpoint(0x0050)
-        assert 0x0050 not in mgr.list_read_watchpoints()
-        assert 0x0050 not in mgr.list_write_watchpoints()
+        read_addrs = [addr for addr, cond in mgr.list_read_watchpoints()]
+        write_addrs = [addr for addr, cond in mgr.list_write_watchpoints()]
+        assert 0x0050 not in read_addrs
+        assert 0x0050 not in write_addrs
 
     def test_clear_watchpoints(self, mgr):
         """clear_watchpoints removes all."""
@@ -176,45 +199,60 @@ class TestWatchpoints:
 
         assert mgr.watchpoint_count == 0
 
-    def test_check_memory_read(self, mgr):
+    def test_check_memory_read(self, mgr, cpu):
         """check_memory_read triggers on watched address."""
         mgr.add_read_watchpoint(0x0050)
 
-        result = mgr.check_memory_read(0x0050, 0x42)
+        result = mgr.check_memory_read(cpu, 0x0050, 0x42)
 
         assert result is False  # Should break
         assert mgr.last_event.reason == BreakReason.MEMORY_READ
         assert mgr.last_event.address == 0x0050
         assert mgr.last_event.value == 0x42
 
-    def test_check_memory_read_unwatched(self, mgr):
+    def test_check_memory_read_unwatched(self, mgr, cpu):
         """check_memory_read passes unwatched address."""
         mgr.add_read_watchpoint(0x0050)
 
-        result = mgr.check_memory_read(0x0060, 0x42)
+        result = mgr.check_memory_read(cpu, 0x0060, 0x42)
 
         assert result is True  # Continue
 
-    def test_check_memory_write(self, mgr):
+    def test_check_memory_write(self, mgr, cpu):
         """check_memory_write triggers on watched address."""
         mgr.add_write_watchpoint(0x0050)
 
-        result = mgr.check_memory_write(0x0050, 0x42)
+        result = mgr.check_memory_write(cpu, 0x0050, 0x42)
 
         assert result is False  # Should break
         assert mgr.last_event.reason == BreakReason.MEMORY_WRITE
 
+    def test_conditional_watchpoint(self, mgr, cpu):
+        """Watchpoint with condition only fires when condition met."""
+        mgr.add_write_watchpoint(0x0050, condition=("a", "==", 0x42))
+
+        # Condition not met - should continue
+        cpu.a = 0x00
+        result = mgr.check_memory_write(cpu, 0x0050, 0xFF)
+        assert result is True
+
+        # Condition met - should break
+        cpu.a = 0x42
+        result = mgr.check_memory_write(cpu, 0x0050, 0xFF)
+        assert result is False
+        assert mgr.last_event.reason == BreakReason.MEMORY_WRITE
+
 
 # =============================================================================
-# RegisterCondition Tests
+# Condition Tests
 # =============================================================================
 
-class TestRegisterCondition:
-    """Test RegisterCondition class."""
+class TestCondition:
+    """Test Condition class."""
 
     def test_create_condition(self):
         """Create basic condition."""
-        cond = RegisterCondition('a', '==', 0x42)
+        cond = Condition('a', '==', 0x42)
         assert cond.register == 'a'
         assert cond.operator == '=='
         assert cond.value == 0x42
@@ -224,7 +262,7 @@ class TestRegisterCondition:
         cpu = MockCPU()
         cpu.a = 0x42
 
-        cond = RegisterCondition('a', '==', 0x42)
+        cond = Condition('a', '==', 0x42)
         assert cond.check(cpu) is True
 
     def test_check_equal_false(self):
@@ -232,7 +270,7 @@ class TestRegisterCondition:
         cpu = MockCPU()
         cpu.a = 0x41
 
-        cond = RegisterCondition('a', '==', 0x42)
+        cond = Condition('a', '==', 0x42)
         assert cond.check(cpu) is False
 
     def test_check_not_equal(self):
@@ -240,7 +278,7 @@ class TestRegisterCondition:
         cpu = MockCPU()
         cpu.a = 0x41
 
-        cond = RegisterCondition('a', '!=', 0x42)
+        cond = Condition('a', '!=', 0x42)
         assert cond.check(cpu) is True
 
     def test_check_less_than(self):
@@ -248,7 +286,7 @@ class TestRegisterCondition:
         cpu = MockCPU()
         cpu.a = 0x10
 
-        cond = RegisterCondition('a', '<', 0x20)
+        cond = Condition('a', '<', 0x20)
         assert cond.check(cpu) is True
 
         cpu.a = 0x20
@@ -259,7 +297,7 @@ class TestRegisterCondition:
         cpu = MockCPU()
         cpu.a = 0x20
 
-        cond = RegisterCondition('a', '<=', 0x20)
+        cond = Condition('a', '<=', 0x20)
         assert cond.check(cpu) is True
 
     def test_check_greater_than(self):
@@ -267,7 +305,7 @@ class TestRegisterCondition:
         cpu = MockCPU()
         cpu.a = 0x30
 
-        cond = RegisterCondition('a', '>', 0x20)
+        cond = Condition('a', '>', 0x20)
         assert cond.check(cpu) is True
 
     def test_check_greater_equal(self):
@@ -275,7 +313,7 @@ class TestRegisterCondition:
         cpu = MockCPU()
         cpu.a = 0x20
 
-        cond = RegisterCondition('a', '>=', 0x20)
+        cond = Condition('a', '>=', 0x20)
         assert cond.check(cpu) is True
 
     def test_check_bitwise_and(self):
@@ -284,11 +322,11 @@ class TestRegisterCondition:
         cpu.a = 0b10101010
 
         # Test if bit 1 is set
-        cond = RegisterCondition('a', '&', 0b00000010)
+        cond = Condition('a', '&', 0b00000010)
         assert cond.check(cpu) is True
 
         # Test if bit 0 is set (it's not)
-        cond = RegisterCondition('a', '&', 0b00000001)
+        cond = Condition('a', '&', 0b00000001)
         assert cond.check(cpu) is False
 
     def test_16bit_register(self):
@@ -296,7 +334,7 @@ class TestRegisterCondition:
         cpu = MockCPU()
         cpu.x = 0x1234
 
-        cond = RegisterCondition('x', '==', 0x1234)
+        cond = Condition('x', '==', 0x1234)
         assert cond.check(cpu) is True
 
     def test_flag_register(self):
@@ -304,71 +342,28 @@ class TestRegisterCondition:
         cpu = MockCPU()
         cpu.flag_z = True
 
-        cond = RegisterCondition('flag_z', '==', True)
+        cond = Condition('flag_z', '==', True)
         assert cond.check(cpu) is True
 
     def test_invalid_register(self):
         """Invalid register name raises error."""
         with pytest.raises(ValueError):
-            RegisterCondition('invalid_reg', '==', 0)
+            Condition('invalid_reg', '==', 0)
 
     def test_invalid_operator(self):
         """Invalid operator raises error."""
         with pytest.raises(ValueError):
-            RegisterCondition('a', '??', 0)
+            Condition('a', '??', 0)
 
     def test_case_insensitive_register(self):
         """Register names are case-insensitive."""
-        cond = RegisterCondition('A', '==', 0x42)
+        cond = Condition('A', '==', 0x42)
         assert cond.register == 'a'
 
-
-# =============================================================================
-# Register Condition Management Tests
-# =============================================================================
-
-class TestRegisterConditionManager:
-    """Test register condition management in BreakpointManager."""
-
-    @pytest.fixture
-    def mgr(self):
-        return BreakpointManager()
-
-    def test_add_condition(self, mgr):
-        """add_register_condition returns ID."""
-        cond = RegisterCondition('a', '==', 0x42)
-        cond_id = mgr.add_register_condition(cond)
-        assert isinstance(cond_id, int)
-
-    def test_add_condition_convenience(self, mgr):
-        """add_condition convenience method."""
-        cond_id = mgr.add_condition('a', '==', 0x42)
-        assert isinstance(cond_id, int)
-
-    def test_remove_condition(self, mgr):
-        """remove_register_condition works."""
-        cond_id = mgr.add_condition('a', '==', 0x42)
-        mgr.remove_register_condition(cond_id)
-
-        conditions = mgr.list_register_conditions()
-        assert len(conditions) == 0
-
-    def test_list_conditions(self, mgr):
-        """list_register_conditions returns active conditions."""
-        mgr.add_condition('a', '==', 0x42)
-        mgr.add_condition('b', '!=', 0x00)
-
-        conditions = mgr.list_register_conditions()
-        assert len(conditions) == 2
-
-    def test_clear_conditions(self, mgr):
-        """clear_register_conditions removes all."""
-        mgr.add_condition('a', '==', 0x42)
-        mgr.add_condition('b', '!=', 0x00)
-        mgr.clear_register_conditions()
-
-        conditions = mgr.list_register_conditions()
-        assert len(conditions) == 0
+    def test_str_representation(self):
+        """Condition has string representation."""
+        cond = Condition('a', '==', 0x42)
+        assert str(cond) == "a == 66"
 
 
 # =============================================================================
@@ -449,15 +444,24 @@ class TestCheckInstruction:
         assert mgr.last_event.reason == BreakReason.STEP
         assert mgr.step_mode is False  # Auto-cleared
 
-    def test_register_condition_stops(self, mgr, cpu):
-        """Register condition stops when met."""
+    def test_conditional_breakpoint_met(self, mgr, cpu):
+        """Conditional breakpoint stops when condition met."""
         cpu.a = 0x42
-        mgr.add_condition('a', '==', 0x42)
+        mgr.add_breakpoint(0x8000, condition=("a", "==", 0x42))
 
         result = mgr.check_instruction(cpu, 0x8000, 0x01)
 
         assert result is False
-        assert mgr.last_event.reason == BreakReason.REGISTER_CONDITION
+        assert mgr.last_event.reason == BreakReason.PC_BREAKPOINT
+
+    def test_conditional_breakpoint_not_met(self, mgr, cpu):
+        """Conditional breakpoint continues when condition not met."""
+        cpu.a = 0x00  # Condition not met
+        mgr.add_breakpoint(0x8000, condition=("a", "==", 0x42))
+
+        result = mgr.check_instruction(cpu, 0x8000, 0x01)
+
+        assert result is True  # Continue, condition not met
 
     def test_syscall_hook_swi(self, mgr, cpu):
         """Syscall hook triggers on SWI instruction."""
@@ -546,7 +550,6 @@ class TestClearAll:
         # Add various things
         mgr.add_breakpoint(0x8000)
         mgr.add_watchpoint(0x0050, on_read=True, on_write=True)
-        mgr.add_condition('a', '==', 0x42)
         mgr.add_syscall_hook(0x10, lambda n, cpu: True)
         mgr.step_mode = True
         mgr.request_break()
@@ -556,5 +559,4 @@ class TestClearAll:
 
         assert mgr.breakpoint_count == 0
         assert mgr.watchpoint_count == 0
-        assert len(mgr.list_register_conditions()) == 0
         assert mgr.step_mode is False

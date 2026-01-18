@@ -319,6 +319,88 @@ ERR_IOERR   EQU     $08     ; I/O error
 ERR_BATT    EQU     $09     ; Battery low
 
 ; =============================================================================
+; OPL Interoperability - Calling OPL Procedures from Assembly
+; =============================================================================
+; These macros allow assembly programs to call external OPL procedures.
+; The OPL procedure runs to completion, then execution resumes in your
+; assembly code with stack state preserved.
+;
+; SETUP REQUIREMENT:
+;   You MUST call CALL_OPL_SETUP at the very start of your program,
+;   BEFORE any stack operations (PSHX, PSHA, etc.)!
+;
+; USAGE:
+;   1. At program start:
+;          CALL_OPL_SETUP        ; Initialize OPL call support (FIRST!)
+;
+;   2. Define your procedure name strings:
+;      _myproc:
+;          FCC     "azMENU"
+;          FCB     0             ; Null terminator required
+;
+;   3. Call the OPL procedure:
+;          CALL_OPL _myproc      ; Call the OPL procedure
+;          ; Execution resumes here after OPL returns
+;
+; COMPLETE EXAMPLE:
+;          ORG     $2100
+;      start:
+;          CALL_OPL_SETUP        ; Initialize (MUST be first!)
+;          ; ... your code ...
+;          CALL_OPL _menu        ; Call OPL procedure
+;          ; ... continues here ...
+;          RTS
+;
+;      _menu:
+;          FCC     "azMENU"
+;          FCB     0
+;
+;          INCLUDE "runtime.inc"
+;          END
+;
+; CONSTRAINTS:
+;   - Procedure name must be <= 8 characters
+;   - Uses default device (A:) for procedure lookup
+;   - D register returns 0 after the call (can be ignored)
+;
+; INTERNALS:
+;   These macros use _call_opl_setup_asm and _call_opl_asm from runtime.inc.
+;   The implementation uses QCode injection to invoke the OPL interpreter.
+;   See runtime.inc for full technical documentation.
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; CALL_OPL_SETUP - Initialize OPL call support
+; Usage: CALL_OPL_SETUP
+; MUST be called at program start, BEFORE any stack operations!
+; Clobbers: D, X
+; -----------------------------------------------------------------------------
+MACRO CALL_OPL_SETUP
+    JSR     _call_opl_setup_asm
+ENDM
+
+; -----------------------------------------------------------------------------
+; CALL_OPL - Call an external OPL procedure
+; Usage: CALL_OPL procname_label
+; Where procname_label points to a null-terminated procedure name string.
+; Clobbers: A, B, X
+; Returns: D = 0 (standard USR return value)
+;
+; Example:
+;     CALL_OPL _myproc
+;     ; Execution resumes here after OPL procedure returns
+;     BRA     next
+;
+; _myproc:
+;     FCC     "azMENU"
+;     FCB     0
+; -----------------------------------------------------------------------------
+MACRO CALL_OPL, procname
+    LDD     #\procname
+    JSR     _call_opl_asm
+ENDM
+
+; =============================================================================
 ; Version Information
 ; =============================================================================
 

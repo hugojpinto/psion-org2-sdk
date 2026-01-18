@@ -187,12 +187,16 @@ class FunctionNode(Declaration):
         parameters: List of parameter declarations
         body: The function body (block statement)
         is_forward_decl: True if this is just a forward declaration
+        is_external: True if this is an external OPL procedure declaration
+                     (declared with 'external' keyword, no body, will be called
+                     via QCode injection at runtime)
     """
     name: str = ""
     return_type: CType = field(default=None)
     parameters: list[ParameterNode] = field(default_factory=list)
     body: Optional["BlockStatement"] = None
     is_forward_decl: bool = False
+    is_external: bool = False
 
 
 # =============================================================================
@@ -711,7 +715,9 @@ class ASTPrinter(ASTVisitor):
 
     def visit_FunctionNode(self, node: FunctionNode):
         params = ", ".join(f"{p.param_type} {p.name}" for p in node.parameters)
-        self._emit(f"Function: {node.return_type} {node.name}({params})")
+        # Mark external OPL procedures distinctly
+        prefix = "External " if node.is_external else ""
+        self._emit(f"{prefix}Function: {node.return_type} {node.name}({params})")
         if node.body:
             self._indent()
             self.visit(node.body)

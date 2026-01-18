@@ -1322,5 +1322,944 @@ _popmode:
         RTS
 
 ; =============================================================================
+; OPL Procedure Call Support (QCode Injection)
+; =============================================================================
+;
+; OVERVIEW
+; --------
+; This module enables Small-C compiled code to call external OPL procedures.
+; It uses "QCode Injection" - a technique discovered through reverse engineering
+; the Psion II OPL interpreter in January 2026.
+;
+; The technique works by:
+;   1. Saving the current stack pointer (for later restoration)
+;   2. Building a synthetic QCode buffer in RAM
+;   3. Pointing the interpreter's program counter (RTA_PC) to our buffer
+;   4. Unwinding to USR() entry and returning (interpreter takes over)
+;   5. The interpreter executes our buffer, calling the OPL procedure
+;   6. After the procedure returns, our buffer triggers USR(restore, saved_SP)
+;   7. The restore routine restores SP and jumps to resume point
+;   8. C code continues with stack (and locals) intact!
+;
+; KEY INSIGHT: STACK PRESERVATION VIA QCODE BUFFER
+; -------------------------------------------------
+; The saved stack pointer is passed as the USR() argument in the QCode buffer.
+; When USR(_call_opl_restore, saved_SP) is called:
+;   - D register = saved_SP (passed as USR argument!)
+;   - _call_opl_restore does XGDX; TXS to restore SP
+;   - Then jumps to the resume address (stored in static variable)
+;   - Locals are preserved because the original stack is restored!
+;
+; This elegant solution was suggested by the user: "Could we not use our made
+; from scratch 7D buffer to do the pushing and popping of the stack?"
+;
+; PORTABILITY
+; -----------
+; The key insight is that RTA_PC ($A9/$AA) is at a STABLE address across ALL
+; Psion Organiser II models: CM, XP, LA, LZ, LZ64, and P350.
+; Source: https://www.jaapsch.net/psion/sysvars.htm
+;
+; This makes the technique fully portable across the Psion II family.
+;
+; SETUP REQUIREMENT
+; -----------------
+; When using the 'external' keyword in C code, the compiler AUTOMATICALLY
+; injects _call_opl_setup() at the start of main(). No manual setup needed!
+;
+; Example using the external keyword (RECOMMENDED):
+;   external void azMENU();  // Declare external OPL procedure
+;
+;   void main() {
+;       // Compiler auto-injects: JSR _call_opl_setup (invisible to user)
+;       int score = 0;
+;       azMENU();  // Looks like a normal function call!
+;       print_int(score);  // score is preserved across the call
+;   }
+;
+; For advanced users calling _call_opl directly (NOT recommended):
+;   _call_opl_setup();  // Must be first statement in main()
+;   _call_opl("azMENU");  // Manual invocation
+;
+; This is required because call_opl() needs to unwind the entire C call
+; stack to return control to the OPL interpreter.
+;
+; USE CASES
+; ---------
+; - Call OPL utility procedures (file I/O, comms, database)
+; - Integrate with existing OPL code libraries
+; - Build hybrid OPL/C applications (like Martin Reid's adventure framework)
+; - Access OPL-only features not available via system calls
+;
+; REFERENCES
+; ----------
+; - dev_docs/PROCEDURE_CALL_RESEARCH.md - Full research documentation
+; - https://www.jaapsch.net/psion/sysvars.htm - System variables
+; - https://www.jaapsch.net/psion/qcodes.htm - QCode reference
+;
+; =============================================================================
+
+; =============================================================================
+; OPL Runtime System Variables (STABLE across all Psion II models)
+; =============================================================================
+; These addresses are confirmed stable on CM, XP, LA, LZ, LZ64, P350.
+; They point to the OPL interpreter's internal state.
+
+RTA_SP          EQU     $A5     ; Language stack pointer (16-bit at $A5/$A6)
+                                ; Points to lowest byte of OPL expression stack
+                                ; Used for parameter passing and temporaries
+
+RTA_FP          EQU     $A7     ; Frame pointer (16-bit at $A7/$A8)
+                                ; Points into header of current procedure frame
+                                ; Used for local variable access
+
+RTA_PC          EQU     $A9     ; Program counter (16-bit at $A9/$AA)
+                                ; Points to current QCode opcode being executed
+                                ; THIS IS THE KEY VARIABLE for QCode injection!
+
+; =============================================================================
+; QCode Opcodes Used for Injection
+; =============================================================================
+; These are the QCode bytes we synthesize in our buffer.
+
+QCO_PROC        EQU     $7D     ; Procedure call opcode
+                                ; Format: $7D len name...
+                                ; Triggers the full 14-step procedure call sequence
+                                ; including FL$BOPN lookup, frame setup, etc.
+
+QCO_PUSHWORD    EQU     $22     ; Push 16-bit integer onto expression stack
+                                ; Format: $22 HH LL (BIG-ENDIAN!)
+                                ; Note: OPL uses big-endian for QCode integers
+
+QCO_USR         EQU     $9F     ; USR() function opcode
+                                ; Pops address and argument from stack
+                                ; Calls machine code at address with arg in D
+
+; =============================================================================
+; QCODE BUFFER LAYOUT (Stack-Preserving Version)
+; =============================================================================
+;
+; The _call_opl function builds this structure in _call_opl_buf:
+;
+;   ┌────────────────────────────────────────────────────────────────────┐
+;   │ Byte 0:        $7D                QCO_PROC opcode                  │
+;   │ Byte 1:        len                Procedure name length (1-8)      │
+;   │ Bytes 2..N:    name               Procedure name bytes (no null)   │
+;   │ Byte N+1:      $22                QCO_PUSHWORD opcode              │
+;   │ Bytes N+2,N+3: HH LL              _call_opl_restore addr (BIG-END) │
+;   │ Byte N+4:      $22                QCO_PUSHWORD opcode              │
+;   │ Bytes N+5,N+6: SP_H SP_L          Saved SP value (BIG-ENDIAN!)     │
+;   │ Byte N+7:      $9F                QCO_USR opcode                   │
+;   └────────────────────────────────────────────────────────────────────┘
+;
+; The key insight: saved_SP is passed as the USR() argument!
+; When USR(_call_opl_restore, saved_SP) executes:
+;   - D register = saved_SP
+;   - _call_opl_restore restores SP from D and jumps to resume
+;   - Local variables are preserved!
+;
+; Example: call_opl("SUB"); with restore at $0ABC and saved_SP=$1FF0 builds:
+;
+;   Offset: 0   1   2   3   4   5   6   7   8   9  10  11
+;   Bytes:  7D  03  53  55  42  22  0A  BC  22  1F  F0  9F
+;               |   S   U   B  |   |rest|  |  |saved| USR
+;               └─ length ─────┘   └─────┘  └───────┘
+;                                  restore   SP as
+;                                  addr      argument!
+;
+; =============================================================================
+; EXECUTION FLOW (Stack-Preserving Version)
+; =============================================================================
+;
+;   C Code                    OPL Interpreter                Target OPL Proc
+;   ─────────────────────────────────────────────────────────────────────────
+;
+;   int x = 42;
+;   call_opl("SUB"); ────────┐
+;   print_int(x);            │ 1. Save current SP (resume_SP) to buffer
+;   ↑                        │ 2. Calculate resume_addr, store in static
+;   │                        │ 3. Build QCode buffer:
+;   │                        │      $7D len name  (proc call)
+;   │                        │      $22 restore   (push restore func addr)
+;   │                        │      $22 saved_SP  (push SP as USR arg!)
+;   │                        │      $9F           (USR opcode)
+;   │                        │ 4. Set RTA_PC = &_call_opl_buf
+;   │                        │ 5. Unwind to _usr_entry_sp, RTS
+;   │                        │    (Exits USR entirely - interpreter takes over)
+;   │                        ↓
+;   │                        Interpreter resumes ──────────────────────┐
+;   │                        Fetches $7D from buffer                   │
+;   │                        Parses "SUB" name                         │
+;   │                        Calls procedure... ───────────────────────┤
+;   │                                                                  ↓
+;   │                                                  SUB: executes
+;   │                                                  (BEEP, PRINT, etc.)
+;   │                                                  Hits $7B (return) ─────┐
+;   │                                                                         │
+;   │                        Buffer continues: ←──────────────────────────────┘
+;   │                        $22 → push _call_opl_restore addr
+;   │                        $22 → push saved_SP (our captured SP!)
+;   │                        $9F → USR(_call_opl_restore, saved_SP)
+;   │                        ↓
+;   │                   _call_opl_restore:
+;   │                        D = saved_SP (the USR argument!)
+;   │                        XGDX         ; X = saved_SP
+;   │                        TXS          ; SP = X (stack restored!)
+;   │                        LDX resume   ; X = resume_addr
+;   │                        JMP 0,X      ; Jump to resume point
+;   │                        ↓
+;   └────────────────────────┘
+;   Execution continues at print_int(x)
+;   x is STILL 42! (stack was restored to exact state)
+;   D = 0 (standard USR return)
+;
+; WHY THIS WORKS
+; --------------
+; 1. We capture SP at call_opl() entry (before any stack changes)
+; 2. We calculate resume_SP = entry_SP + 4 (skip ret addr + arg)
+; 3. We build a QCode buffer that passes resume_SP as USR argument
+; 4. We unwind and exit USR entirely (interpreter continues)
+; 5. Interpreter runs our buffer: calls proc, then USR(restore, SP)
+; 6. _call_opl_restore receives saved_SP in D, restores it, jumps
+; 7. We're back exactly where we were, with locals intact!
+;
+; =============================================================================
+;
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; _call_opl - Call an OPL procedure from C code (QCode Injection)
+; -----------------------------------------------------------------------------
+;
+; SYNOPSIS
+;   void call_opl(char *name);
+;
+; DESCRIPTION
+;   Calls an external OPL procedure by name. When the procedure completes,
+;   execution resumes at the statement following the call_opl() call.
+;   LOCAL VARIABLES ARE PRESERVED across the call!
+;
+;   The resume address is automatically derived from the return address
+;   on the stack, adjusted to skip the argument cleanup code (INS INS).
+;
+; SETUP REQUIREMENT
+;   Programs using call_opl() MUST call _call_opl_setup() as the very
+;   first statement in main():
+;
+;     void main() {
+;         _call_opl_setup();  // REQUIRED - must be first!
+;         // ... rest of program ...
+;     }
+;
+;   This saves the USR entry stack pointer needed for stack unwinding.
+;
+; PARAMETERS
+;   name_ptr    - Pointer to null-terminated procedure name (max 8 chars)
+;                 Example: "azMENU" or "SUB"
+;                 Do NOT include device prefix; uses default device.
+;
+; STACK LAYOUT (at entry, before prologue)
+;   SP points to: [return addr][name_ptr]
+;   resume_SP = SP + 4 (after cleanup of ret addr + arg)
+;
+; RESUME ADDRESS CALCULATION
+;   After JSR _call_opl, the compiler emits cleanup code:
+;       JSR _call_opl   ; return addr points here ─┐
+;       INS             ; ← return addr            │
+;       INS             ; cleanup 2 bytes of arg   │
+;       <next stmt>     ; ← resume_addr = ret + 2 ─┘
+;
+;   We add 2 to the return address to skip the INS INS cleanup.
+;
+; REGISTER USAGE
+;   A, B, D, X - All scratch (clobbered)
+;   Uses _call_opl_* static variables for state
+;
+; RETURNS
+;   Execution continues at the next statement after call_opl().
+;   D register = 0 (standard USR return value).
+;   Stack is restored to exact state at call_opl() entry.
+;   LOCAL VARIABLES ARE PRESERVED!
+;
+; EXAMPLE USAGE
+;   void game_loop() {
+;       int local_score = 42;   // Local variable
+;
+;       call_opl("azMENU");     // Call OPL procedure
+;
+;       // Execution resumes here
+;       // local_score is STILL 42! (stack preserved)
+;       print_int(local_score);
+;   }
+;
+; HOW IT WORKS
+;   1. Capture entry SP; calculate resume_SP = entry_SP + 4
+;   2. Calculate resume_addr = return_addr + 2
+;   3. Build QCode buffer:
+;      - $7D len name (procedure call)
+;      - $22 _call_opl_restore (push restore function address)
+;      - $22 resume_SP (push saved SP as USR argument!)
+;      - $9F (USR opcode)
+;   4. Point RTA_PC to buffer
+;   5. Unwind to USR entry (LDX _usr_entry_sp; TXS; RTS)
+;   6. Interpreter executes buffer: calls proc, then USR(restore, SP)
+;   7. _call_opl_restore: D=saved_SP, restore SP, jump to resume_addr
+;   8. We're back with locals intact!
+;
+; NOTES
+;   - Maximum name length: 8 characters (Psion identifier limit)
+;   - Name is NOT null-terminated in buffer (length-prefixed)
+;   - RTA_PC ($A9/$AA) is stable across all Psion II models
+;   - The clever trick: saved_SP is passed as USR() argument!
+;
+; -----------------------------------------------------------------------------
+_call_opl:
+        ;
+        ; ═══════════════════════════════════════════════════════════════════
+        ; STEP 1: Capture SP for later restoration (BEFORE prologue!)
+        ; ═══════════════════════════════════════════════════════════════════
+        ;
+        ; At entry, SP points to: [return_addr 2B][name_ptr 2B]
+        ; After normal return + cleanup, SP would be at entry_SP + 4.
+        ; We capture this "resume SP" now, before any stack manipulation.
+        ;
+        TSX                     ; X = SP (points to return addr)
+        XGDX                    ; D = entry SP
+        ADDD    #4              ; D = resume_SP (after ret addr + arg cleaned)
+        STD     _call_opl_saved_sp ; Save for QCode buffer
+        XGDX                    ; X = entry SP (restore for indexing)
+        ;
+        ; Stack state at entry (before PSHX):
+        ;   ┌─────────────────────────┐
+        ;   │ 0,X - 1,X: return addr  │ ← X points here
+        ;   │ 2,X - 3,X: name_ptr     │ (the argument)
+        ;   └─────────────────────────┘
+        ;
+
+        ;
+        ; ═══════════════════════════════════════════════════════════════════
+        ; STEP 2: Extract arguments and calculate resume address
+        ; ═══════════════════════════════════════════════════════════════════
+        ;
+        ; Save name_ptr to static storage (at 2,X before PSHX)
+        LDD     2,X             ; D = name_ptr (argument at 2,X)
+        STD     _call_opl_name_ptr ; Save to static storage
+        ;
+        ; Calculate resume_addr = return_addr + 2
+        ; This skips the "INS INS" cleanup code after JSR _call_opl
+        ; so we resume at the actual next statement.
+        ;
+        LDD     0,X             ; D = return address (at 0,X)
+        ADDD    #2              ; D = return_addr + 2 (skip INS INS)
+        STD     _call_opl_resume   ; Save calculated resume address
+
+        ;
+        ; ═══════════════════════════════════════════════════════════════════
+        ; STEP 3: Count procedure name length
+        ; ═══════════════════════════════════════════════════════════════════
+        ; Psion procedure names are max 8 characters. We count until null
+        ; or until we hit the limit.
+        ;
+        LDX     _call_opl_name_ptr ; X = pointer to name string
+        CLRB                    ; B = length counter, start at 0
+_call_opl_count:
+        TST     0,X             ; Test byte at current position
+        BEQ     _call_opl_build ; If null terminator, done counting
+        INX                     ; Advance to next character
+        INCB                    ; Increment length counter
+        CMPB    #8              ; Check against Psion's 8-char limit
+        BNE     _call_opl_count ; Continue if under limit
+        ;
+        ; If we reach here, name is exactly 8 chars (or we hit limit)
+        ; Fall through to build phase
+        ;
+
+_call_opl_build:
+        ;
+        ; ═══════════════════════════════════════════════════════════════════
+        ; STEP 4: Build QCode buffer
+        ; ═══════════════════════════════════════════════════════════════════
+        ; We build the buffer byte-by-byte using _call_opl_emit helper.
+        ; The helper manages a write index for sequential writing.
+        ;
+        ; At this point: B = name length (1-8)
+        ;
+        STAB    _call_opl_namelen  ; Save length for later use
+        CLR     _call_opl_idx      ; Initialize buffer write index to 0
+
+        ;
+        ; ─────────────────────────────────────────────────────────────────
+        ; 4a. Write procedure call header: $7D + length
+        ; ─────────────────────────────────────────────────────────────────
+        ;
+        LDAA    #QCO_PROC       ; A = $7D (procedure call opcode)
+        BSR     _call_opl_emit  ; buf[0] = $7D
+        ;
+        LDAA    _call_opl_namelen ; A = name length
+        BSR     _call_opl_emit  ; buf[1] = length
+
+        ;
+        ; ─────────────────────────────────────────────────────────────────
+        ; 4b. Write procedure name bytes (without null terminator)
+        ; ─────────────────────────────────────────────────────────────────
+        ; Loop copies 'B' bytes from name string to buffer.
+        ;
+        LDX     _call_opl_name_ptr ; X = source pointer (name string)
+        LDAB    _call_opl_namelen  ; B = byte counter
+_call_opl_copyname:
+        TSTB                    ; Check if counter is zero
+        BEQ     _call_opl_suffix   ; If zero, name copy complete
+        LDAA    0,X             ; A = current source byte
+        INX                     ; Advance source pointer
+        PSHX                    ; Save source pointer (emit clobbers X)
+        PSHB                    ; Save counter (emit clobbers B)
+        BSR     _call_opl_emit  ; Write byte to buffer
+        PULB                    ; Restore counter
+        PULX                    ; Restore source pointer
+        DECB                    ; Decrement counter
+        BRA     _call_opl_copyname ; Continue loop
+
+_call_opl_suffix:
+        ;
+        ; ─────────────────────────────────────────────────────────────────
+        ; 4c. Write _call_opl_restore address: $22 + addr (big-endian)
+        ; ─────────────────────────────────────────────────────────────────
+        ; This is the function that will receive the saved SP and restore it.
+        ; OPL QCode uses BIG-ENDIAN for 16-bit values!
+        ; HD6303 D register: A = high byte, B = low byte
+        ;
+        LDAA    #QCO_PUSHWORD   ; A = $22 (push word opcode)
+        BSR     _call_opl_emit  ; Write $22
+        ;
+        LDD     #_call_opl_restore ; D = restore function address
+        PSHB                    ; Save low byte (need to write after high)
+        BSR     _call_opl_emit  ; Write high byte (A)
+        PULA                    ; A = low byte (was B)
+        BSR     _call_opl_emit  ; Write low byte
+
+        ;
+        ; ─────────────────────────────────────────────────────────────────
+        ; 4d. Write saved SP as USR argument: $22 + saved_SP (big-endian)
+        ; ─────────────────────────────────────────────────────────────────
+        ; THIS IS THE KEY TRICK! The saved SP is passed as the USR argument.
+        ; When USR(_call_opl_restore, saved_SP) is called:
+        ;   - D register = saved_SP
+        ;   - _call_opl_restore restores SP from D and jumps to resume
+        ;   - Local variables are preserved!
+        ;
+        LDAA    #QCO_PUSHWORD   ; A = $22 (push word opcode)
+        BSR     _call_opl_emit  ; Write $22
+        ;
+        LDD     _call_opl_saved_sp ; D = saved SP value (resume SP)
+        PSHB                    ; Save low byte
+        BSR     _call_opl_emit  ; Write high byte (A)
+        PULA                    ; A = low byte (was B)
+        BSR     _call_opl_emit  ; Write low byte
+
+        ;
+        ; ─────────────────────────────────────────────────────────────────
+        ; 4e. Write USR opcode: $9F
+        ; ─────────────────────────────────────────────────────────────────
+        ; This completes the buffer. When the interpreter executes this,
+        ; it will call USR(_call_opl_restore, saved_SP)!
+        ;
+        LDAA    #QCO_USR        ; A = $9F (USR opcode)
+        BSR     _call_opl_emit  ; Write $9F
+
+        ;
+        ; ═══════════════════════════════════════════════════════════════════
+        ; STEP 5: Point interpreter to our buffer
+        ; ═══════════════════════════════════════════════════════════════════
+        ; This is the magic! RTA_PC is the OPL interpreter's program counter.
+        ; By setting it to point to our buffer, the interpreter will execute
+        ; our synthesized QCode when it resumes.
+        ;
+        ; RTA_PC is at $A9/$AA - CONFIRMED STABLE across all Psion II models.
+        ;
+        LDX     #_call_opl_buf  ; X = address of our QCode buffer
+        STX     RTA_PC          ; RTA_PC = &_call_opl_buf
+
+        ;
+        ; ═══════════════════════════════════════════════════════════════════
+        ; STEP 6: Unwind to USR entry and exit
+        ; ═══════════════════════════════════════════════════════════════════
+        ; We need to exit the current USR() context entirely so the OPL
+        ; interpreter takes over. Simply doing RTS would return to our
+        ; caller (the C code), which would then continue executing before
+        ; the interpreter runs our buffer - causing code to run twice!
+        ;
+        ; Solution: Restore SP to the saved USR entry point and RTS from
+        ; there. This requires _usr_entry_sp to be set at program start.
+        ;
+        ; The interpreter will then:
+        ;   1. Fetch $7D → call the target OPL procedure
+        ;   2. Target procedure executes and returns ($7B)
+        ;   3. Fetch $22 → push _call_opl_restore address
+        ;   4. Fetch $22 → push saved_SP
+        ;   5. Fetch $9F → call USR(_call_opl_restore, saved_SP)
+        ;   6. _call_opl_restore restores SP and jumps to resume_addr
+        ;   7. Back in C code with stack intact!
+        ;
+        LDX     _usr_entry_sp   ; X = USR entry stack pointer
+        TXS                     ; SP = X (unwind entire C stack)
+        RTS                     ; Exit USR! Interpreter takes over.
+
+; =============================================================================
+; _call_opl_emit - Write byte to buffer at current index
+; =============================================================================
+;
+; Helper subroutine for buffer construction. Writes a single byte to
+; _call_opl_buf at the current index, then increments the index.
+;
+; INPUT
+;   A = byte to write
+;
+; OUTPUT
+;   Byte written to buffer
+;   _call_opl_idx incremented
+;
+; CLOBBERS
+;   X (used for address calculation)
+;
+; PRESERVES
+;   A (still contains the byte that was written)
+;   B (saved and restored)
+;
+; NOTES
+;   Uses indexed addressing: buf[idx] = A; idx++;
+;   This is like the HD6303's missing Y register (simulated with memory).
+;
+; -----------------------------------------------------------------------------
+_call_opl_emit:
+        LDX     #_call_opl_buf  ; X = base address of buffer
+        PSHB                    ; Save B (caller may be using it)
+        LDAB    _call_opl_idx   ; B = current write index
+        ABX                     ; X = buf + index (effective address)
+        STAA    0,X             ; Write byte A to buffer
+        INC     _call_opl_idx   ; Increment index for next write
+        PULB                    ; Restore B
+        RTS
+
+; =============================================================================
+; _call_opl_restore - Restore stack and resume C execution
+; =============================================================================
+;
+; This function is called by the OPL interpreter via USR(_call_opl_restore, SP).
+; It receives the saved stack pointer as the USR argument in D register,
+; restores SP to that value, and jumps to the saved resume address.
+;
+; INPUT
+;   D = saved_SP (the USR argument, passed by our QCode buffer)
+;
+; OUTPUT
+;   Does not return normally - jumps to resume address
+;   SP is restored to saved value
+;   D = 0 (standard return value)
+;
+; HOW IT WORKS
+;   1. D contains the saved SP (passed as USR argument)
+;   2. XGDX moves saved_SP to X
+;   3. TXS restores SP from X
+;   4. LDX loads resume address from static storage
+;   5. LDD #0 sets D=0 (standard USR return)
+;   6. JMP 0,X jumps to resume point
+;
+; RESULT
+;   Execution resumes at the C statement after call_opl().
+;   Local variables are preserved because SP was restored!
+;
+; -----------------------------------------------------------------------------
+_call_opl_restore:
+        ;
+        ; D = saved_SP (the USR argument from our QCode buffer!)
+        ;
+        XGDX                    ; X = saved_SP
+        TXS                     ; SP = X (stack pointer restored!)
+        ;
+        ; Now SP is exactly where it was after call_opl() cleanup.
+        ; Local variables above this point are intact!
+        ;
+        LDX     _call_opl_resume ; X = resume address (saved earlier)
+        LDD     #0              ; D = 0 (standard USR return value)
+        JMP     0,X             ; Jump to resume point!
+        ;
+        ; Execution continues at the C statement after call_opl().
+        ; We don't RTS - we're jumping directly to the resume point.
+        ;
+
+; =============================================================================
+; _call_opl_setup - Initialize call_opl support (C calling convention)
+; =============================================================================
+;
+; SYNOPSIS
+;   void _call_opl_setup(void);
+;
+; DESCRIPTION
+;   Saves the USR entry stack pointer for later use by call_opl().
+;   This is the C-calling-convention version.
+;
+;   AUTOMATIC INJECTION: When using the 'external' keyword in C code,
+;   the compiler AUTOMATICALLY injects a call to this function at the
+;   very start of main(), BEFORE any local variables are allocated.
+;   Users do NOT need to call this function manually!
+;
+;   The saved SP is used to unwind the entire C call stack when
+;   call_opl() needs to exit the current USR() context.
+;
+; USAGE (MODERN - RECOMMENDED)
+;   The 'external' keyword makes this transparent:
+;
+;   external void azMENU();  // Compiler will auto-inject setup!
+;
+;   void main() {
+;       // JSR _call_opl_setup is injected HERE by compiler
+;       int x;
+;       azMENU();  // Works seamlessly
+;   }
+;
+; USAGE (LEGACY - Manual call, not recommended)
+;   void main() {
+;       _call_opl_setup();  // REQUIRED - must be FIRST, before locals!
+;       int x;              // Locals AFTER setup
+;       // ... rest of program using call_opl("name") ...
+;   }
+;
+; FOR ASSEMBLY PROGRAMMERS
+;   Use _call_opl_setup_asm and _call_opl_asm instead - see below.
+;
+; WHY IS THIS NEEDED?
+;   When call_opl() is invoked from deep in the call stack, it needs
+;   to exit the USR() context entirely so the OPL interpreter can
+;   execute our QCode buffer. To do this, we need to restore SP to
+;   the value that allows RTS to return to OPL.
+;
+;   If _call_opl_setup() is not called, call_opl() will crash.
+;   If called AFTER local variable declarations, stack calculation
+;   will be wrong and call_opl() will crash.
+;
+; STACK ANALYSIS
+;   When OPL calls USR(_main, arg):
+;     1. OPL interpreter calls machine code at _main
+;     2. At _main entry: SP -> [return_addr to OPL interpreter]
+;     3. Compiler prologue runs: PSHX (saves caller's X)
+;     4. After prologue: SP -> [saved_X][return to OPL]
+;     5. main() calls _call_opl_setup()
+;     6. At our entry: SP -> [ret to main][saved_X][ret to OPL]
+;                              0,X         2,X      4,X
+;
+;   To properly return to OPL, we need SP pointing to [ret to OPL].
+;   That's current_SP + 4 (skip our return + main's saved_X).
+;
+; CRITICAL CONSTRAINT
+;   This calculation assumes main() has NO locals pushed before
+;   calling _call_opl_setup(). If there are locals between saved_X
+;   and our return address, the calculation will be wrong!
+;
+;   CORRECT:
+;     void main() { _call_opl_setup(); int x; ... }
+;
+;   WRONG (will crash):
+;     void main() { int x; _call_opl_setup(); ... }
+;
+; NOTES
+;   - Must be called before any call_opl() invocation
+;   - Must be the first statement in main() (before locals!)
+;   - Only needs to be called once per program execution
+;
+; -----------------------------------------------------------------------------
+_call_opl_setup:
+        ;
+        ; At entry to _call_opl_setup, the stack looks like:
+        ;
+        ;   ┌─────────────────────────────────┐
+        ;   │ SP+0, SP+1: return addr to main │ ← SP points here
+        ;   │ SP+2, SP+3: main's saved_X      │ (from PSHX prologue)
+        ;   │ SP+4, SP+5: return addr to OPL  │ ← We need SP here!
+        ;   └─────────────────────────────────┘
+        ;
+        ; We want _usr_entry_sp = current_SP + 4
+        ; so that TXS + RTS will return directly to OPL.
+        ;
+        TSX                     ; X = SP (points to our return addr)
+        XGDX                    ; D = current SP
+        ADDD    #4              ; D = SP + 4 (skip ret_to_main + saved_X)
+        STD     _usr_entry_sp   ; Save for call_opl() unwinding
+        RTS
+
+; =============================================================================
+; =============================================================================
+;
+;                    ASSEMBLY PROGRAMMER INTERFACE
+;
+; =============================================================================
+; =============================================================================
+;
+; The following routines provide a clean interface for assembly language
+; programmers who want to call OPL procedures without using the C compiler.
+;
+; QUICK START FOR ASSEMBLY PROGRAMMERS
+; -------------------------------------
+;
+; 1. At the VERY START of your program (before ANY stack operations):
+;
+;        ORG     $2100
+;        JSR     _call_opl_setup_asm   ; MUST be first instruction!
+;        ; ... rest of your program ...
+;
+; 2. To call an OPL procedure:
+;
+;        LDD     #_myproc_name         ; Load address of procedure name
+;        JSR     _call_opl_asm         ; Call OPL procedure
+;        ; Execution resumes here after OPL returns
+;
+;    _myproc_name:
+;        FCC     "azMENU"              ; Procedure name (max 8 chars)
+;        FCB     0                     ; Null terminator
+;
+; COMPLETE EXAMPLE
+; ----------------
+;
+;        ORG     $2100
+;
+;    ; ─────────────────────────────────────────────────────────────────────
+;    ; Program entry point
+;    ; ─────────────────────────────────────────────────────────────────────
+;    _main:
+;        JSR     _call_opl_setup_asm   ; Initialize OPL call support (FIRST!)
+;
+;        ; Your program logic here...
+;        LDAA    #'H'
+;        JSR     _putchar
+;
+;        ; Call an OPL procedure
+;        LDD     #_menu_proc           ; D = pointer to procedure name
+;        JSR     _call_opl_asm         ; Call the OPL procedure
+;        ; OPL procedure runs, then execution resumes here
+;
+;        ; Continue after OPL returns...
+;        LDAA    #'!'
+;        JSR     _putchar
+;
+;        RTS                           ; Return to OPL interpreter
+;
+;    ; ─────────────────────────────────────────────────────────────────────
+;    ; Procedure name strings
+;    ; ─────────────────────────────────────────────────────────────────────
+;    _menu_proc:
+;        FCC     "azMENU"
+;        FCB     0
+;
+;        INCLUDE "runtime.inc"         ; Include runtime library
+;        END
+;
+; KEY DIFFERENCES FROM C VERSION
+; ------------------------------
+;
+; | Feature          | C Version (_call_opl)      | Asm Version (_call_opl_asm) |
+; |------------------|----------------------------|-----------------------------|
+; | Name pointer     | Pushed on stack            | Passed in D register        |
+; | Stack cleanup    | Requires INS INS after     | No cleanup needed           |
+; | Resume address   | Return addr + 2            | Return addr (exact)         |
+; | Setup function   | _call_opl_setup (SP+4)     | _call_opl_setup_asm (SP+2)  |
+;
+; =============================================================================
+
+; =============================================================================
+; _call_opl_setup_asm - Initialize OPL call support (assembly version)
+; =============================================================================
+;
+; SYNOPSIS (assembly)
+;   JSR     _call_opl_setup_asm
+;
+; DESCRIPTION
+;   Saves the USR entry stack pointer for later use by _call_opl_asm.
+;   This is the assembly-language version - simpler stack calculation.
+;
+;   MUST be called as the VERY FIRST instruction in your program,
+;   BEFORE any PSHX, PSHA, PSHB, or other stack-modifying operations!
+;
+; STACK LAYOUT AT ENTRY
+;   When OPL calls USR(addr, arg), the stack looks like:
+;     SP -> [return_to_setup][return_to_OPL]
+;            0,1              2,3
+;
+;   We want SP pointing to [return_to_OPL] for unwinding.
+;   So we calculate: _usr_entry_sp = current_SP + 2
+;
+; EXAMPLE
+;        ORG     $2100
+;    _main:
+;        JSR     _call_opl_setup_asm   ; MUST be first!
+;        ; ... your program ...
+;
+; CLOBBERS
+;   D, X
+;
+; -----------------------------------------------------------------------------
+_call_opl_setup_asm:
+        TSX                     ; X = SP (points to our return addr)
+        XGDX                    ; D = current SP
+        ADDD    #2              ; D = SP + 2 (skip just our return addr)
+        STD     _usr_entry_sp   ; Save for _call_opl_asm unwinding
+        RTS
+
+; =============================================================================
+; _call_opl_asm - Call an OPL procedure (assembly version)
+; =============================================================================
+;
+; SYNOPSIS (assembly)
+;   LDD     #procedure_name_string
+;   JSR     _call_opl_asm
+;   ; Execution resumes here after OPL procedure returns
+;
+; DESCRIPTION
+;   Calls an external OPL procedure by name. When the procedure completes,
+;   execution resumes at the instruction immediately after the JSR.
+;   Stack state and registers are preserved across the call.
+;
+;   This is the assembly-friendly version that:
+;   - Takes the procedure name pointer in D register (not on stack)
+;   - Does NOT require any stack cleanup after the call
+;   - Resumes at the exact return address (no +2 adjustment)
+;
+; PARAMETERS
+;   D = Pointer to null-terminated procedure name string (max 8 chars)
+;
+; RETURNS
+;   D = 0 (standard USR return value)
+;   Execution resumes at the instruction after JSR _call_opl_asm
+;
+; REQUIREMENTS
+;   - _call_opl_setup_asm MUST be called first (at program start)
+;   - Procedure name must be <= 8 characters
+;   - Uses default device (A:) for procedure lookup
+;
+; EXAMPLE
+;        ; Call the azMENU OPL procedure
+;        LDD     #_azMENU_name
+;        JSR     _call_opl_asm
+;        ; Execution resumes here
+;        ; D = 0 (can be ignored)
+;        BRA     _continue
+;
+;    _azMENU_name:
+;        FCC     "azMENU"
+;        FCB     0
+;
+;    _continue:
+;        ; ... rest of program ...
+;
+; CLOBBERS
+;   A, B, X (all registers may be modified)
+;
+; STACK EFFECT
+;   Net zero - SP is preserved across the call
+;
+; HOW IT WORKS
+;   1. Builds a QCode buffer containing: procedure_call + USR(restore, SP)
+;   2. Sets RTA_PC to point to this buffer
+;   3. Unwinds stack to USR entry and returns to OPL interpreter
+;   4. Interpreter executes our buffer: calls OPL proc, then USR(restore)
+;   5. _call_opl_restore receives saved_SP, restores stack, jumps to resume
+;   6. Execution continues at the instruction after JSR _call_opl_asm
+;
+; -----------------------------------------------------------------------------
+_call_opl_asm:
+        ;
+        ; ═══════════════════════════════════════════════════════════════════
+        ; STEP 1: Save name pointer and capture resume information
+        ; ═══════════════════════════════════════════════════════════════════
+        ;
+        ; D = name_ptr (passed in D register - assembly convention!)
+        ;
+        STD     _call_opl_name_ptr ; Save name pointer to static storage
+        ;
+        ; Get return address and use it directly as resume address
+        ; (no +2 adjustment needed for assembly - no INS cleanup)
+        ;
+        TSX                     ; X = SP (points to return addr)
+        LDD     0,X             ; D = return address
+        STD     _call_opl_resume   ; Save as resume address (exact, no +2)
+        ;
+        ; Calculate resume_SP = entry_SP + 2 (just skip our return addr)
+        ;
+        XGDX                    ; D = entry SP
+        ADDD    #2              ; D = resume_SP (after return addr removed)
+        STD     _call_opl_saved_sp ; Save for QCode buffer
+
+        ;
+        ; ═══════════════════════════════════════════════════════════════════
+        ; STEP 2: Count procedure name length (same as C version)
+        ; ═══════════════════════════════════════════════════════════════════
+        ;
+        LDX     _call_opl_name_ptr ; X = pointer to name string
+        CLRB                    ; B = length counter, start at 0
+_call_opl_asm_count:
+        TST     0,X             ; Test byte at current position
+        BEQ     _call_opl_asm_build ; If null terminator, done counting
+        INX                     ; Advance to next character
+        INCB                    ; Increment length counter
+        CMPB    #8              ; Check against Psion's 8-char limit
+        BNE     _call_opl_asm_count ; Continue if under limit
+
+_call_opl_asm_build:
+        ;
+        ; ═══════════════════════════════════════════════════════════════════
+        ; STEP 3-6: Build buffer and unwind (shared with C version)
+        ; ═══════════════════════════════════════════════════════════════════
+        ;
+        ; Jump to the shared build code in _call_opl.
+        ; At this point:
+        ;   - B = name length (1-8)
+        ;   - _call_opl_name_ptr = procedure name string
+        ;   - _call_opl_resume = resume address
+        ;   - _call_opl_saved_sp = resume SP value
+        ;
+        ; The _call_opl_build code is shared and handles:
+        ;   - Building the QCode buffer
+        ;   - Setting RTA_PC
+        ;   - Unwinding to USR entry
+        ;
+        JMP     _call_opl_build ; Reuse shared build/unwind code
+
+; =============================================================================
+; Static Storage for OPL Procedure Call Support
+; =============================================================================
+; These variables hold state during buffer construction and call execution.
+; They are used instead of stack manipulation for clarity and simplicity.
+
+_call_opl_name_ptr:             ; Pointer to procedure name string (saved arg)
+        RMB     2               ; 16-bit pointer
+
+_call_opl_resume:               ; Resume address (calculated from return addr)
+        RMB     2               ; 16-bit address
+
+_call_opl_saved_sp:             ; Saved SP for stack restoration
+        RMB     2               ; 16-bit stack pointer value
+
+_call_opl_namelen:              ; Calculated length of procedure name
+        RMB     1               ; 8-bit value (1-8)
+
+_call_opl_idx:                  ; Current write index into buffer
+        RMB     1               ; 8-bit index
+
+_usr_entry_sp:                  ; Stack pointer at USR() entry
+        RMB     2               ; Set by _call_opl_setup(), used for unwinding
+
+; =============================================================================
+; QCode Injection Buffer
+; =============================================================================
+; This buffer holds the synthesized QCode that the interpreter will execute.
+;
+; Maximum size calculation:
+;   $7D (1) + len (1) + name (8) + $22 (1) + addr (2) + $22 (1) + SP (2) + $9F (1)
+;   = 17 bytes maximum
+;
+; We allocate 20 bytes for safety margin.
+
+_call_opl_buf:
+        RMB     20              ; Buffer for synthesized QCode
+
+
+; =============================================================================
 ; End of Runtime Library
 ; =============================================================================

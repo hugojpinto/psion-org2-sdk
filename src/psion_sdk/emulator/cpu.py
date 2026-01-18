@@ -129,10 +129,13 @@ class HD6303:
         # Instrumentation hooks
         # on_instruction(pc, opcode) -> bool: return False to stop execution
         self.on_instruction: Optional[Callable[[int, int], bool]] = None
-        # on_memory_read(address, value) -> None
-        self.on_memory_read: Optional[Callable[[int, int], None]] = None
-        # on_memory_write(address, value) -> None
-        self.on_memory_write: Optional[Callable[[int, int], None]] = None
+        # on_memory_read(address, value) -> bool: return False to stop execution
+        self.on_memory_read: Optional[Callable[[int, int], bool]] = None
+        # on_memory_write(address, value) -> bool: return False to stop execution
+        self.on_memory_write: Optional[Callable[[int, int], bool]] = None
+
+        # Flag set by memory hooks to request execution stop
+        self._memory_break_requested: bool = False
 
     # ========================================
     # Register Properties (match JAPE naming)
@@ -282,18 +285,20 @@ class HD6303:
     # ========================================
 
     def _read_byte(self, addr: int) -> int:
-        """Read byte from bus with optional tracing."""
+        """Read byte from bus with optional watchpoint check."""
         value = self.bus.read(addr & 0xFFFF) & 0xFF
         if self.on_memory_read:
-            self.on_memory_read(addr & 0xFFFF, value)
+            if not self.on_memory_read(addr & 0xFFFF, value):
+                self._memory_break_requested = True
         return value
 
     def _write_byte(self, addr: int, value: int) -> None:
-        """Write byte to bus with optional tracing."""
+        """Write byte to bus with optional watchpoint check."""
         addr = addr & 0xFFFF
         value = value & 0xFF
         if self.on_memory_write:
-            self.on_memory_write(addr, value)
+            if not self.on_memory_write(addr, value):
+                self._memory_break_requested = True
         self.bus.write(addr, value)
 
     def _read_word(self, addr: int) -> int:
@@ -453,6 +458,12 @@ class HD6303:
 
             ticks += 1
             ticks += self._execute_instruction(inst)
+
+            # Check if a memory watchpoint was triggered
+            if self._memory_break_requested:
+                self._memory_break_requested = False
+                self.bus.inc_frame(ticks)
+                return total_ticks + ticks
 
             # Update bus timing
             self.bus.inc_frame(ticks)

@@ -883,47 +883,180 @@ async def write_memory(
         return error_result(f"Write memory error: {e}")
 
 
-async def set_breakpoint(
+async def search_memory(
     manager: SessionManager,
     args: Dict[str, Any]
 ) -> ToolResult:
     """
-    Set a breakpoint at an address.
+    Search for byte pattern in emulator memory.
 
     Args:
         manager: Session manager
-        args: {"session_id": str, "address": int, "type": str}
+        args: {
+            "session_id": str,
+            "pattern": List[int],  # Bytes to search for (0-255 each)
+            "start": int,          # Start address (default 0)
+            "end": int,            # End address (default 0xFFFF)
+            "max_results": int     # Maximum matches to return (default 20)
+        }
 
     Returns:
-        ToolResult indicating success
+        ToolResult with matching addresses
     """
     session_id = args.get("session_id", "")
-    address = args.get("address", 0)
-    bp_type = args.get("type", "pc").lower()
+    pattern = args.get("pattern", [])
+    start = args.get("start", 0)
+    end = args.get("end", 0xFFFF)
+    max_results = args.get("max_results", 20)
 
     session, error = get_session_or_error(manager, session_id)
     if error:
         return error
 
     # Validate
-    if not 0 <= address <= 0xFFFF:
-        return error_result(f"Address ${address:04X} out of range")
+    if not pattern:
+        return error_result("No pattern specified")
+    if len(pattern) > 64:
+        return error_result("Pattern too long (max 64 bytes)")
+
+    # Validate pattern bytes
+    for i, b in enumerate(pattern):
+        if not isinstance(b, int) or not 0 <= b <= 255:
+            return error_result(f"Invalid byte at index {i}: {b}")
+
+    if not 0 <= start <= 0xFFFF:
+        return error_result(f"Start address ${start:04X} out of range")
+    if not 0 <= end <= 0xFFFF:
+        return error_result(f"End address ${end:04X} out of range")
+    if start > end:
+        return error_result("Start must be <= end")
+
+    try:
+        emu = session.emulator
+        pattern_bytes = bytes(pattern)
+        pattern_len = len(pattern_bytes)
+        matches = []
+
+        # Search through memory
+        addr = start
+        while addr <= end - pattern_len + 1 and len(matches) < max_results:
+            # Read bytes at current position
+            data = emu.read_bytes(addr, pattern_len)
+            if data == pattern_bytes:
+                matches.append(addr)
+            addr += 1
+
+        # Format results
+        if not matches:
+            pattern_hex = ' '.join(f'{b:02X}' for b in pattern)
+            return success_result(
+                f"Pattern [{pattern_hex}] not found in range "
+                f"${start:04X}-${end:04X}"
+            )
+
+        # Build result with context
+        result_lines = [
+            f"Found {len(matches)} match(es) for pattern "
+            f"[{' '.join(f'{b:02X}' for b in pattern)}]:"
+        ]
+
+        for addr in matches:
+            # Show some context around the match
+            ctx_start = max(0, addr - 4)
+            ctx_end = min(0xFFFF, addr + pattern_len + 4)
+            context = emu.read_bytes(ctx_start, ctx_end - ctx_start)
+
+            # Format with match highlighted
+            hex_parts = []
+            for i, b in enumerate(context):
+                real_addr = ctx_start + i
+                if addr <= real_addr < addr + pattern_len:
+                    hex_parts.append(f"[{b:02X}]")  # Highlight match
+                else:
+                    hex_parts.append(f"{b:02X}")
+
+            result_lines.append(f"  ${addr:04X}: {' '.join(hex_parts)}")
+
+        if len(matches) >= max_results:
+            result_lines.append(f"  (limited to {max_results} results)")
+
+        return success_result('\n'.join(result_lines))
+
+    except Exception as e:
+        return error_result(f"Search memory error: {e}")
+
+
+async def set_breakpoint(
+    manager: SessionManager,
+    args: Dict[str, Any]
+) -> ToolResult:
+    """
+    Set a breakpoint or watchpoint with optional condition.
+
+    Args:
+        manager: Session manager
+        args: {
+            "session_id": str,
+            "type": str,       # "pc" (default), "read", or "write"
+            "address": int,    # Memory address (required)
+
+            # Optional condition - break only fires when condition is also true:
+            "when_register": str,  # a, b, d, x, sp, pc, flag_c, flag_v, flag_z, flag_n
+            "when_op": str,        # ==, !=, <, <=, >, >=, &
+            "when_value": int
+        }
+
+    Examples:
+        - Simple: {type: "pc", address: 0x8000}
+        - Conditional: {type: "pc", address: 0x8000, when_register: "a", when_op: "==", when_value: 0x42}
+          → Break at $8000 only when A == 0x42
+
+    Returns:
+        ToolResult indicating success
+    """
+    session_id = args.get("session_id", "")
+    bp_type = args.get("type", "pc").lower()
+    address = args.get("address", -1)
+
+    session, error = get_session_or_error(manager, session_id)
+    if error:
+        return error
+
+    # Validate address
+    if address < 0 or address > 0xFFFF:
+        return error_result(f"Address required (0-65535)")
+
+    # Build optional condition
+    condition = None
+    when_register = args.get("when_register")
+    when_op = args.get("when_op")
+    when_value = args.get("when_value")
+
+    if when_register and when_op and when_value is not None:
+        condition = (when_register, when_op, when_value)
 
     try:
         emu = session.emulator
 
         if bp_type == "pc":
-            emu.add_breakpoint(address)
-            return success_result(f"PC breakpoint set at ${address:04X}")
+            emu.breakpoints.add_breakpoint(address, condition=condition)
+            msg = f"Breakpoint set at ${address:04X}"
         elif bp_type == "read":
-            emu.add_watchpoint(address, on_read=True, on_write=False)
-            return success_result(f"Read watchpoint set at ${address:04X}")
+            emu.breakpoints.add_read_watchpoint(address, condition=condition)
+            msg = f"Read watchpoint set at ${address:04X}"
         elif bp_type == "write":
-            emu.add_watchpoint(address, on_read=False, on_write=True)
-            return success_result(f"Write watchpoint set at ${address:04X}")
+            emu.breakpoints.add_write_watchpoint(address, condition=condition)
+            msg = f"Write watchpoint set at ${address:04X}"
         else:
-            return error_result(f"Unknown breakpoint type: {bp_type}")
+            return error_result(f"Unknown type: {bp_type}. Use pc, read, or write.")
 
+        if condition:
+            msg += f" (when {when_register} {when_op} {when_value})"
+
+        return success_result(msg)
+
+    except ValueError as e:
+        return error_result(f"Invalid condition: {e}")
     except Exception as e:
         return error_result(f"Set breakpoint error: {e}")
 
@@ -933,17 +1066,77 @@ async def remove_breakpoint(
     args: Dict[str, Any]
 ) -> ToolResult:
     """
-    Remove a breakpoint.
+    Remove a breakpoint or watchpoint at an address.
 
     Args:
         manager: Session manager
-        args: {"session_id": str, "address": int}
+        args: {
+            "session_id": str,
+            "address": int,    # Memory address (required)
+            "type": str        # "all" (default), "pc", "read", or "write"
+        }
 
     Returns:
-        ToolResult indicating success
+        ToolResult indicating what was removed
     """
     session_id = args.get("session_id", "")
-    address = args.get("address", 0)
+    address = args.get("address", -1)
+    bp_type = args.get("type", "all").lower()
+
+    session, error = get_session_or_error(manager, session_id)
+    if error:
+        return error
+
+    if address < 0 or address > 0xFFFF:
+        return error_result("Address required (0-65535)")
+
+    try:
+        emu = session.emulator
+        removed = []
+
+        if bp_type in ("pc", "all"):
+            if emu.breakpoints.has_breakpoint(address):
+                emu.breakpoints.remove_breakpoint(address)
+                removed.append("PC breakpoint")
+
+        if bp_type in ("read", "all"):
+            if address in emu.breakpoints._read_watchpoints:
+                emu.breakpoints.remove_read_watchpoint(address)
+                removed.append("read watchpoint")
+
+        if bp_type in ("write", "all"):
+            if address in emu.breakpoints._write_watchpoints:
+                emu.breakpoints.remove_write_watchpoint(address)
+                removed.append("write watchpoint")
+
+        if removed:
+            return success_result(
+                f"Removed at ${address:04X}: {', '.join(removed)}"
+            )
+        else:
+            return success_result(
+                f"No breakpoints/watchpoints at ${address:04X}"
+            )
+
+    except Exception as e:
+        return error_result(f"Remove breakpoint error: {e}")
+
+
+async def list_breakpoints(
+    manager: SessionManager,
+    args: Dict[str, Any]
+) -> ToolResult:
+    """
+    List all active breakpoints and watchpoints.
+
+    Args:
+        manager: Session manager
+        args: {"session_id": str}
+
+    Returns:
+        ToolResult with all active debugging points and their conditions
+    """
+    session_id = args.get("session_id", "")
 
     session, error = get_session_or_error(manager, session_id)
     if error:
@@ -951,11 +1144,50 @@ async def remove_breakpoint(
 
     try:
         emu = session.emulator
-        emu.remove_breakpoint(address)
-        return success_result(f"Removed breakpoint at ${address:04X}")
+        bp_mgr = emu.breakpoints
+        result_lines = []
+
+        def format_entry(addr: int, cond) -> str:
+            """Format a breakpoint/watchpoint entry with optional condition."""
+            if cond:
+                return f"  ${addr:04X}  when {cond}"
+            return f"  ${addr:04X}"
+
+        # PC Breakpoints
+        pc_breakpoints = bp_mgr.list_breakpoints()
+        if pc_breakpoints:
+            result_lines.append(f"PC Breakpoints ({len(pc_breakpoints)}):")
+            for addr, cond in pc_breakpoints:
+                result_lines.append(format_entry(addr, cond))
+        else:
+            result_lines.append("PC Breakpoints: (none)")
+
+        # Read Watchpoints
+        read_watchpoints = bp_mgr.list_read_watchpoints()
+        if read_watchpoints:
+            result_lines.append(f"\nRead Watchpoints ({len(read_watchpoints)}):")
+            for addr, cond in read_watchpoints:
+                result_lines.append(format_entry(addr, cond))
+        else:
+            result_lines.append("\nRead Watchpoints: (none)")
+
+        # Write Watchpoints
+        write_watchpoints = bp_mgr.list_write_watchpoints()
+        if write_watchpoints:
+            result_lines.append(f"\nWrite Watchpoints ({len(write_watchpoints)}):")
+            for addr, cond in write_watchpoints:
+                result_lines.append(format_entry(addr, cond))
+        else:
+            result_lines.append("\nWrite Watchpoints: (none)")
+
+        # Summary
+        total = len(pc_breakpoints) + len(read_watchpoints) + len(write_watchpoints)
+        result_lines.append(f"\nTotal: {total} active")
+
+        return success_result('\n'.join(result_lines))
 
     except Exception as e:
-        return error_result(f"Remove breakpoint error: {e}")
+        return error_result(f"List breakpoints error: {e}")
 
 
 async def get_registers(

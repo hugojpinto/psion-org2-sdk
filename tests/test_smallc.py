@@ -934,3 +934,351 @@ int rows = DISP_ROWS;
         result = compiler.compile_source(source, "test.c")
         assert result.target_model == "CM"
         assert "; Target Model: CM" in result.assembly
+
+
+# =============================================================================
+# External OPL Function Tests
+# =============================================================================
+
+class TestExternalKeyword:
+    """Tests for the 'external' keyword that enables OPL procedure calls."""
+
+    # -------------------------------------------------------------------------
+    # Lexer Tests
+    # -------------------------------------------------------------------------
+
+    def test_external_keyword_lexes(self):
+        """'external' keyword should tokenize correctly."""
+        lexer = CLexer("external", "test.c")
+        tokens = list(lexer.tokenize())
+        assert tokens[0].type == CTokenType.EXTERNAL
+        assert tokens[0].value == "external"
+
+    def test_external_in_declaration(self):
+        """External declaration should tokenize all parts."""
+        lexer = CLexer("external void foo();", "test.c")
+        tokens = list(lexer.tokenize())
+        assert tokens[0].type == CTokenType.EXTERNAL
+        assert tokens[1].type == CTokenType.VOID
+        assert tokens[2].type == CTokenType.IDENTIFIER
+        assert tokens[2].value == "foo"
+
+    # -------------------------------------------------------------------------
+    # Parser Tests - Valid Declarations
+    # -------------------------------------------------------------------------
+
+    def test_simple_external_declaration(self):
+        """Simple external declaration should parse correctly."""
+        source = "external void azMENU();"
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 1
+        func = ast.declarations[0]
+        assert isinstance(func, FunctionNode)
+        assert func.name == "azMENU"
+        assert func.is_external
+        assert func.return_type.base_type == BaseType.VOID
+        assert len(func.parameters) == 0
+        assert func.body is None
+
+    def test_multiple_external_declarations(self):
+        """Multiple external declarations should parse correctly."""
+        source = """
+        external void azMENU();
+        external void azHELP();
+        external void azINIT();
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 3
+        for func in ast.declarations:
+            assert isinstance(func, FunctionNode)
+            assert func.is_external
+
+        assert ast.declarations[0].name == "azMENU"
+        assert ast.declarations[1].name == "azHELP"
+        assert ast.declarations[2].name == "azINIT"
+
+    def test_external_with_explicit_void_params(self):
+        """External declaration with explicit void params should parse."""
+        source = "external void azMENU(void);"
+        ast = parse_source(source)
+
+        func = ast.declarations[0]
+        assert func.is_external
+        assert len(func.parameters) == 0
+
+    def test_external_mixed_with_functions(self):
+        """External declarations mixed with regular functions should parse."""
+        source = """
+        external void azMENU();
+
+        void main() {
+            azMENU();
+        }
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 2
+        assert ast.declarations[0].is_external
+        assert ast.declarations[0].name == "azMENU"
+        assert not ast.declarations[1].is_external
+        assert ast.declarations[1].name == "main"
+
+    def test_external_8_char_name(self):
+        """External declaration with exactly 8-char name should parse."""
+        source = "external void PROCNAME();"  # 8 characters
+        ast = parse_source(source)
+
+        func = ast.declarations[0]
+        assert func.name == "PROCNAME"
+        assert func.is_external
+
+    # -------------------------------------------------------------------------
+    # Parser Tests - Error Cases
+    # -------------------------------------------------------------------------
+
+    def test_external_non_void_return_error(self):
+        """External with non-void return type should raise error."""
+        source = "external int azMENU();"
+        with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
+            parse_source(source)
+        assert "void" in str(exc_info.value).lower()
+
+    def test_external_with_parameters_error(self):
+        """External with parameters should raise error."""
+        source = "external void azMENU(int x);"
+        with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
+            parse_source(source)
+        assert "parameter" in str(exc_info.value).lower()
+
+    def test_external_name_too_long_error(self):
+        """External with name > 8 chars should raise error."""
+        source = "external void VERYLONGNAME();"  # 12 characters
+        with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
+            parse_source(source)
+        assert "8" in str(exc_info.value)
+
+    def test_external_with_body_error(self):
+        """External declaration cannot have a body."""
+        source = "external void azMENU() { }"
+        with pytest.raises((CSyntaxError, SmallCError)):
+            parse_source(source)
+
+    def test_external_char_return_error(self):
+        """External with char return type should raise error."""
+        source = "external char azMENU();"
+        with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
+            parse_source(source)
+        assert "void" in str(exc_info.value).lower()
+
+    def test_external_pointer_return_error(self):
+        """External with pointer return type should raise error."""
+        source = "external void *azMENU();"
+        with pytest.raises((CSyntaxError, SmallCError)):
+            parse_source(source)
+
+    # -------------------------------------------------------------------------
+    # Code Generator Tests - Setup Injection
+    # -------------------------------------------------------------------------
+
+    def test_external_injects_setup_in_main(self):
+        """External declaration should inject setup code in main()."""
+        source = """
+        external void azMENU();
+
+        void main() {
+            azMENU();
+        }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should contain setup call at start of main
+        assert "JSR" in asm
+        assert "_call_opl_setup" in asm
+        # Setup should come before local allocation (if any)
+        main_start = asm.find("_main:")
+        setup_pos = asm.find("_call_opl_setup", main_start)
+        assert setup_pos > main_start  # Setup is after _main label
+
+    def test_no_setup_without_external(self):
+        """Without external declarations, no setup should be injected."""
+        source = """
+        void foo() { }
+
+        void main() {
+            foo();
+        }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert "_call_opl_setup" not in asm
+
+    def test_setup_only_once(self):
+        """Setup should only be injected once, even with multiple externals."""
+        source = """
+        external void azMENU();
+        external void azHELP();
+        external void azINIT();
+
+        void main() {
+            azMENU();
+            azHELP();
+            azINIT();
+        }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Count occurrences of _call_opl_setup
+        count = asm.count("_call_opl_setup")
+        assert count == 1  # Only one setup call
+
+    # -------------------------------------------------------------------------
+    # Code Generator Tests - External Calls
+    # -------------------------------------------------------------------------
+
+    def test_external_call_generates_call_opl(self):
+        """External function call should generate _call_opl invocation."""
+        source = """
+        external void azMENU();
+
+        void main() {
+            azMENU();
+        }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should call _call_opl, not JSR _azMENU
+        assert "JSR" in asm
+        assert "_call_opl" in asm
+        # Should NOT have JSR _azMENU (direct call)
+        # The procedure name is in a string constant, not a label
+        assert "JSR\t_azMENU" not in asm and "JSR     _azMENU" not in asm
+
+    def test_external_call_generates_string_literal(self):
+        """External call should generate procedure name string."""
+        source = """
+        external void azMENU();
+
+        void main() {
+            azMENU();
+        }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should contain the procedure name as a string
+        assert "azMENU" in asm
+        # Should have FCC directive for the string
+        assert "FCC" in asm or "FCB" in asm
+
+    def test_multiple_external_calls(self):
+        """Multiple external calls should each generate _call_opl."""
+        source = """
+        external void azMENU();
+        external void azHELP();
+
+        void main() {
+            azMENU();
+            azHELP();
+        }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should have multiple _call_opl calls (after the setup)
+        # Count JSR _call_opl (not _call_opl_setup)
+        lines = asm.split('\n')
+        call_opl_count = sum(1 for line in lines
+                             if '_call_opl' in line
+                             and '_call_opl_setup' not in line
+                             and 'JSR' in line)
+        assert call_opl_count == 2
+
+    def test_external_call_preserves_locals(self):
+        """External call should work with local variables."""
+        source = """
+        external void azMENU();
+
+        void main() {
+            int score;
+            score = 42;
+            azMENU();
+            score = score + 1;
+        }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should compile without error
+        assert "_main:" in asm
+        assert "_call_opl" in asm
+
+    # -------------------------------------------------------------------------
+    # Integration Tests
+    # -------------------------------------------------------------------------
+
+    def test_full_compilation_with_external(self):
+        """Full compilation with external should succeed."""
+        source = """
+        external void azMENU();
+        external void azHELP();
+
+        int g_score;
+
+        void main() {
+            g_score = 100;
+            azMENU();
+            g_score = g_score + 10;
+            azHELP();
+        }
+        """
+        asm = compile_c(source)
+
+        assert "_main:" in asm
+        assert "_call_opl_setup" in asm
+        assert "_call_opl" in asm
+        assert "_g_score:" in asm
+
+    def test_external_with_helper_functions(self):
+        """External calls from helper functions should work."""
+        source = """
+        external void azMENU();
+
+        void show_menu() {
+            azMENU();
+        }
+
+        void main() {
+            show_menu();
+        }
+        """
+        asm = compile_c(source)
+
+        assert "_main:" in asm
+        assert "_show_menu:" in asm
+        # Setup should be in main, not in show_menu
+        # Find where setup is
+        assert "_call_opl_setup" in asm
+        assert "_call_opl" in asm
+
+    def test_ast_printer_shows_external(self):
+        """AST printer should indicate external functions."""
+        source = "external void azMENU();"
+        ast = parse_source(source)
+        printer = ASTPrinter()
+        output = printer.print(ast)
+
+        assert "External" in output
+        assert "azMENU" in output
