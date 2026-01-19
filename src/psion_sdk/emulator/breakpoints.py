@@ -39,15 +39,15 @@ class BreakReason(Enum):
 
     Used in BreakEvent to indicate what triggered the break.
     """
-    NONE = auto()           # No specific reason (normal termination)
-    PC_BREAKPOINT = auto()  # PC reached a breakpoint address
-    MEMORY_READ = auto()    # Memory read watchpoint triggered
-    MEMORY_WRITE = auto()   # Memory write watchpoint triggered
-    SYSCALL = auto()        # Syscall hook requested stop
-    STEP = auto()           # Single-step mode
-    USER_INTERRUPT = auto() # User requested stop
-    MAX_CYCLES = auto()     # Maximum cycle count reached
-    ERROR = auto()          # Runtime error occurred
+    NONE = auto()              # No specific reason (normal termination)
+    PC_BREAKPOINT = auto()     # PC reached a breakpoint address
+    MEMORY_READ = auto()       # Memory read watchpoint triggered
+    MEMORY_WRITE = auto()      # Memory write watchpoint triggered
+    SYSCALL = auto()           # Syscall hook requested stop
+    STEP = auto()              # Single-step mode
+    USER_INTERRUPT = auto()    # User requested stop
+    MAX_CYCLES = auto()        # Maximum cycle count reached
+    ERROR = auto()             # Runtime error occurred
 
 
 @dataclass

@@ -40,6 +40,17 @@
 ; (e.g., __strlen). These wrappers provide compatibility.
 ; =============================================================================
 
+; -----------------------------------------------------------------------------
+; Fixed Zero-Page Storage (must be defined before first use)
+; -----------------------------------------------------------------------------
+; These use the temporary work words in zero page.
+; UTW_S0-3 are trashed by allocator calls, but UTW_W0-W2 are safe.
+; These MUST be defined here (not later) to avoid forward reference issues
+; in the two-pass assembler.
+;
+_CALL_OPL_TAG   EQU     UTW_W0  ; $84: Tag of our allocated cell
+; NOTE: Resume address is now stored in cell at _COL_RESUME offset, not zero-page
+
 _strlen:        JMP     __strlen        ; char *s -> int length
 _memcpy:        JMP     __memcpy        ; void *dest, void *src, int n -> void *dest
 _memset:        JMP     __memset        ; void *dest, int c, int n -> void *dest
@@ -1434,6 +1445,10 @@ QCO_USR         EQU     $9F     ; USR() function opcode
                                 ; Pops address and argument from stack
                                 ; Calls machine code at address with arg in D
 
+QCO_PUSHBYTE    EQU     $20     ; Push 8-bit integer onto expression stack
+                                ; Format: $20 BB (single byte value)
+                                ; Used for parameter count in procedure calls
+
 ; =============================================================================
 ; QCODE BUFFER LAYOUT (Stack-Preserving Version)
 ; =============================================================================
@@ -1441,14 +1456,16 @@ QCO_USR         EQU     $9F     ; USR() function opcode
 ; The _call_opl function builds this structure in _call_opl_buf:
 ;
 ;   ┌────────────────────────────────────────────────────────────────────┐
-;   │ Byte 0:        $7D                QCO_PROC opcode                  │
-;   │ Byte 1:        len                Procedure name length (1-8)      │
-;   │ Bytes 2..N:    name               Procedure name bytes (no null)   │
-;   │ Byte N+1:      $22                QCO_PUSHWORD opcode              │
-;   │ Bytes N+2,N+3: HH LL              _call_opl_restore addr (BIG-END) │
-;   │ Byte N+4:      $22                QCO_PUSHWORD opcode              │
-;   │ Bytes N+5,N+6: SP_H SP_L          Saved SP value (BIG-ENDIAN!)     │
-;   │ Byte N+7:      $9F                QCO_USR opcode                   │
+;   │ Byte 0:        $20                QCO_PUSHBYTE opcode              │
+;   │ Byte 1:        $00                Parameter count (0 for no args)  │
+;   │ Byte 2:        $7D                QCO_PROC opcode                  │
+;   │ Byte 3:        len                Procedure name length (1-8)      │
+;   │ Bytes 4..N+2:  name               Procedure name bytes (no null)   │
+;   │ Byte N+3:      $22                QCO_PUSHWORD opcode              │
+;   │ Bytes N+4,N+5: HH LL              _call_opl_restore addr (BIG-END) │
+;   │ Byte N+6:      $22                QCO_PUSHWORD opcode              │
+;   │ Bytes N+7,N+8: SP_H SP_L          Saved SP value (BIG-ENDIAN!)     │
+;   │ Byte N+9:      $9F                QCO_USR opcode                   │
 ;   └────────────────────────────────────────────────────────────────────┘
 ;
 ; The key insight: saved_SP is passed as the USR() argument!
@@ -1459,11 +1476,12 @@ QCO_USR         EQU     $9F     ; USR() function opcode
 ;
 ; Example: call_opl("SUB"); with restore at $0ABC and saved_SP=$1FF0 builds:
 ;
-;   Offset: 0   1   2   3   4   5   6   7   8   9  10  11
-;   Bytes:  7D  03  53  55  42  22  0A  BC  22  1F  F0  9F
-;               |   S   U   B  |   |rest|  |  |saved| USR
-;               └─ length ─────┘   └─────┘  └───────┘
-;                                  restore   SP as
+;   Offset: 0   1   2   3   4   5   6   7   8   9  10  11  12  13
+;   Bytes:  20  00  7D  03  53  55  42  22  0A  BC  22  1F  F0  9F
+;           |cnt|      |   S   U   B  |   |rest|  |  |saved| USR
+;           └─0─┘      └─ length ─────┘   └─────┘  └───────┘
+;           param                         restore   SP as
+;           count                         address   argument
 ;                                  addr      argument!
 ;
 ; =============================================================================
@@ -1615,51 +1633,65 @@ QCO_USR         EQU     $9F     ; USR() function opcode
 _call_opl:
         ;
         ; ═══════════════════════════════════════════════════════════════════
-        ; STEP 1: Capture SP for later restoration (BEFORE prologue!)
+        ; STEP 1: Capture SP and arguments from stack
         ; ═══════════════════════════════════════════════════════════════════
         ;
         ; At entry, SP points to: [return_addr 2B][name_ptr 2B]
         ; After normal return + cleanup, SP would be at entry_SP + 4.
-        ; We capture this "resume SP" now, before any stack manipulation.
         ;
-        TSX                     ; X = SP (points to return addr)
-        XGDX                    ; D = entry SP
-        ADDD    #4              ; D = resume_SP (after ret addr + arg cleaned)
-        STD     _call_opl_saved_sp ; Save for QCode buffer
-        XGDX                    ; X = entry SP (restore for indexing)
-        ;
-        ; Stack state at entry (before PSHX):
+        ; Stack state at entry:
         ;   ┌─────────────────────────┐
-        ;   │ 0,X - 1,X: return addr  │ ← X points here
+        ;   │ 0,X - 1,X: return addr  │ ← SP/X points here
         ;   │ 2,X - 3,X: name_ptr     │ (the argument)
         ;   └─────────────────────────┘
         ;
-
+        TSX                     ; X = SP (points to return addr)
         ;
-        ; ═══════════════════════════════════════════════════════════════════
-        ; STEP 2: Extract arguments and calculate resume address
-        ; ═══════════════════════════════════════════════════════════════════
+        ; Extract name_ptr first (before we lose X)
         ;
-        ; Save name_ptr to static storage (at 2,X before PSHX)
         LDD     2,X             ; D = name_ptr (argument at 2,X)
-        STD     _call_opl_name_ptr ; Save to static storage
+        PSHB
+        PSHA                    ; Save name_ptr on stack
         ;
-        ; Calculate resume_addr = return_addr + 2
-        ; This skips the "INS INS" cleanup code after JSR _call_opl
-        ; so we resume at the actual next statement.
+        ; Calculate resume_addr = return_addr + 2 (skips INS INS cleanup)
         ;
-        LDD     0,X             ; D = return address (at 0,X)
-        ADDD    #2              ; D = return_addr + 2 (skip INS INS)
-        STD     _call_opl_resume   ; Save calculated resume address
-
+        LDD     0,X             ; D = return address
+        ADDD    #2              ; D = return_addr + 2
+        PSHB
+        PSHA                    ; Save resume_addr on stack
+        ;
+        ; Calculate resume_SP = entry_SP + 4
+        ;
+        XGDX                    ; D = entry SP (was in X from TSX)
+        ADDD    #4              ; D = resume_SP
+        PSHB
+        PSHA                    ; Save saved_sp on stack
+        ;
+        ; ═══════════════════════════════════════════════════════════════════
+        ; STEP 2: Store values to allocated cell
+        ; ═══════════════════════════════════════════════════════════════════
+        ;
+        ; Stack now: [saved_sp][resume_addr][name_ptr][ret_addr][orig_name_ptr]
+        ;
+        JSR     _call_opl_get_cell ; X = cell base
+        ;
+        PULA
+        PULB                    ; D = saved_sp
+        STD     _COL_SAVED_SP,X ; Store at offset 2
+        ;
+        PULA
+        PULB                    ; D = resume_addr
+        STD     _COL_RESUME,X   ; Store at offset 28
+        ;
+        PULA
+        PULB                    ; D = name_ptr
+        STD     _COL_NAME_PTR,X ; Store at offset 0
         ;
         ; ═══════════════════════════════════════════════════════════════════
         ; STEP 3: Count procedure name length
         ; ═══════════════════════════════════════════════════════════════════
-        ; Psion procedure names are max 8 characters. We count until null
-        ; or until we hit the limit.
         ;
-        LDX     _call_opl_name_ptr ; X = pointer to name string
+        LDX     _COL_NAME_PTR,X ; X = pointer to name string (from cell)
         CLRB                    ; B = length counter, start at 0
 _call_opl_count:
         TST     0,X             ; Test byte at current position
@@ -1679,32 +1711,50 @@ _call_opl_build:
         ; STEP 4: Build QCode buffer
         ; ═══════════════════════════════════════════════════════════════════
         ; We build the buffer byte-by-byte using _call_opl_emit helper.
-        ; The helper manages a write index for sequential writing.
         ;
         ; At this point: B = name length (1-8)
         ;
-        STAB    _call_opl_namelen  ; Save length for later use
-        CLR     _call_opl_idx      ; Initialize buffer write index to 0
+        PSHB                    ; Save length on stack
+        JSR     _call_opl_get_cell ; X = cell base
+        PULB                    ; B = length
+        STAB    _COL_NAMELEN,X  ; Save length in cell
+        CLR     _COL_IDX,X      ; Initialize buffer write index to 0
 
         ;
         ; ─────────────────────────────────────────────────────────────────
-        ; 4a. Write procedure call header: $7D + length
+        ; 4a. Write parameter count: $20 $00 (push 0 for no arguments)
+        ; ─────────────────────────────────────────────────────────────────
+        ; QCO_PROC reads the parameter count from the language stack.
+        ; Before calling a procedure with 0 arguments, OPL emits "$20 $00"
+        ; to push 0 onto the stack. Without this, QCO_PROC reads garbage
+        ; and reports "ARG COUNT ERR".
+        ;
+        LDAA    #QCO_PUSHBYTE   ; A = $20 (push byte opcode)
+        BSR     _call_opl_emit  ; buf[0] = $20
+        ;
+        CLRA                    ; A = 0 (parameter count for no-arg call)
+        BSR     _call_opl_emit  ; buf[1] = $00
+        ;
+        ; ─────────────────────────────────────────────────────────────────
+        ; 4b. Write procedure call header: $7D + length
         ; ─────────────────────────────────────────────────────────────────
         ;
         LDAA    #QCO_PROC       ; A = $7D (procedure call opcode)
-        BSR     _call_opl_emit  ; buf[0] = $7D
+        BSR     _call_opl_emit  ; buf[2] = $7D
         ;
-        LDAA    _call_opl_namelen ; A = name length
-        BSR     _call_opl_emit  ; buf[1] = length
+        JSR     _call_opl_get_cell ; X = cell base
+        LDAA    _COL_NAMELEN,X  ; A = name length
+        BSR     _call_opl_emit  ; buf[3] = length
 
         ;
         ; ─────────────────────────────────────────────────────────────────
-        ; 4b. Write procedure name bytes (without null terminator)
+        ; 4c. Write procedure name bytes (without null terminator)
         ; ─────────────────────────────────────────────────────────────────
-        ; Loop copies 'B' bytes from name string to buffer.
+        ; Loop copies 'namelen' bytes from name string to buffer.
         ;
-        LDX     _call_opl_name_ptr ; X = source pointer (name string)
-        LDAB    _call_opl_namelen  ; B = byte counter
+        JSR     _call_opl_get_cell ; X = cell base
+        LDAB    _COL_NAMELEN,X  ; B = byte counter
+        LDX     _COL_NAME_PTR,X ; X = source pointer (name string)
 _call_opl_copyname:
         TSTB                    ; Check if counter is zero
         BEQ     _call_opl_suffix   ; If zero, name copy complete
@@ -1721,7 +1771,7 @@ _call_opl_copyname:
 _call_opl_suffix:
         ;
         ; ─────────────────────────────────────────────────────────────────
-        ; 4c. Write _call_opl_restore address: $22 + addr (big-endian)
+        ; 4d. Write _call_opl_restore address: $22 + addr (big-endian)
         ; ─────────────────────────────────────────────────────────────────
         ; This is the function that will receive the saved SP and restore it.
         ; OPL QCode uses BIG-ENDIAN for 16-bit values!
@@ -1738,7 +1788,7 @@ _call_opl_suffix:
 
         ;
         ; ─────────────────────────────────────────────────────────────────
-        ; 4d. Write saved SP as USR argument: $22 + saved_SP (big-endian)
+        ; 4e. Write saved SP as USR argument: $22 + saved_SP (big-endian)
         ; ─────────────────────────────────────────────────────────────────
         ; THIS IS THE KEY TRICK! The saved SP is passed as the USR argument.
         ; When USR(_call_opl_restore, saved_SP) is called:
@@ -1749,7 +1799,8 @@ _call_opl_suffix:
         LDAA    #QCO_PUSHWORD   ; A = $22 (push word opcode)
         BSR     _call_opl_emit  ; Write $22
         ;
-        LDD     _call_opl_saved_sp ; D = saved SP value (resume SP)
+        JSR     _call_opl_get_cell ; X = cell base
+        LDD     _COL_SAVED_SP,X ; D = saved SP value (resume SP)
         PSHB                    ; Save low byte
         BSR     _call_opl_emit  ; Write high byte (A)
         PULA                    ; A = low byte (was B)
@@ -1757,7 +1808,7 @@ _call_opl_suffix:
 
         ;
         ; ─────────────────────────────────────────────────────────────────
-        ; 4e. Write USR opcode: $9F
+        ; 4f. Write USR opcode: $9F
         ; ─────────────────────────────────────────────────────────────────
         ; This completes the buffer. When the interpreter executes this,
         ; it will call USR(_call_opl_restore, saved_SP)!
@@ -1775,8 +1826,14 @@ _call_opl_suffix:
         ;
         ; RTA_PC is at $A9/$AA - CONFIRMED STABLE across all Psion II models.
         ;
-        LDX     #_call_opl_buf  ; X = address of our QCode buffer
-        STX     RTA_PC          ; RTA_PC = &_call_opl_buf
+        ; Calculate buffer address: cell_base + _COL_BUF offset
+        ;
+        JSR     _call_opl_get_cell ; X = cell base
+        XGDX                    ; D = cell base
+        ADDD    #_COL_BUF       ; D = cell_base + 8 (buffer offset)
+        SUBD    #1              ; Pre-compensate: interpreter adds 1 after USR return
+        XGDX                    ; X = adjusted buffer address
+        STX     RTA_PC          ; RTA_PC = &buffer - 1 (becomes &buffer after +1)
 
         ;
         ; ═══════════════════════════════════════════════════════════════════
@@ -1799,8 +1856,10 @@ _call_opl_suffix:
         ;   6. _call_opl_restore restores SP and jumps to resume_addr
         ;   7. Back in C code with stack intact!
         ;
-        LDX     _usr_entry_sp   ; X = USR entry stack pointer
+        JSR     _call_opl_get_cell ; X = cell base
+        LDX     _COL_USR_SP,X   ; X = USR entry stack pointer
         TXS                     ; SP = X (unwind entire C stack)
+        CLRB                    ; B=0 so interpreter doesn't advance RTA_PC!
         RTS                     ; Exit USR! Interpreter takes over.
 
 ; =============================================================================
@@ -1808,14 +1867,15 @@ _call_opl_suffix:
 ; =============================================================================
 ;
 ; Helper subroutine for buffer construction. Writes a single byte to
-; _call_opl_buf at the current index, then increments the index.
+; the QCode buffer at the current index, then increments the index.
+; The buffer is located in the dynamically allocated cell.
 ;
 ; INPUT
 ;   A = byte to write
 ;
 ; OUTPUT
 ;   Byte written to buffer
-;   _call_opl_idx incremented
+;   idx incremented in cell
 ;
 ; CLOBBERS
 ;   X (used for address calculation)
@@ -1826,17 +1886,54 @@ _call_opl_suffix:
 ;
 ; NOTES
 ;   Uses indexed addressing: buf[idx] = A; idx++;
-;   This is like the HD6303's missing Y register (simulated with memory).
+;   Accesses the allocated cell via tag dereference.
 ;
 ; -----------------------------------------------------------------------------
 _call_opl_emit:
-        LDX     #_call_opl_buf  ; X = base address of buffer
-        PSHB                    ; Save B (caller may be using it)
-        LDAB    _call_opl_idx   ; B = current write index
-        ABX                     ; X = buf + index (effective address)
-        STAA    0,X             ; Write byte A to buffer
-        INC     _call_opl_idx   ; Increment index for next write
-        PULB                    ; Restore B
+        PSHA                    ; [1] Save A (the byte to write)
+        PSHB                    ; [2] Save B (caller's value)
+        ;
+        ; Stack: [B_saved][A_byte][ret_addr]
+        ;
+        ; Get cell base
+        ;
+        JSR     _call_opl_get_cell ; X = cell base
+        ;
+        ; Load current index and calculate buffer address
+        ; Buffer addr = cell_base + _COL_BUF + idx
+        ;
+        LDAB    _COL_IDX,X      ; B = current index (0-19)
+        PSHB                    ; [3] Save index
+        ;
+        ; Stack: [idx][B_saved][A_byte][ret_addr]
+        ;
+        ; Increment index in cell now (before we lose X)
+        ;
+        INC     _COL_IDX,X
+        ;
+        ; Calculate buffer address
+        ;
+        XGDX                    ; D = cell base
+        ADDD    #_COL_BUF       ; D = buffer start (cell + 8)
+        XGDX                    ; X = buffer start
+        PULB                    ; B = index
+        ABX                     ; X = &buf[idx] (final address)
+        ;
+        ; Stack: [B_saved][A_byte][ret_addr]
+        ;
+        ; Retrieve the byte to write from stack and store it
+        ; Need to get A from stack position 1 (past B_saved)
+        ;
+        PSHX                    ; [3] Save buffer address
+        TSX                     ; X = SP
+        LDAA    3,X             ; A = byte (at offset 3: [bufaddr][B][A])
+        PULX                    ; X = buffer address
+        STAA    0,X             ; buf[idx] = A
+        ;
+        ; Restore registers
+        ;
+        PULB                    ; Restore caller's B
+        PULA                    ; Restore A (unchanged, for caller)
         RTS
 
 ; =============================================================================
@@ -1878,7 +1975,11 @@ _call_opl_restore:
         ; Now SP is exactly where it was after call_opl() cleanup.
         ; Local variables above this point are intact!
         ;
-        LDX     _call_opl_resume ; X = resume address (saved earlier)
+        ; Get resume address from cell (not zero-page - OPL may corrupt it)
+        ;
+        LDX     _CALL_OPL_TAG   ; X = tag of our cell
+        LDX     0,X             ; X = cell base (dereference tag)
+        LDX     _COL_RESUME,X   ; X = resume address from cell
         LDD     #0              ; D = 0 (standard USR return value)
         JMP     0,X             ; Jump to resume point!
         ;
@@ -1979,10 +2080,31 @@ _call_opl_setup:
         ; We want _usr_entry_sp = current_SP + 4
         ; so that TXS + RTS will return directly to OPL.
         ;
+        ; STEP 1: Capture USR entry SP (before any stack changes)
+        ;
         TSX                     ; X = SP (points to our return addr)
         XGDX                    ; D = current SP
         ADDD    #4              ; D = SP + 4 (skip ret_to_main + saved_X)
-        STD     _usr_entry_sp   ; Save for call_opl() unwinding
+        PSHB
+        PSHA                    ; Save usr_entry_sp temporarily on stack
+        ;
+        ; STEP 2: Allocate memory cell using AL$GRAB
+        ;
+        ; The allocator will find a free cell tag in $2024-$203E range
+        ; and allocate the requested memory, returning the tag in X.
+        ;
+        LDD     #_COL_SIZE      ; D = 28 bytes needed
+        SWI                     ; Call AL$GRAB allocator
+        FCB     AL_GRAB         ; X = tag of allocated cell
+        STX     _CALL_OPL_TAG   ; Save tag to fixed zero-page location
+        ;
+        ; STEP 3: Store usr_entry_sp in the allocated cell
+        ;
+        LDX     0,X             ; X = cell base (dereference tag)
+        PULA
+        PULB                    ; D = usr_entry_sp (from stack)
+        STD     _COL_USR_SP,X   ; Store at offset 4 in cell
+        ;
         RTS
 
 ; =============================================================================
@@ -2096,10 +2218,29 @@ _call_opl_setup:
 ;
 ; -----------------------------------------------------------------------------
 _call_opl_setup_asm:
+        ;
+        ; STEP 1: Capture USR entry SP
+        ;
         TSX                     ; X = SP (points to our return addr)
         XGDX                    ; D = current SP
         ADDD    #2              ; D = SP + 2 (skip just our return addr)
-        STD     _usr_entry_sp   ; Save for _call_opl_asm unwinding
+        PSHB
+        PSHA                    ; Save usr_entry_sp temporarily
+        ;
+        ; STEP 2: Allocate memory cell
+        ;
+        LDD     #_COL_SIZE      ; D = 28 bytes needed
+        SWI                     ; Call AL$GRAB allocator
+        FCB     AL_GRAB         ; X = tag of allocated cell
+        STX     _CALL_OPL_TAG   ; Save tag to zero-page
+        ;
+        ; STEP 3: Store usr_entry_sp in cell
+        ;
+        LDX     0,X             ; X = cell base (dereference tag)
+        PULA
+        PULB                    ; D = usr_entry_sp
+        STD     _COL_USR_SP,X   ; Store at offset 4 in cell
+        ;
         RTS
 
 ; =============================================================================
@@ -2171,27 +2312,45 @@ _call_opl_asm:
         ;
         ; D = name_ptr (passed in D register - assembly convention!)
         ;
-        STD     _call_opl_name_ptr ; Save name pointer to static storage
+        PSHB
+        PSHA                    ; Save name_ptr on stack
         ;
         ; Get return address and use it directly as resume address
         ; (no +2 adjustment needed for assembly - no INS cleanup)
         ;
-        TSX                     ; X = SP (points to return addr)
-        LDD     0,X             ; D = return address
-        STD     _call_opl_resume   ; Save as resume address (exact, no +2)
+        TSX                     ; X = SP (points past pushed name_ptr)
+        LDD     2,X             ; D = return address (at offset 2)
+        PSHB
+        PSHA                    ; Save resume_addr on stack
         ;
         ; Calculate resume_SP = entry_SP + 2 (just skip our return addr)
         ;
-        XGDX                    ; D = entry SP
-        ADDD    #2              ; D = resume_SP (after return addr removed)
-        STD     _call_opl_saved_sp ; Save for QCode buffer
+        XGDX                    ; D = SP (at time of name_ptr push)
+        ADDD    #4              ; D = entry_SP + 4 (skip name_ptr push + ret addr)
+        PSHB
+        PSHA                    ; Save saved_sp on stack
+        ;
+        ; Stack: [saved_sp][resume_addr][name_ptr][ret_addr]
+        ;
+        ; Store values to cell
+        ;
+        JSR     _call_opl_get_cell ; X = cell base
+        PULA
+        PULB                    ; D = saved_sp
+        STD     _COL_SAVED_SP,X ; Store at offset 2
+        PULA
+        PULB                    ; D = resume_addr
+        STD     _COL_RESUME,X   ; Store at offset 28
+        PULA
+        PULB                    ; D = name_ptr
+        STD     _COL_NAME_PTR,X ; Store at offset 0
 
         ;
         ; ═══════════════════════════════════════════════════════════════════
-        ; STEP 2: Count procedure name length (same as C version)
+        ; STEP 2: Count procedure name length
         ; ═══════════════════════════════════════════════════════════════════
         ;
-        LDX     _call_opl_name_ptr ; X = pointer to name string
+        LDX     _COL_NAME_PTR,X ; X = pointer to name string (from cell)
         CLRB                    ; B = length counter, start at 0
 _call_opl_asm_count:
         TST     0,X             ; Test byte at current position
@@ -2210,9 +2369,7 @@ _call_opl_asm_build:
         ; Jump to the shared build code in _call_opl.
         ; At this point:
         ;   - B = name length (1-8)
-        ;   - _call_opl_name_ptr = procedure name string
-        ;   - _call_opl_resume = resume address
-        ;   - _call_opl_saved_sp = resume SP value
+        ;   - Cell contains: name_ptr, saved_sp, resume address
         ;
         ; The _call_opl_build code is shared and handles:
         ;   - Building the QCode buffer
@@ -2222,42 +2379,93 @@ _call_opl_asm_build:
         JMP     _call_opl_build ; Reuse shared build/unwind code
 
 ; =============================================================================
-; Static Storage for OPL Procedure Call Support
+; Dynamic Memory Allocation for OPL Procedure Call Support
 ; =============================================================================
-; These variables hold state during buffer construction and call execution.
-; They are used instead of stack manipulation for clarity and simplicity.
-
-_call_opl_name_ptr:             ; Pointer to procedure name string (saved arg)
-        RMB     2               ; 16-bit pointer
-
-_call_opl_resume:               ; Resume address (calculated from return addr)
-        RMB     2               ; 16-bit address
-
-_call_opl_saved_sp:             ; Saved SP for stack restoration
-        RMB     2               ; 16-bit stack pointer value
-
-_call_opl_namelen:              ; Calculated length of procedure name
-        RMB     1               ; 8-bit value (1-8)
-
-_call_opl_idx:                  ; Current write index into buffer
-        RMB     1               ; 8-bit index
-
-_usr_entry_sp:                  ; Stack pointer at USR() entry
-        RMB     2               ; Set by _call_opl_setup(), used for unwinding
-
-; =============================================================================
-; QCode Injection Buffer
-; =============================================================================
-; This buffer holds the synthesized QCode that the interpreter will execute.
+; These variables are stored in a dynamically allocated memory cell obtained
+; via the Psion allocator service (AL$GRAB). This ensures safe RAM allocation
+; that doesn't conflict with system usage.
 ;
-; Maximum size calculation:
-;   $7D (1) + len (1) + name (8) + $22 (1) + addr (2) + $22 (1) + SP (2) + $9F (1)
-;   = 17 bytes maximum
+; The allocator manages 32 cells with tags at $2000-$203E.
+; Cells $2024-$203E (14 cells) are available for applications.
 ;
-; We allocate 20 bytes for safety margin.
+; MEMORY CELL LAYOUT (offsets from cell base):
+;   +0:  name_ptr   (2B) - Pointer to procedure name string
+;   +2:  saved_sp   (2B) - SP value to restore after OPL call
+;   +4:  usr_sp     (2B) - USR() entry SP for stack unwinding
+;   +6:  namelen    (1B) - Procedure name length (1-8)
+;   +7:  idx        (1B) - Buffer write index
+;   +8:  buf       (20B) - QCode injection buffer
+;   Total: 28 bytes
+;
+; FIXED ZERO-PAGE STORAGE (these survive stack manipulation):
+;   UTW_W0 ($84): Cell TAG returned by AL$GRAB (dereference to get base)
+;   UTW_W1 ($86): Resume address (must be accessible after TXS in restore)
+;
+; WHY UTW_W1 FOR RESUME?
+;   _call_opl_restore needs to access resume_addr AFTER restoring SP.
+;   At that point, the cell base pointer (via tag dereference) is lost
+;   because X was used for TXS. So resume must be at a fixed location.
+;
+; =============================================================================
 
-_call_opl_buf:
-        RMB     20              ; Buffer for synthesized QCode
+; -----------------------------------------------------------------------------
+; Cell Layout Offsets
+; -----------------------------------------------------------------------------
+_COL_NAME_PTR   EQU     0       ; Pointer to procedure name string (2B)
+_COL_SAVED_SP   EQU     2       ; Saved SP for stack restoration (2B)
+_COL_USR_SP     EQU     4       ; USR() entry SP for unwinding (2B)
+_COL_NAMELEN    EQU     6       ; Procedure name length 1-8 (1B)
+_COL_IDX        EQU     7       ; Buffer write index (1B)
+_COL_BUF        EQU     8       ; Buffer for synthesized QCode (20B)
+_COL_RESUME     EQU     28      ; Resume address after OPL call (2B)
+_COL_SIZE       EQU     30      ; Total cell size
+
+; -----------------------------------------------------------------------------
+; Compatibility Symbols (point to cell offsets for documentation)
+; -----------------------------------------------------------------------------
+; These map the old names to cell offsets. Code must load cell base first!
+;
+_call_opl_name_ptr      EQU     _COL_NAME_PTR
+_call_opl_saved_sp      EQU     _COL_SAVED_SP
+_usr_entry_sp           EQU     _COL_USR_SP
+_call_opl_namelen       EQU     _COL_NAMELEN
+_call_opl_idx           EQU     _COL_IDX
+_call_opl_buf           EQU     _COL_BUF
+
+; =============================================================================
+; _call_opl_get_cell - Get cell base address
+; =============================================================================
+; Dereferences the cell tag to get the current base address.
+; The base address may change if other cells are resized, so always
+; call this before accessing cell data.
+;
+; INPUT:  None
+; OUTPUT: X = cell base address
+; CLOBBERS: None (X is the output)
+;
+; -----------------------------------------------------------------------------
+_call_opl_get_cell:
+        LDX     _CALL_OPL_TAG   ; X = tag (e.g., $2024)
+        LDX     0,X             ; X = cell base (dereference tag)
+        RTS
+
+; =============================================================================
+; _call_opl_cleanup - Free the allocated memory cell
+; =============================================================================
+; Call this when the program exits to release the allocated memory.
+; This is good practice but not strictly required as the Psion reclaims
+; all cells when the program terminates.
+;
+; INPUT:  None
+; OUTPUT: Cell is freed
+; CLOBBERS: A, B, X (trashed by AL$FREE)
+;
+; -----------------------------------------------------------------------------
+_call_opl_cleanup:
+        LDX     _CALL_OPL_TAG   ; X = tag of our cell
+        SWI                     ; Call AL$FREE allocator
+        FCB     AL_FREE         ; Free the cell
+        RTS
 
 
 ; =============================================================================

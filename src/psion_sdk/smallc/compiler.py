@@ -123,8 +123,8 @@ class SmallCCompiler:
 
         try:
             # Stage 1: Preprocessing
-            # Returns both preprocessed source and effective target model
-            preprocessed, effective_model = self._preprocess(source, filename)
+            # Returns preprocessed source, effective target model, and float support flag
+            preprocessed, effective_model, has_float_support = self._preprocess(source, filename)
             result.preprocessed_source = preprocessed
             result.target_model = effective_model
 
@@ -136,8 +136,8 @@ class SmallCCompiler:
             ast = self._parse(tokens, filename, preprocessed.splitlines())
             result.ast = ast
 
-            # Stage 4: Code generation (with target model awareness)
-            assembly = self._generate(ast, effective_model)
+            # Stage 4: Code generation (with target model and float support awareness)
+            assembly = self._generate(ast, effective_model, has_float_support)
             result.assembly = assembly
             result.success = True
 
@@ -180,7 +180,7 @@ class SmallCCompiler:
 
         return self.compile_source(source, filepath)
 
-    def _preprocess(self, source: str, filename: str) -> tuple[str, str]:
+    def _preprocess(self, source: str, filename: str) -> tuple[str, str, bool]:
         """
         Run the preprocessor on source code.
 
@@ -189,7 +189,7 @@ class SmallCCompiler:
             filename: Source filename
 
         Returns:
-            Tuple of (preprocessed_source, effective_model)
+            Tuple of (preprocessed_source, effective_model, has_float_support)
         """
         preprocessor = Preprocessor(
             source,
@@ -199,7 +199,8 @@ class SmallCCompiler:
         )
         preprocessed = preprocessor.process()
         effective_model = preprocessor.get_effective_model()
-        return preprocessed, effective_model
+        has_float_support = preprocessor.has_float_support()
+        return preprocessed, effective_model, has_float_support
 
     def _lex(self, source: str, filename: str) -> list:
         """Tokenize preprocessed source."""
@@ -211,18 +212,21 @@ class SmallCCompiler:
         parser = CParser(tokens, filename, source_lines)
         return parser.parse()
 
-    def _generate(self, ast: ProgramNode, target_model: str = "XP") -> str:
+    def _generate(
+        self, ast: ProgramNode, target_model: str = "XP", has_float_support: bool = False
+    ) -> str:
         """
         Generate assembly from AST.
 
         Args:
             ast: The parsed AST
             target_model: Target Psion model (CM, XP, LA, LZ, LZ64)
+            has_float_support: Whether float.h was included
 
         Returns:
             Generated HD6303 assembly code
         """
-        generator = CodeGenerator(target_model=target_model)
+        generator = CodeGenerator(target_model=target_model, has_float_support=has_float_support)
         return generator.generate(ast)
 
 

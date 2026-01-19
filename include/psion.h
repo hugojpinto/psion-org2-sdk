@@ -15,6 +15,14 @@
  *   - Memory: Memory operations
  *   - String: String manipulation
  *
+ * FLOATING POINT SUPPORT:
+ *   For floating point operations (sin, cos, sqrt, etc.), include float.h:
+ *     #include <psion.h>
+ *     #include <float.h>
+ *
+ *   Floating point functions are kept separate to avoid code bloat when
+ *   not needed. See float.h for documentation and examples.
+ *
  * Usage:
  *   #include <psion.h>
  *

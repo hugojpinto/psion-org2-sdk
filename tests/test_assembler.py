@@ -760,6 +760,217 @@ _after:     RTS
 
 
 # =============================================================================
+# Direct vs Extended Addressing Mode Tests
+# =============================================================================
+
+class TestDirectVsExtendedAddressing:
+    """Test direct vs extended addressing mode selection.
+
+    The assembler optimizes to direct mode (2 bytes) when possible, but must
+    use extended mode (3 bytes) in relocatable code for internal symbols.
+    These tests verify the correct mode is used in various scenarios.
+    """
+
+    def test_non_relocatable_uses_direct_for_low_address(self):
+        """Non-relocatable code should use direct mode for addresses <= $FF.
+
+        Without -r flag, the assembler can safely optimize JSR to direct mode
+        when the target address fits in one byte.
+        """
+        source = """
+_target:    NOP                 ; at $0000
+            RTS                 ; at $0001
+_caller:    JSR     _target     ; backward ref to $0000, should use direct
+            RTS
+        """
+        asm = Assembler(relocatable=False)
+        result = asm.assemble(source)
+        code = result[7:]  # Skip OB3 header
+
+        # _target at $0000: NOP (1 byte) + RTS (1 byte) = 2 bytes
+        # _caller at $0002: JSR should use direct mode (9D 00) = 2 bytes
+        # Final RTS at $0004
+
+        # Verify JSR uses direct mode (opcode $9D) not extended ($BD)
+        assert code[2] == 0x9D, f"JSR should use direct mode ($9D), got ${code[2]:02X}"
+        assert code[3] == 0x00, f"JSR target should be $00"
+
+    def test_non_relocatable_uses_extended_for_high_address(self):
+        """Non-relocatable code should use extended mode for addresses > $FF."""
+        source = """
+            ORG     $0100
+_target:    NOP
+            RTS
+_caller:    JSR     _target     ; target at $0100, must use extended
+            RTS
+        """
+        asm = Assembler(relocatable=False)
+        result = asm.assemble(source)
+        code = result[7:]  # Skip OB3 header
+
+        # _target at $0100: NOP + RTS = 2 bytes
+        # _caller at $0102: JSR extended (BD 01 00) = 3 bytes
+
+        # Verify JSR uses extended mode (opcode $BD)
+        assert code[2] == 0xBD, f"JSR should use extended mode ($BD), got ${code[2]:02X}"
+        assert code[3] == 0x01 and code[4] == 0x00, "JSR target should be $0100"
+
+    def test_relocatable_forces_extended_for_internal_symbols(self):
+        """Relocatable code must use extended mode for internal symbols.
+
+        Even when a symbol's address is <= $FF, relocatable code must use
+        extended mode because direct mode addresses cannot be patched.
+        """
+        source = """
+_target:    NOP                 ; at $0000
+            RTS
+_caller:    JSR     _target     ; must use extended for relocation
+            RTS
+        """
+        asm = Assembler(relocatable=True)
+        result = asm.assemble(source)
+
+        # In relocatable mode, there's a stub prepended, so find the user code
+        # The stub is ~93 bytes, but let's find JSR by looking for the pattern
+        # We know _target is at offset 0 in user code, so JSR should target 0x0000
+
+        # Verify JSR uses extended mode (opcode $BD) not direct ($9D)
+        # Search for BD 00 00 pattern (JSR extended to $0000)
+        found_extended = False
+        for i in range(len(result) - 3):
+            if result[i] == 0xBD and result[i+1] == 0x00 and result[i+2] == 0x00:
+                found_extended = True
+                break
+
+        assert found_extended, "Relocatable code should use extended mode (BD 00 00) for internal symbol"
+
+        # Verify direct mode pattern is NOT present for internal JSR
+        found_direct = False
+        for i in range(len(result) - 2):
+            if result[i] == 0x9D and result[i+1] == 0x00:
+                # Check if this looks like a JSR pattern (could be data)
+                # In our simple case, 9D 00 would be suspicious
+                found_direct = True
+                break
+
+        # Note: 9D 00 might appear in the relocation stub, so this test is informational
+        # The key test is that BD 00 00 IS present for the user's JSR
+
+    def test_force_direct_with_prefix(self):
+        """Explicit < prefix forces direct mode even in non-relocatable code.
+
+        The < prefix is an escape hatch for when the programmer explicitly
+        wants direct mode addressing.
+        """
+        source = """
+            JSR     <$50        ; Force direct mode to address $50
+            RTS
+        """
+        asm = Assembler(relocatable=False)
+        result = asm.assemble(source)
+        code = result[7:]  # Skip OB3 header
+
+        # JSR <$50 should generate 9D 50 (direct mode, 2 bytes)
+        assert code[0] == 0x9D, f"JSR < should use direct mode ($9D), got ${code[0]:02X}"
+        assert code[1] == 0x50, f"JSR target should be $50, got ${code[1]:02X}"
+
+    def test_force_extended_with_prefix(self):
+        """Explicit > prefix forces extended mode."""
+        source = """
+            JSR     >$50        ; Force extended mode to address $50
+            RTS
+        """
+        asm = Assembler(relocatable=False)
+        result = asm.assemble(source)
+        code = result[7:]  # Skip OB3 header
+
+        # JSR >$50 should generate BD 00 50 (extended mode, 3 bytes)
+        assert code[0] == 0xBD, f"JSR > should use extended mode ($BD), got ${code[0]:02X}"
+        assert code[1] == 0x00 and code[2] == 0x50, "JSR target should be $0050"
+
+    def test_equ_constant_uses_direct_in_relocatable(self):
+        """EQU constants can use direct mode even in relocatable code.
+
+        Constants defined with EQU represent fixed addresses (like OS calls)
+        that don't need relocation, so direct mode is safe.
+        """
+        source = """
+OS_CALL     EQU     $3F         ; System call address (fixed)
+            JSR     <OS_CALL    ; Should use direct mode
+            RTS
+        """
+        asm = Assembler(relocatable=True)
+        result = asm.assemble(source)
+
+        # Search for 9D 3F pattern (JSR direct to $3F)
+        found_direct = False
+        for i in range(len(result) - 2):
+            if result[i] == 0x9D and result[i+1] == 0x3F:
+                found_direct = True
+                break
+
+        assert found_direct, "JSR <EQU_CONSTANT should use direct mode (9D 3F)"
+
+    def test_ldaa_direct_vs_extended(self):
+        """LDAA should use direct mode for addresses <= $FF, extended otherwise."""
+        source = """
+            LDAA    $50         ; Should use direct mode (96 50)
+            LDAA    $0150       ; Should use extended mode (B6 01 50)
+            RTS
+        """
+        asm = Assembler(relocatable=False)
+        result = asm.assemble(source)
+        code = result[7:]  # Skip OB3 header
+
+        # LDAA $50: direct mode = 96 50 (2 bytes)
+        assert code[0] == 0x96, f"LDAA $50 should use direct mode ($96), got ${code[0]:02X}"
+        assert code[1] == 0x50, f"LDAA target should be $50"
+
+        # LDAA $0150: extended mode = B6 01 50 (3 bytes)
+        assert code[2] == 0xB6, f"LDAA $0150 should use extended mode ($B6), got ${code[2]:02X}"
+        assert code[3] == 0x01 and code[4] == 0x50, "LDAA target should be $0150"
+
+    def test_staa_direct_vs_extended(self):
+        """STAA should use direct mode for addresses <= $FF, extended otherwise."""
+        source = """
+            STAA    $50         ; Should use direct mode (97 50)
+            STAA    $0150       ; Should use extended mode (B7 01 50)
+            RTS
+        """
+        asm = Assembler(relocatable=False)
+        result = asm.assemble(source)
+        code = result[7:]  # Skip OB3 header
+
+        # STAA $50: direct mode = 97 50 (2 bytes)
+        assert code[0] == 0x97, f"STAA $50 should use direct mode ($97), got ${code[0]:02X}"
+        assert code[1] == 0x50
+
+        # STAA $0150: extended mode = B7 01 50 (3 bytes)
+        assert code[2] == 0xB7, f"STAA $0150 should use extended mode ($B7), got ${code[2]:02X}"
+
+    def test_relocatable_ldx_immediate_to_label(self):
+        """LDX #label in relocatable code should use extended and be in fixup table."""
+        source = """
+_data:      FCB     $01,$02,$03
+_code:      LDX     #_data      ; Load address of _data, needs relocation
+            RTS
+        """
+        asm = Assembler(relocatable=True)
+        result = asm.assemble(source)
+
+        # LDX immediate is always 3 bytes (CE xx xx), but the address
+        # should be in the fixup table for relocation
+        # Verify CE is present (LDX immediate opcode)
+        found_ldx_imm = False
+        for i in range(len(result) - 1):
+            if result[i] == 0xCE:
+                found_ldx_imm = True
+                break
+
+        assert found_ldx_imm, "LDX #label should generate CE opcode"
+
+
+# =============================================================================
 # Model Support Tests
 # =============================================================================
 

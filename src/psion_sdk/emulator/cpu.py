@@ -134,7 +134,7 @@ class HD6303:
         # on_memory_write(address, value) -> bool: return False to stop execution
         self.on_memory_write: Optional[Callable[[int, int], bool]] = None
 
-        # Flag set by memory hooks to request execution stop
+        # Flag set by hooks to request execution stop
         self._memory_break_requested: bool = False
 
     # ========================================

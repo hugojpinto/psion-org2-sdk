@@ -12,8 +12,8 @@ from psion_sdk.emulator import (
     BreakpointManager,
     BreakEvent,
     BreakReason,
-    Condition,
 )
+from psion_sdk.emulator.breakpoints import Condition
 
 
 # =============================================================================

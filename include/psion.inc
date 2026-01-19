@@ -13,6 +13,14 @@
 ;   - sysvars.inc   : System variable addresses
 ;   - Common macros for Psion development
 ;
+; FLOATING POINT SUPPORT:
+;   For floating point operations (sin, cos, sqrt, etc.), also include:
+;     INCLUDE "float.inc"      ; FP constants and macros
+;     INCLUDE "fpruntime.inc"  ; FP runtime functions (for C-style API)
+;
+;   FP files are kept separate to avoid code bloat when not needed.
+;   See float.inc for documentation and examples.
+;
 ; Target Model Support:
 ;   Use .MODEL directive or -m CLI flag to specify target machine:
 ;

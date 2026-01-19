@@ -59,6 +59,112 @@ def get_session_or_error(
 
 
 # =============================================================================
+# Cursor Position Helper
+# =============================================================================
+# The Psion OS maintains cursor position and state in system variables.
+# These addresses are STABLE across all Psion II models (CM, XP, LZ, LZ64).
+# Reference: https://www.jaapsch.net/psion/sysvars.htm
+
+# Display cursor system variable addresses
+DPB_CPOS = 0x62  # Current cursor position (1 byte)
+                  # Range: 0-31 for 2-line displays (CM/XP)
+                  #        0-79 for 4-line displays (LZ/LZ64)
+DPB_CUST = 0x63  # Cursor state flags (1 byte)
+                  # Bit 7: cursor visibility (1=on, 0=off)
+                  # Bit 0: cursor style (1=line/underline, 0=block)
+
+
+def get_cursor_info(emulator) -> Dict[str, Any]:
+    """
+    Read cursor position and state from Psion system variables.
+
+    This reads the DPB_CPOS and DPB_CUST system variables from emulator
+    memory to determine the current cursor position and state.
+
+    The cursor position is a linear value that can be converted to
+    row/column coordinates based on the display dimensions:
+    - 2-line displays (CM/XP): 16 columns × 2 rows, position 0-31
+    - 4-line displays (LZ/LZ64): 20 columns × 4 rows, position 0-79
+
+    Args:
+        emulator: The Emulator instance
+
+    Returns:
+        Dictionary containing:
+        - position: Linear cursor position (0-31 or 0-79)
+        - row: Calculated row number (0-based)
+        - column: Calculated column number (0-based)
+        - visible: True if cursor is visible
+        - style: "block" or "line" (underline)
+        - display_lines: Number of display lines (2 or 4)
+        - display_cols: Number of display columns (16 or 20)
+    """
+    # Read cursor position and state from system variables
+    cpos = emulator.read_bytes(DPB_CPOS, 1)[0]
+    cust = emulator.read_bytes(DPB_CUST, 1)[0]
+
+    # Get display dimensions from emulator model
+    display_lines = emulator.model.display_lines
+    display_cols = emulator.model.display_cols
+
+    # Calculate row and column from linear position
+    # Position formula: pos = (row * columns) + column
+    row = cpos // display_cols
+    column = cpos % display_cols
+
+    # Clamp row to valid range (in case position exceeds display size)
+    if row >= display_lines:
+        row = display_lines - 1
+
+    # Parse cursor state flags
+    # Bit 7: cursor visibility (1=on, 0=off)
+    # Bit 0: cursor style (1=line/underline, 0=block)
+    visible = (cust & 0x80) != 0
+    style = "line" if (cust & 0x01) != 0 else "block"
+
+    return {
+        "position": cpos,
+        "row": row,
+        "column": column,
+        "visible": visible,
+        "style": style,
+        "display_lines": display_lines,
+        "display_cols": display_cols,
+    }
+
+
+def format_cursor_info(cursor: Dict[str, Any], compact: bool = False) -> str:
+    """
+    Format cursor information as human-readable string.
+
+    Args:
+        cursor: Dictionary from get_cursor_info()
+        compact: If True, return single-line format for embedding in other output
+
+    Returns:
+        Formatted string describing cursor state
+    """
+    if compact:
+        # Single-line format for embedding in other output
+        visibility = "visible" if cursor["visible"] else "hidden"
+        return (
+            f"Cursor: row {cursor['row']}, col {cursor['column']} "
+            f"(pos {cursor['position']}) [{cursor['style']}, {visibility}]"
+        )
+    else:
+        # Multi-line detailed format
+        visibility = "ON (visible)" if cursor["visible"] else "OFF (hidden)"
+        return (
+            f"Cursor Position:\n"
+            f"  Row: {cursor['row']} (0-{cursor['display_lines']-1})\n"
+            f"  Column: {cursor['column']} (0-{cursor['display_cols']-1})\n"
+            f"  Linear Position: {cursor['position']}\n"
+            f"  Visibility: {visibility}\n"
+            f"  Style: {cursor['style']}"
+        )
+
+
+# =============================================================================
 # High-Level Tools
 # =============================================================================
 
@@ -400,15 +506,25 @@ async def read_screen(
     try:
         emu = session.emulator
 
+        # Always read cursor information for text-based formats
+        # This enables AI agents to understand spatial context on the screen
+        cursor = get_cursor_info(emu)
+
         if format_type == "text":
             text = emu.display_text
-            return success_result(f"Display content:\n{text}")
+            cursor_info = format_cursor_info(cursor, compact=True)
+            return success_result(
+                f"Display content:\n{text}\n\n{cursor_info}"
+            )
 
         elif format_type == "lines":
             lines = emu.display_lines
             result = "Display lines:\n"
-            for i, line in enumerate(lines, 1):
-                result += f"  Line {i}: {repr(line)}\n"
+            for i, line in enumerate(lines):
+                # Mark the cursor position with a visual indicator
+                row_marker = " <-- cursor" if i == cursor["row"] else ""
+                result += f"  [{i}] {repr(line)}{row_marker}\n"
+            result += f"\n{format_cursor_info(cursor, compact=True)}"
             return success_result(result)
 
         elif format_type == "image":
@@ -1260,7 +1376,10 @@ async def get_display(
         display = emu.display
 
         lines = emu.display_lines
-        text = emu.display_text
+
+        # Get detailed cursor information from system variables
+        # This provides accurate cursor position as maintained by the Psion OS
+        cursor = get_cursor_info(emu)
 
         result = (
             f"Display State:\n"
@@ -1269,13 +1388,17 @@ async def get_display(
             f"\nContent:\n"
         )
 
-        # Format each line with line numbers
-        for i, line in enumerate(lines, 1):
-            result += f"  [{i}] \"{line}\"\n"
+        # Format each line with line numbers and cursor indicator
+        for i, line in enumerate(lines):
+            cursor_marker = ""
+            if i == cursor["row"] and cursor["visible"]:
+                # Show column position indicator
+                cursor_marker = f"  <-- cursor at column {cursor['column']}"
+            result += f"  [{i}] \"{line}\"{cursor_marker}\n"
 
-        # Show cursor position if available
-        if hasattr(display, '_cursor_address'):
-            result += f"\nCursor: position {display._cursor_address}"
+        # Add detailed cursor state information
+        # This is essential for AI agents to understand screen position context
+        result += f"\n{format_cursor_info(cursor, compact=False)}"
 
         return success_result(result)
 
@@ -1350,3 +1473,670 @@ async def destroy_session(
 
     except Exception as e:
         return error_result(f"Destroy session error: {e}")
+
+
+# =============================================================================
+# Advanced Debugging Tools
+# =============================================================================
+# These tools provide enhanced debugging capabilities for understanding
+# program behavior, particularly useful for debugging the _call_opl
+# QCode injection mechanism and OPL interpreter interactions.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# OPL Interpreter System Variables
+# -----------------------------------------------------------------------------
+# These addresses are STABLE across all Psion II models (CM, XP, LA, LZ, LZ64, P350)
+# Reference: https://www.jaapsch.net/psion/sysvars.htm
+
+OPL_SYSTEM_VARS = {
+    "RTA_SP": (0xA5, 2, "Language stack pointer"),
+    "RTA_FP": (0xA7, 2, "Frame pointer"),
+    "RTA_PC": (0xA9, 2, "QCode program counter"),
+    "DEFAULT_DEV": (0xB5, 1, "Default device letter ('A'=0x41, 'B'=0x42)"),
+}
+
+
+async def get_opl_state(
+    manager: SessionManager,
+    args: Dict[str, Any]
+) -> ToolResult:
+    """
+    Read OPL interpreter system variables.
+
+    This tool provides quick access to the key OPL runtime variables that
+    control QCode execution. Essential for debugging procedure calls and
+    the _call_opl QCode injection mechanism.
+
+    The addresses are STABLE across all Psion II models.
+
+    Variables returned:
+        RTA_SP ($A5/$A6): Language expression stack pointer
+        RTA_FP ($A7/$A8): Current procedure frame pointer
+        RTA_PC ($A9/$AA): QCode program counter (current execution point)
+        DEFAULT_DEV ($B5): Default device letter for procedure lookup
+
+    Args:
+        manager: Session manager
+        args: {"session_id": str}
+
+    Returns:
+        ToolResult with OPL interpreter state
+    """
+    session_id = args.get("session_id", "")
+
+    session, error = get_session_or_error(manager, session_id)
+    if error:
+        return error
+
+    try:
+        emu = session.emulator
+        result_lines = ["OPL Interpreter State:"]
+        result_lines.append("=" * 50)
+
+        for name, (addr, size, desc) in OPL_SYSTEM_VARS.items():
+            if size == 1:
+                value = emu.read_bytes(addr, 1)[0]
+                # Show ASCII for device letter
+                if name == "DEFAULT_DEV" and 0x41 <= value <= 0x5A:
+                    result_lines.append(
+                        f"  {name:12} ${addr:02X}     = ${value:02X} ('{chr(value)}')"
+                    )
+                else:
+                    result_lines.append(
+                        f"  {name:12} ${addr:02X}     = ${value:02X}"
+                    )
+            else:
+                # 16-bit value (big-endian in memory for these vars)
+                hi = emu.read_bytes(addr, 1)[0]
+                lo = emu.read_bytes(addr + 1, 1)[0]
+                value = (hi << 8) | lo
+                result_lines.append(
+                    f"  {name:12} ${addr:02X}/${addr+1:02X}  = ${value:04X}"
+                )
+
+        result_lines.append("")
+        result_lines.append("Description:")
+        for name, (addr, size, desc) in OPL_SYSTEM_VARS.items():
+            result_lines.append(f"  {name}: {desc}")
+
+        return success_result('\n'.join(result_lines))
+
+    except Exception as e:
+        return error_result(f"Get OPL state error: {e}")
+
+
+async def disassemble(
+    manager: SessionManager,
+    args: Dict[str, Any]
+) -> ToolResult:
+    """
+    Disassemble HD6303 machine code at a memory address.
+
+    Reads memory from the emulator and disassembles it into HD6303
+    assembly language mnemonics. Useful for understanding what machine
+    code is executing, examining ROM routines, or debugging C-compiled code.
+
+    Args:
+        manager: Session manager
+        args: {
+            "session_id": str,
+            "address": int,       # Starting address to disassemble
+            "count": int,         # Number of instructions (default: 16)
+            "show_bytes": bool    # Include raw bytes in output (default: True)
+        }
+
+    Returns:
+        ToolResult with disassembly listing
+    """
+    session_id = args.get("session_id", "")
+    address = args.get("address", -1)
+    count = args.get("count", 16)
+    show_bytes = args.get("show_bytes", True)
+
+    session, error = get_session_or_error(manager, session_id)
+    if error:
+        return error
+
+    # Validate
+    if address < 0 or address > 0xFFFF:
+        return error_result("Address required (0-65535)")
+    if count < 1 or count > 100:
+        return error_result("Count must be 1-100")
+
+    try:
+        # Import disassembler
+        from psion_sdk.disassembler import HD6303Disassembler
+
+        emu = session.emulator
+
+        # Read enough bytes for disassembly (max 3 bytes per instruction)
+        max_bytes = min(count * 3, 0x10000 - address)
+        data = emu.read_bytes(address, max_bytes)
+
+        # Disassemble
+        disasm = HD6303Disassembler()
+        instructions = disasm.disassemble(data, start_address=address, count=count)
+
+        # Format output
+        result_lines = [f"Disassembly at ${address:04X} ({count} instructions):"]
+        result_lines.append("")
+
+        for instr in instructions:
+            if show_bytes:
+                result_lines.append(str(instr))
+            else:
+                # Compact format without bytes
+                if instr.operand_str:
+                    line = f"${instr.address:04X}: {instr.mnemonic} {instr.operand_str}"
+                else:
+                    line = f"${instr.address:04X}: {instr.mnemonic}"
+                if instr.comment:
+                    line += f"  ; {instr.comment}"
+                result_lines.append(line)
+
+        return success_result('\n'.join(result_lines))
+
+    except ImportError:
+        return error_result(
+            "Disassembler not available. Check psion_sdk.disassembler module."
+        )
+    except Exception as e:
+        return error_result(f"Disassemble error: {e}")
+
+
+async def disassemble_qcode(
+    manager: SessionManager,
+    args: Dict[str, Any]
+) -> ToolResult:
+    """
+    Disassemble OPL QCode bytecode at a memory address.
+
+    QCode is the bytecode format used by the Psion OPL interpreter.
+    This tool decodes QCode opcodes into human-readable form, which is
+    essential for:
+    - Understanding OPL procedure behavior
+    - Debugging _call_opl QCode injection buffers
+    - Analyzing QCode stored in memory
+
+    Key QCode opcodes:
+        $7D = QCO_PROC (procedure call)
+        $22 = Push 16-bit integer
+        $9F = USR() function call
+        $7B = RETURN
+        $59 $B2 = LZ 4-line mode prefix (STOP+SIN)
+
+    Args:
+        manager: Session manager
+        args: {
+            "session_id": str,
+            "address": int,       # Starting address
+            "count": int,         # Number of opcodes (default: 16)
+            "call_opl_mode": bool # Special formatting for _call_opl buffers
+        }
+
+    Returns:
+        ToolResult with QCode disassembly
+    """
+    session_id = args.get("session_id", "")
+    address = args.get("address", -1)
+    count = args.get("count", 16)
+    call_opl_mode = args.get("call_opl_mode", False)
+
+    session, error = get_session_or_error(manager, session_id)
+    if error:
+        return error
+
+    # Validate
+    if address < 0 or address > 0xFFFF:
+        return error_result("Address required (0-65535)")
+    if count < 1 or count > 100:
+        return error_result("Count must be 1-100")
+
+    try:
+        # Import disassembler
+        from psion_sdk.disassembler import QCodeDisassembler
+
+        emu = session.emulator
+
+        # Read bytes - QCode can have variable-length instructions
+        max_bytes = min(count * 12, 0x10000 - address)  # 12 bytes max per QCode
+        data = emu.read_bytes(address, max_bytes)
+
+        # Disassemble
+        disasm = QCodeDisassembler()
+
+        if call_opl_mode:
+            # Special formatting for _call_opl buffers
+            result = disasm.disassemble_call_opl_buffer(data, start_address=address)
+        else:
+            # Normal disassembly
+            instructions = disasm.disassemble(data, start_address=address, count=count)
+            result_lines = [f"QCode Disassembly at ${address:04X}:"]
+            result_lines.append("")
+            for instr in instructions:
+                result_lines.append(str(instr))
+            result = '\n'.join(result_lines)
+
+        return success_result(result)
+
+    except ImportError:
+        return error_result(
+            "Disassembler not available. Check psion_sdk.disassembler module."
+        )
+    except Exception as e:
+        return error_result(f"Disassemble QCode error: {e}")
+
+
+async def run_with_trace(
+    manager: SessionManager,
+    args: Dict[str, Any]
+) -> ToolResult:
+    """
+    Run emulator with instruction tracing.
+
+    Executes the emulator while recording the last N instructions executed.
+    This is invaluable for debugging complex execution flows where you need
+    to understand exactly what code path was taken.
+
+    The trace captures:
+    - PC address for each instruction
+    - Optionally: full register state at each step
+
+    Use this when:
+    - Debugging why _call_opl_restore is never reached
+    - Understanding QCO_PROC handler behavior
+    - Tracing OPL interpreter dispatch
+
+    Args:
+        manager: Session manager
+        args: {
+            "session_id": str,
+            "max_cycles": int,       # Max cycles to run (default: 100000)
+            "trace_depth": int,      # Instructions to keep in trace (default: 50)
+            "stop_address": int,     # Optional: stop when PC reaches this address
+            "include_registers": bool # Include full registers in trace (default: False)
+        }
+
+    Returns:
+        ToolResult with execution trace
+    """
+    session_id = args.get("session_id", "")
+    max_cycles = args.get("max_cycles", 100_000)
+    trace_depth = args.get("trace_depth", 50)
+    stop_address = args.get("stop_address", None)
+    include_registers = args.get("include_registers", False)
+
+    session, error = get_session_or_error(manager, session_id)
+    if error:
+        return error
+
+    # Validate
+    if trace_depth < 1 or trace_depth > 1000:
+        return error_result("trace_depth must be 1-1000")
+    if max_cycles < 1 or max_cycles > 10_000_000:
+        return error_result("max_cycles must be 1-10000000")
+
+    try:
+        emu = session.emulator
+        trace = []
+        cycles_run = 0
+        hit_stop_address = False
+
+        # Step through execution, recording trace
+        while cycles_run < max_cycles:
+            pc = emu.cpu.pc
+
+            # Check stop condition
+            if stop_address is not None and pc == stop_address:
+                hit_stop_address = True
+                break
+
+            # Record trace entry
+            if include_registers:
+                regs = emu.registers
+                entry = {
+                    "pc": pc,
+                    "a": regs["a"],
+                    "b": regs["b"],
+                    "x": regs["x"],
+                    "sp": regs["sp"],
+                }
+            else:
+                entry = {"pc": pc}
+
+            trace.append(entry)
+
+            # Keep only last N entries
+            if len(trace) > trace_depth:
+                trace.pop(0)
+
+            # Execute one instruction
+            event = emu.step()
+            cycles_run += 1
+
+            # Check for breakpoints
+            if event.reason.name != "MAX_CYCLES":
+                break
+
+        # Format output
+        result_lines = [f"Execution Trace (last {len(trace)} instructions):"]
+        result_lines.append(f"Cycles executed: {cycles_run:,}")
+
+        if hit_stop_address:
+            result_lines.append(f"Stopped at target address: ${stop_address:04X}")
+
+        result_lines.append("")
+
+        # Try to disassemble trace entries
+        try:
+            from psion_sdk.disassembler import HD6303Disassembler
+            disasm = HD6303Disassembler()
+            has_disasm = True
+        except ImportError:
+            has_disasm = False
+
+        for i, entry in enumerate(trace):
+            pc = entry["pc"]
+
+            if has_disasm:
+                # Read a few bytes and disassemble
+                data = emu.read_bytes(pc, 3)
+                instr = disasm.disassemble_one(data, address=pc)
+                if instr.operand_str:
+                    asm = f"{instr.mnemonic} {instr.operand_str}"
+                else:
+                    asm = instr.mnemonic
+            else:
+                asm = ""
+
+            if include_registers:
+                line = (
+                    f"[{i:3d}] ${pc:04X}: {asm:<16} "
+                    f"A=${entry['a']:02X} B=${entry['b']:02X} "
+                    f"X=${entry['x']:04X} SP=${entry['sp']:04X}"
+                )
+            else:
+                line = f"[{i:3d}] ${pc:04X}: {asm}"
+
+            result_lines.append(line)
+
+        return success_result('\n'.join(result_lines))
+
+    except Exception as e:
+        return error_result(f"Run with trace error: {e}")
+
+
+async def set_registers(
+    manager: SessionManager,
+    args: Dict[str, Any]
+) -> ToolResult:
+    """
+    Set CPU register values.
+
+    Modify the HD6303 CPU registers directly. Useful for:
+    - Setting up test conditions
+    - Modifying execution flow
+    - Injecting values for debugging
+
+    Available registers:
+        a, b: 8-bit accumulators (0-255)
+        d: 16-bit combined A:B (0-65535) - sets both A and B
+        x: 16-bit index register (0-65535)
+        sp: 16-bit stack pointer (0-65535)
+        pc: 16-bit program counter (0-65535)
+
+    Note: Modifying PC will change where execution continues.
+    Modifying SP can cause stack corruption if not careful.
+
+    Args:
+        manager: Session manager
+        args: {
+            "session_id": str,
+            "a": int,     # Optional: Set A register (0-255)
+            "b": int,     # Optional: Set B register (0-255)
+            "d": int,     # Optional: Set D register (0-65535), overrides a/b
+            "x": int,     # Optional: Set X register (0-65535)
+            "sp": int,    # Optional: Set SP register (0-65535)
+            "pc": int     # Optional: Set PC register (0-65535)
+        }
+
+    Returns:
+        ToolResult confirming changes
+    """
+    session_id = args.get("session_id", "")
+
+    session, error = get_session_or_error(manager, session_id)
+    if error:
+        return error
+
+    try:
+        emu = session.emulator
+        cpu = emu.cpu
+        changes = []
+
+        # Set D first (if specified) since it sets both A and B
+        if "d" in args:
+            d_val = args["d"]
+            if not 0 <= d_val <= 0xFFFF:
+                return error_result("D must be 0-65535")
+            cpu.a = (d_val >> 8) & 0xFF
+            cpu.b = d_val & 0xFF
+            changes.append(f"D=${d_val:04X} (A=${cpu.a:02X}, B=${cpu.b:02X})")
+
+        # Set individual registers
+        if "a" in args and "d" not in args:
+            a_val = args["a"]
+            if not 0 <= a_val <= 0xFF:
+                return error_result("A must be 0-255")
+            cpu.a = a_val
+            changes.append(f"A=${a_val:02X}")
+
+        if "b" in args and "d" not in args:
+            b_val = args["b"]
+            if not 0 <= b_val <= 0xFF:
+                return error_result("B must be 0-255")
+            cpu.b = b_val
+            changes.append(f"B=${b_val:02X}")
+
+        if "x" in args:
+            x_val = args["x"]
+            if not 0 <= x_val <= 0xFFFF:
+                return error_result("X must be 0-65535")
+            cpu.x = x_val
+            changes.append(f"X=${x_val:04X}")
+
+        if "sp" in args:
+            sp_val = args["sp"]
+            if not 0 <= sp_val <= 0xFFFF:
+                return error_result("SP must be 0-65535")
+            cpu.sp = sp_val
+            changes.append(f"SP=${sp_val:04X}")
+
+        if "pc" in args:
+            pc_val = args["pc"]
+            if not 0 <= pc_val <= 0xFFFF:
+                return error_result("PC must be 0-65535")
+            cpu.pc = pc_val
+            changes.append(f"PC=${pc_val:04X}")
+
+        if not changes:
+            return error_result(
+                "No registers specified. Use: a, b, d, x, sp, pc"
+            )
+
+        # Show final state
+        regs = emu.registers
+        result = "Registers modified:\n"
+        result += "  " + ", ".join(changes) + "\n\n"
+        result += "Current state:\n"
+        result += f"  A=${regs['a']:02X} B=${regs['b']:02X} D=${regs['d']:04X}\n"
+        result += f"  X=${regs['x']:04X} SP=${regs['sp']:04X} PC=${regs['pc']:04X}"
+
+        return success_result(result)
+
+    except Exception as e:
+        return error_result(f"Set registers error: {e}")
+
+
+async def run_until_address(
+    manager: SessionManager,
+    args: Dict[str, Any]
+) -> ToolResult:
+    """
+    Run emulator until PC reaches a specific address.
+
+    This is a convenient alternative to setting a one-shot breakpoint.
+    Execution stops when PC equals the target address, or when max_cycles
+    is reached.
+
+    Use cases:
+    - Run until a specific routine is reached
+    - Continue to a known point after injection
+    - Debug step-over functionality
+
+    Args:
+        manager: Session manager
+        args: {
+            "session_id": str,
+            "address": int,       # Target PC address
+            "max_cycles": int     # Max cycles before timeout (default: 1000000)
+        }
+
+    Returns:
+        ToolResult indicating if address was reached
+    """
+    session_id = args.get("session_id", "")
+    address = args.get("address", -1)
+    max_cycles = args.get("max_cycles", 1_000_000)
+
+    session, error = get_session_or_error(manager, session_id)
+    if error:
+        return error
+
+    # Validate
+    if address < 0 or address > 0xFFFF:
+        return error_result("Address required (0-65535)")
+
+    try:
+        emu = session.emulator
+        initial_cycles = emu.total_cycles
+        cycles_run = 0
+
+        # Run until address reached
+        while cycles_run < max_cycles:
+            if emu.cpu.pc == address:
+                # Found it!
+                cycles_run = emu.total_cycles - initial_cycles
+                regs = emu.registers
+                display = emu.display_text.strip()
+
+                return success_result(
+                    f"Reached target address ${address:04X}!\n"
+                    f"Cycles: {cycles_run:,}\n"
+                    f"Registers: A=${regs['a']:02X} B=${regs['b']:02X} "
+                    f"X=${regs['x']:04X} SP=${regs['sp']:04X}\n"
+                    f"Display:\n{display}"
+                )
+
+            # Step one instruction
+            emu.step()
+            cycles_run += 1
+
+        # Timeout
+        regs = emu.registers
+        return success_result(
+            f"Target ${address:04X} NOT reached within {max_cycles:,} cycles.\n"
+            f"Final PC: ${regs['pc']:04X}\n"
+            f"A=${regs['a']:02X} B=${regs['b']:02X} "
+            f"X=${regs['x']:04X} SP=${regs['sp']:04X}"
+        )
+
+    except Exception as e:
+        return error_result(f"Run until address error: {e}")
+
+
+async def step_with_disasm(
+    manager: SessionManager,
+    args: Dict[str, Any]
+) -> ToolResult:
+    """
+    Execute a single CPU instruction with disassembly output.
+
+    Enhanced version of 'step' that shows the disassembled instruction
+    that was just executed, along with full register state.
+
+    This provides much better visibility than the basic step command
+    when tracing through code.
+
+    Args:
+        manager: Session manager
+        args: {
+            "session_id": str,
+            "count": int          # Number of steps (default: 1, max: 100)
+        }
+
+    Returns:
+        ToolResult with disassembled instruction(s) and register state
+    """
+    session_id = args.get("session_id", "")
+    count = args.get("count", 1)
+
+    session, error = get_session_or_error(manager, session_id)
+    if error:
+        return error
+
+    # Validate
+    if count < 1 or count > 100:
+        return error_result("Count must be 1-100")
+
+    try:
+        # Import disassembler
+        try:
+            from psion_sdk.disassembler import HD6303Disassembler
+            disasm = HD6303Disassembler()
+            has_disasm = True
+        except ImportError:
+            has_disasm = False
+
+        emu = session.emulator
+        result_lines = []
+
+        for i in range(count):
+            pc_before = emu.cpu.pc
+
+            # Get instruction bytes before stepping
+            if has_disasm:
+                data = emu.read_bytes(pc_before, 3)
+                instr = disasm.disassemble_one(data, address=pc_before)
+                instr_str = str(instr)
+            else:
+                opcode = emu.read_bytes(pc_before, 1)[0]
+                instr_str = f"${pc_before:04X}: ${opcode:02X}"
+
+            # Step
+            event = emu.step()
+
+            # Get register state after
+            regs = emu.registers
+            flags = f"Z={regs['z']} N={regs['n']} C={regs['c']} V={regs['v']}"
+
+            # Format output
+            result_lines.append(instr_str)
+            result_lines.append(
+                f"        → A=${regs['a']:02X} B=${regs['b']:02X} "
+                f"X=${regs['x']:04X} SP=${regs['sp']:04X} [{flags}]"
+            )
+
+            # Stop early on breakpoint
+            if event.reason.name != "MAX_CYCLES":
+                result_lines.append(f"        Stop: {event.reason.name}")
+                break
+
+        if count > 1:
+            result_lines.insert(0, f"Executed {min(i+1, count)} instruction(s):\n")
+
+        return success_result('\n'.join(result_lines))
+
+    except Exception as e:
+        return error_result(f"Step with disasm error: {e}")

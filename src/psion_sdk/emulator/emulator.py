@@ -39,7 +39,7 @@ from .memory import Memory
 from .display import Display
 from .keyboard import Keyboard
 from .pack import Pack
-from .breakpoints import BreakpointManager, BreakEvent, BreakReason, Condition
+from .breakpoints import BreakpointManager, BreakEvent, BreakReason
 from .models import PsionModel, get_model, get_rom_path
 
 
@@ -72,9 +72,8 @@ class Emulator:
     whole, providing high-level methods for common operations.
 
     The emulator integrates with the BreakpointManager to support:
-    - PC breakpoints (stop at specific addresses)
-    - Memory watchpoints (stop on read/write to addresses)
-    - Register conditions (stop when registers match conditions)
+    - PC breakpoints (stop at specific addresses, optionally with register conditions)
+    - Memory watchpoints (stop on read/write to addresses, optionally with register conditions)
     - Syscall hooks (intercept OS calls)
 
     Attributes:
@@ -472,35 +471,8 @@ class Emulator:
         if on_write:
             self.breakpoints.add_write_watchpoint(address)
 
-    def add_condition(
-        self,
-        register: str,
-        operator: str,
-        value: int
-    ) -> int:
-        """
-        Add a register condition breakpoint.
-
-        Execution will stop when the condition evaluates to True.
-
-        Args:
-            register: Register name (a, b, d, x, sp, pc, flag_*)
-            operator: Comparison operator (==, !=, <, <=, >, >=, &)
-            value: Value to compare against
-
-        Returns:
-            Condition ID for later removal
-
-        Example:
-            >>> # Break when A register becomes 0
-            >>> cond_id = emu.add_condition('a', '==', 0)
-        """
-        return self.breakpoints.add_register_condition(
-            Condition(register, operator, value)
-        )
-
     def clear_breakpoints(self) -> None:
-        """Remove all breakpoints, watchpoints, and conditions."""
+        """Remove all breakpoints and watchpoints."""
         self.breakpoints.clear_all()
 
     # =========================================================================

@@ -188,16 +188,16 @@ class TestHighLevelTools:
         assert result.is_error is True
 
     @pytest.mark.asyncio
-    async def test_load_program_file_not_found(self, session_manager, temp_rom):
-        """load_program with missing file returns error."""
+    async def test_load_pack_file_not_found(self, session_manager, temp_rom):
+        """load_pack with missing file returns error."""
         session = session_manager.create_session(rom_path=temp_rom)
 
-        result = await tools.load_program(
+        result = await tools.load_pack(
             session_manager,
             {"session_id": session.session_id, "opk_path": "/nonexistent/file.opk"}
         )
         assert result.is_error is True
-        assert "not found" in result.content[0]["text"]
+        assert "not found" in result.content[0]["text"].lower()
 
     @pytest.mark.asyncio
     async def test_wait_for_text_empty(self, session_manager, temp_rom):
@@ -463,26 +463,43 @@ class TestMCPServer:
         assert server.SERVER_NAME == "psion-emulator"
 
     def test_tool_registration(self):
-        """All tools are registered."""
+        """All expected core tools are registered."""
         server = MCPServer()
 
+        # Core tools that must always be present
+        # Note: This list covers the essential tools; additional debugging tools
+        # may be added without breaking this test
         expected_tools = [
+            # Session management
             "create_emulator",
-            "load_program",
-            "run_program",
-            "press_key",
-            "read_screen",
-            "wait_for_text",
-            "step",
-            "run_cycles",
-            "read_memory",
-            "write_memory",
-            "set_breakpoint",
-            "remove_breakpoint",
-            "get_registers",
-            "get_display",
             "list_sessions",
             "destroy_session",
+            # Program loading and execution
+            "load_pack",  # Renamed from load_program
+            "run_program",
+            "boot_emulator",
+            # Input
+            "press_key",
+            "press_key_and_run",
+            "type_text",
+            # Output
+            "read_screen",
+            "get_display",
+            "save_screenshot",
+            "wait_for_text",
+            # Execution control
+            "step",
+            "run_cycles",
+            "run_until_idle",
+            # Memory
+            "read_memory",
+            "write_memory",
+            "search_memory",
+            # Debugging
+            "set_breakpoint",
+            "remove_breakpoint",
+            "list_breakpoints",
+            "get_registers",
         ]
 
         for tool_name in expected_tools:

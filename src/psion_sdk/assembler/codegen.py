@@ -729,6 +729,26 @@ class CodeGenerator:
                 # Look up actual size from opcode table for extended mode
                 info = get_instruction_info(mnemonic, AddressingMode.EXTENDED)
                 return info.size if info else 3
+
+            # CRITICAL: In relocatable mode, any reference to internal symbols
+            # MUST use extended addressing because direct mode addresses cannot
+            # be patched during relocation. Direct mode uses only the low byte
+            # of the address, so JSR $3E would always jump to $003E even if the
+            # code is loaded at $7000+.
+            if self._relocatable:
+                # Check if operand references any non-constant symbols
+                for token in operand.tokens:
+                    if token.type == TokenType.IDENTIFIER:
+                        sym_name = token.value.upper()
+                        # If symbol exists, check if it's a constant
+                        if sym_name in self._symbols:
+                            sym = self._symbols[sym_name]
+                            if not sym.is_constant:
+                                return 3  # Force extended for relocatable symbols
+                        else:
+                            # Unknown symbol - assume it's an internal label
+                            return 3  # Force extended
+
             # Try to evaluate
             try:
                 self._evaluator.set_pc(self._pc)
@@ -835,13 +855,24 @@ class CodeGenerator:
         # Evaluate condition
         condition_met = self._evaluate_condition(cond)
 
-        # Process appropriate body
+        # Process appropriate body with lookahead logic for EQU labels
         if condition_met:
-            for stmt in cond.if_body:
-                self._pass1_statement(stmt)
+            self._pass1_statements_with_lookahead(cond.if_body)
         else:
-            for stmt in cond.else_body:
-                self._pass1_statement(stmt)
+            self._pass1_statements_with_lookahead(cond.else_body)
+
+    def _pass1_statements_with_lookahead(self, statements: list) -> None:
+        """Process statements with lookahead to skip LabelDef before EQU/SET."""
+        for i, stmt in enumerate(statements):
+            # Skip LabelDef if next statement is EQU/SET with same label
+            # (the parser creates both LabelDef and Directive for "LABEL EQU value")
+            if isinstance(stmt, LabelDef) and i + 1 < len(statements):
+                next_stmt = statements[i + 1]
+                if (isinstance(next_stmt, Directive) and
+                    next_stmt.name.upper() in ("EQU", "SET") and
+                    next_stmt.label == stmt.name):
+                    continue  # Skip LabelDef, EQU will define the symbol
+            self._pass1_statement(stmt)
 
     def _evaluate_condition(self, cond: ConditionalBlock) -> bool:
         """Evaluate a conditional assembly condition."""
@@ -1125,23 +1156,48 @@ class CodeGenerator:
         elif operand.is_force_extended:
             use_direct = False
         elif value <= 0xFF:
-            # Check if this was a forward reference in pass 1
-            # In pass 1, forward refs default to extended mode (3 bytes)
-            # We must use the same mode here for symbol addresses to be correct
-            #
-            # A symbol was a forward reference if its address >= the PC at the
-            # start of this instruction (meaning it was defined later in pass 1)
-            is_forward_ref = False
-            for token in operand.tokens:
-                if token.type == TokenType.IDENTIFIER:
-                    sym_name = token.value.upper()
-                    if sym_name in self._symbols:
-                        sym = self._symbols[sym_name]
-                        # If symbol's value >= current PC, it was a forward ref
-                        if sym.value >= self._pc:
-                            is_forward_ref = True
-                            break
-            use_direct = not is_forward_ref
+            # CRITICAL: In relocatable mode, any reference to internal symbols
+            # MUST use extended addressing because direct mode addresses cannot
+            # be patched during relocation. Direct mode uses only the low byte
+            # of the address, so JSR $3E would always jump to $003E even if the
+            # code is loaded at $7000+.
+            if self._relocatable:
+                # Check if operand references any non-constant symbols
+                refs_internal_symbol = False
+                for token in operand.tokens:
+                    if token.type == TokenType.IDENTIFIER:
+                        sym_name = token.value.upper()
+                        if sym_name in self._symbols:
+                            sym = self._symbols[sym_name]
+                            if not sym.is_constant:
+                                refs_internal_symbol = True
+                                break
+                if refs_internal_symbol:
+                    use_direct = False
+                else:
+                    use_direct = True
+            else:
+                # Non-relocatable: Check if this was a forward reference in pass 1
+                # In pass 1, forward refs default to extended mode (3 bytes)
+                # We must use the same mode here for symbol addresses to be correct
+                #
+                # A symbol was a forward reference if its address >= the PC at the
+                # start of this instruction (meaning it was defined later in pass 1)
+                is_forward_ref = False
+                for token in operand.tokens:
+                    if token.type == TokenType.IDENTIFIER:
+                        sym_name = token.value.upper()
+                        if sym_name in self._symbols:
+                            sym = self._symbols[sym_name]
+                            # Skip forward reference check for EQU/SET constants
+                            # Constants are not addresses, so comparing to PC is meaningless
+                            if sym.is_constant:
+                                continue
+                            # If symbol's value >= current PC, it was a forward ref
+                            if sym.value >= self._pc:
+                                is_forward_ref = True
+                                break
+                use_direct = not is_forward_ref
 
         if use_direct:
             info = get_instruction_info(mnemonic, AddressingMode.DIRECT)

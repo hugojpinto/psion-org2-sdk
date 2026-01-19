@@ -113,40 +113,73 @@ RTB_FL      EQU     $46     ; Runtime block pointer
 RTB_PL      EQU     $48     ; Program pointer
 RTB_BL      EQU     $4A     ; Block pointer
 
-; Display state
-DPB_CRSR    EQU     $50     ; Cursor position
-DPB_BUFF    EQU     $51     ; Display buffer pointer (2 bytes)
-DPB_FLAG    EQU     $53     ; Display flags
+; -----------------------------------------------------------------------------
+; Battery State ($60-$61)
+; Reference: https://www.jaapsch.net/psion/sysvars.htm
+; -----------------------------------------------------------------------------
+RTB_LBAT    EQU     $60     ; Low battery flag (non-zero when low)
 
-; Keyboard state
-KBB_STAT    EQU     $58     ; Keyboard status byte
-KBB_SKEY    EQU     $59     ; Last key code
-KBB_KBPT    EQU     $5A     ; Keyboard buffer pointer (2 bytes)
-KBB_KBCT    EQU     $5C     ; Keyboard buffer count
+; -----------------------------------------------------------------------------
+; Display Variables ($62-$70)
+; Reference: https://www.jaapsch.net/psion/sysvars.htm
+; -----------------------------------------------------------------------------
+; These variables track cursor position and display state, essential for
+; AI agents to understand screen layout during text editing operations.
 
-; Pack/file pointers
-PKB_SLTP    EQU     $60     ; Current pack slot
-PKB_ADDR    EQU     $61     ; Pack address (3 bytes)
-PKB_TYPE    EQU     $64     ; Pack type
+DPB_CPOS    EQU     $62     ; Current cursor position
+                            ; Range: 0-31 for 2-line displays (CM/XP)
+                            ;        0-79 for 4-line displays (LZ/LZ64)
+                            ; Formula: position = (row * columns) + column
+                            ;   2-line: position = (row * 16) + column
+                            ;   4-line: position = (row * 20) + column
 
-; Time variables
-TMB_SECS    EQU     $68     ; Seconds counter (2 bytes)
-TMB_MINS    EQU     $6A     ; Minutes
-TMB_HOUR    EQU     $6B     ; Hours
-TMB_DAY     EQU     $6C     ; Day of month
-TMB_MON     EQU     $6D     ; Month
-TMB_YEAR    EQU     $6E     ; Year (offset from 1900)
-TMB_WDAY    EQU     $6F     ; Day of week (0=Sunday)
+DPB_CUST    EQU     $63     ; Cursor state flags (as passed to DP$STAT)
+                            ; Bit 7: cursor visibility (1=on, 0=off)
+                            ; Bit 0: cursor style (1=line/underline, 0=block)
+                            ; Other bits reserved
 
-; Alarm settings
-ALB_HOUR    EQU     $70     ; Alarm hour
-ALB_MIN     EQU     $71     ; Alarm minute
-ALB_STAT    EQU     $72     ; Alarm status
+DPB_VLIN    EQU     $64     ; Scrolling line position / menu item
+                            ; VIEW: line being scrolled (0-1 or 0-3)
+                            ; MENU: current menu item number
 
-; System flags
-SYS_FLAG    EQU     $78     ; System status flags
-SYS_ERR     EQU     $79     ; Last error code
-SYS_BAUD    EQU     $7A     ; Serial baud rate setting
+DPB_VSIZ    EQU     $65     ; Scrolling text size / menu count
+                            ; VIEW: number of characters to scroll
+                            ; MENU: total number of menu items
+
+DPB_VDIR    EQU     $66     ; Scroll direction
+                            ; 0 = paused
+                            ; 1 = right
+                            ; 2 = left
+
+DPB_SPOS    EQU     $67     ; Saved cursor position (by DP$SAVE)
+DPB_SCUS    EQU     $68     ; Saved cursor state (by DP$SAVE)
+
+DPW_SPED    EQU     $69     ; Horizontal scroll speed (2 bytes, 50ms units)
+                            ; Default: 4 (200ms between scroll steps)
+
+DPW_DELY    EQU     $6B     ; Vertical scroll delay (2 bytes, 50ms units)
+                            ; Default: 10 (500ms pause between scrolls)
+
+DPW_REDY    EQU     $6D     ; Display ready countdown (2 bytes, 50ms units)
+                            ; Decremented every 50ms until zero
+
+DPA_VADD    EQU     $6F     ; VIEW string address (2 bytes)
+                            ; Address of string being scrolled by DP$VIEW
+
+; -----------------------------------------------------------------------------
+; Keyboard Variables ($71-$7B)
+; Reference: https://www.jaapsch.net/psion/sysvars.htm
+; -----------------------------------------------------------------------------
+KBW_TDEL    EQU     $71     ; Keyboard interrupt timing (2 bytes)
+                            ; Default: $B3DD for 0.05 second interval
+KBB_BACK    EQU     $73     ; Keyboard buffer back index
+KBB_NKYS    EQU     $74     ; Number of keys in buffer
+KBB_SAST    EQU     $75     ; Shift key state
+KBB_WAIT    EQU     $76     ; Unget key (pushed back by KB$UGET)
+KBB_SKEY    EQU     $77     ; Last key pressed
+KBB_FLGS    EQU     $78     ; Keyboard flags (auto-repeat, etc.)
+KBW_REP1    EQU     $79     ; First repeat delay (2 bytes)
+KBB_STAT    EQU     $7B     ; Keyboard status (shift/caps lock state)
 
 ; Temporary work areas (can be used by user programs)
 ; These are typically safe to use within your own code

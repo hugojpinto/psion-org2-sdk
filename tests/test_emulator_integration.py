@@ -24,7 +24,6 @@ from psion_sdk.emulator import (
     Emulator,
     EmulatorConfig,
     BreakReason,
-    RegisterCondition,
     get_model,
     MODEL_XP,
     MODEL_LZ,
@@ -151,22 +150,23 @@ class TestCodeInjection:
 
     def test_inject_loop(self, emu):
         """Inject loop code."""
-        # LDAA #$05, DECA, BNE -2 (loop 5 times)
+        # LDAA #$05, DECA, BNE -3 (loop 5 times), NOP at end
         code = bytes([
-            0x86, 0x05,  # LDAA #$05
-            0x4A,        # DECA
-            0x26, 0xFD,  # BNE -3 (back to DECA)
+            0x86, 0x05,  # LDAA #$05   @ 0x2000
+            0x4A,        # DECA        @ 0x2002
+            0x26, 0xFD,  # BNE -3      @ 0x2003 (back to DECA)
+            0x01,        # NOP         @ 0x2005 (after loop exits)
         ])
         emu.inject_program(code, entry_point=0x2000)
 
-        # Add breakpoint when A == 0
-        emu.add_condition('a', '==', 0)
+        # Add breakpoint after loop exits
+        emu.add_breakpoint(0x2005)
 
         # Run until breakpoint
         event = emu.run(10000)
 
-        assert event.reason == BreakReason.REGISTER_CONDITION
-        assert emu.cpu.a == 0
+        assert event.reason == BreakReason.PC_BREAKPOINT
+        assert emu.cpu.a == 0  # Loop decremented A to 0
 
     def test_memory_operations(self, emu):
         """Test memory read/write."""
@@ -232,23 +232,6 @@ class TestBreakpointIntegration:
 
         assert event.reason == BreakReason.MAX_CYCLES
 
-    def test_register_condition(self, emu):
-        """Register condition breakpoint."""
-        # LDAA #$00, LDAB #$10
-        code = bytes([
-            0x86, 0x05,  # LDAA #$05
-            0x4A,        # DECA
-            0x26, 0xFD,  # BNE -3
-            0x01,        # NOP (after loop)
-        ])
-        emu.inject_program(code, entry_point=0x2000)
-
-        cond_id = emu.add_condition('a', '==', 0)
-        event = emu.run(10000)
-
-        assert event.reason == BreakReason.REGISTER_CONDITION
-        assert emu.cpu.a == 0
-
     def test_run_until_pc(self, emu):
         """run_until_pc stops at target."""
         code = bytes([0x01] * 50)  # NOPs
@@ -263,7 +246,7 @@ class TestBreakpointIntegration:
         """clear_breakpoints removes all."""
         emu.add_breakpoint(0x2000)
         emu.add_breakpoint(0x2010)
-        emu.add_condition('a', '==', 0)
+        emu.add_watchpoint(0x0500)
 
         emu.clear_breakpoints()
 

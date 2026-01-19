@@ -201,6 +201,9 @@ class Preprocessor:
         # Include stack to detect circular includes
         self._include_stack: list[str] = []
 
+        # Set of included file basenames (e.g., "float.h", "psion.h")
+        self._included_files: set[str] = set()
+
         # Output lines
         self._output: list[str] = []
 
@@ -432,6 +435,9 @@ class Preprocessor:
                 SourceLocation(self._current_file, self._current_line, 1),
             )
 
+        # Track included file basename (e.g., "float.h")
+        self._included_files.add(Path(filename).name.lower())
+
         # Read and process the included file
         try:
             include_source = include_path.read_text()
@@ -646,6 +652,27 @@ class Preprocessor:
         if self._detected_model:
             return self._detected_model
         return self._initial_model
+
+    def has_float_support(self) -> bool:
+        """
+        Return True if the source code uses floating point support.
+
+        This checks if float.h was included during preprocessing.
+        Used by codegen to conditionally include fpruntime.inc.
+
+        Returns:
+            True if float.h was included, False otherwise.
+        """
+        return "float.h" in self._included_files
+
+    def get_included_files(self) -> set[str]:
+        """
+        Return the set of included file basenames.
+
+        Returns:
+            Set of lowercase filenames that were included (e.g., {"float.h", "psion.h"})
+        """
+        return self._included_files.copy()
 
     def _expand_macros(self, line: str) -> str:
         """Expand all macros in a line of text."""

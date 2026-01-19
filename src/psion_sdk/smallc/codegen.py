@@ -199,16 +199,21 @@ class CodeGenerator(ASTVisitor):
         "LZ64": (4, 20),
     }
 
-    def __init__(self, target_model: str = "XP"):
+    def __init__(self, target_model: str = "XP", has_float_support: bool = False):
         """
         Initialize the code generator.
 
         Args:
             target_model: Target Psion model (CM, XP, LA, LZ, LZ64).
                          Defaults to XP for broad compatibility with 2-line models.
+            has_float_support: Whether to include floating point runtime support.
+                              True if float.h was included, False otherwise.
         """
         # Target model for generated code
         self._target_model = target_model.upper() if target_model else "XP"
+
+        # Whether to include floating point support (fpruntime.inc)
+        self._has_float_support = has_float_support
 
         # Assembly output lines
         self._output: list[str] = []
@@ -303,6 +308,9 @@ class CodeGenerator(ASTVisitor):
         self._emit("; -----------------------------------------------------------------------------")
         self._emit("        INCLUDE \"psion.inc\"")
         self._emit("        INCLUDE \"runtime.inc\"")
+        if self._has_float_support:
+            self._emit("        INCLUDE \"float.inc\"       ; FP constants and macros")
+            self._emit("        INCLUDE \"fpruntime.inc\"  ; Floating point support")
 
         # Emit global variables
         self._emit_globals()
@@ -1378,9 +1386,17 @@ class CodeGenerator(ASTVisitor):
             self._emit_comment(f"Call external OPL procedure: {expr.function_name}")
             # Load address of procedure name string into D
             self._emit_instruction("LDD", f"#{proc_name_label}")
+            # Push name pointer argument to stack (standard calling convention)
+            self._emit_instruction("PSHB", "")
+            self._emit_instruction("PSHA", "")
             # Call the OPL invocation runtime
             # This will unwind stack, call the OPL procedure, and resume here
             self._emit_instruction("JSR", "_call_opl")
+            # Cleanup: REQUIRED! _call_opl calculates resume_addr = return_addr + 2
+            # This expects exactly two INS instructions after the JSR, which the
+            # restore function jumps past to reach the next statement.
+            self._emit_instruction("INS", "")
+            self._emit_instruction("INS", "")
             # D register now contains 0 (USR return value, discarded)
             # Execution resumes here after OPL procedure completes
             return

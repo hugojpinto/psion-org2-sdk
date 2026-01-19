@@ -157,6 +157,10 @@ class CParser:
         # Error collection for multiple error reporting
         self._errors = CErrorCollector()
 
+        # Typedef table: maps type name -> (base_type, is_unsigned, pointer_depth, array_size)
+        # Example: "fp_t" -> (BaseType.CHAR, False, 0, 8) for "typedef char fp_t[8]"
+        self._typedefs: dict[str, tuple[BaseType, bool, int, int]] = {}
+
     def parse(self) -> ProgramNode:
         """
         Parse the token stream into an AST.
@@ -321,6 +325,17 @@ class CParser:
         if self._match(CTokenType.EXTERNAL):
             return self._parse_external_declaration()
 
+        # =====================================================================
+        # Check for 'typedef' keyword - type alias
+        # =====================================================================
+        # Typedef creates type aliases. Supported forms:
+        #   typedef char mychar;           - simple alias
+        #   typedef char buffer[100];      - array typedef
+        #   typedef int *intptr;           - pointer typedef
+        if self._match(CTokenType.TYPEDEF):
+            self._parse_typedef()
+            return None  # Typedef doesn't produce AST nodes
+
         # Parse type specifiers
         type_info = self._parse_type_specifier()
         if type_info is None:
@@ -330,10 +345,10 @@ class CParser:
                 location=self._peek().location,
             )
 
-        base_type, is_unsigned = type_info
+        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size = type_info
 
-        # Parse pointer prefix
-        pointer_depth = 0
+        # Parse pointer prefix (adds to any typedef pointer depth)
+        pointer_depth = typedef_ptr_depth
         while self._match(CTokenType.STAR):
             pointer_depth += 1
 
@@ -343,18 +358,23 @@ class CParser:
 
         # Check if function or variable
         if self._check(CTokenType.LPAREN):
-            # Function definition
-            return self._parse_function(base_type, is_unsigned, pointer_depth, name, name_token.location)
+            # Function definition - pass typedef_array_size for parameter handling
+            return self._parse_function(base_type, is_unsigned, pointer_depth, name, name_token.location, typedef_array_size)
         else:
-            # Global variable declaration
-            return self._parse_global_variable(base_type, is_unsigned, pointer_depth, name, name_token.location)
+            # Global variable declaration - pass typedef info for multi-var declarations
+            return self._parse_global_variable(base_type, is_unsigned, pointer_depth, name, name_token.location,
+                                               typedef_ptr_depth, typedef_array_size)
 
-    def _parse_type_specifier(self) -> Optional[tuple[BaseType, bool]]:
+    def _parse_type_specifier(self) -> Optional[tuple[BaseType, bool, int, int]]:
         """
-        Parse type specifier keywords.
+        Parse type specifier keywords or typedef names.
 
         Returns:
-            Tuple of (base_type, is_unsigned) or None if not a type
+            Tuple of (base_type, is_unsigned, typedef_pointer_depth, typedef_array_size)
+            or None if not a type.
+
+            For built-in types, typedef_pointer_depth and typedef_array_size are 0.
+            For typedef'd types, these carry the typedef's pointer/array info.
         """
         specifiers = []
 
@@ -369,13 +389,22 @@ class CParser:
             token = self._advance()
             specifiers.append(token.value)
 
-        if not specifiers:
-            return None
+        if specifiers:
+            try:
+                base_type, is_unsigned = parse_type_specifiers(specifiers)
+                return (base_type, is_unsigned, 0, 0)  # No typedef info
+            except ValueError as e:
+                raise CSyntaxError(str(e), self._peek().location)
 
-        try:
-            return parse_type_specifiers(specifiers)
-        except ValueError as e:
-            raise CSyntaxError(str(e), self._peek().location)
+        # No built-in type specifiers - check for typedef name
+        if self._check(CTokenType.IDENTIFIER):
+            name = self._peek().value
+            if name in self._typedefs:
+                self._advance()  # consume the typedef name
+                base_type, is_unsigned, ptr_depth, array_size = self._typedefs[name]
+                return (base_type, is_unsigned, ptr_depth, array_size)
+
+        return None
 
     def _parse_external_declaration(self) -> FunctionNode:
         """
@@ -424,7 +453,7 @@ class CParser:
                 hint="external void procedureName();",
             )
 
-        base_type, is_unsigned = type_info
+        base_type, is_unsigned, _, _ = type_info
 
         # Validate that the return type is void
         if base_type != BaseType.VOID:
@@ -494,6 +523,65 @@ class CParser:
             is_external=True,
         )
 
+    def _parse_typedef(self) -> None:
+        """
+        Parse a typedef declaration and register the type alias.
+
+        Supported forms:
+            typedef char mychar;           - simple alias
+            typedef char buffer[100];      - array typedef
+            typedef unsigned int uint;     - unsigned type alias
+            typedef char *charptr;         - pointer typedef
+
+        The typedef is stored in self._typedefs for later lookup when
+        parsing type specifiers.
+        """
+        # Parse the base type
+        type_info = self._parse_type_specifier()
+        if type_info is None:
+            raise UnexpectedTokenError(
+                self._peek().value or self._peek().type.name,
+                expected="type specifier in typedef",
+                location=self._peek().location,
+            )
+
+        # Unpack type info - for typedef of typedef, we flatten to the base
+        base_type, is_unsigned, inner_ptr_depth, inner_array_size = type_info
+
+        # Parse optional pointer prefix (adds to any inherited pointer depth)
+        pointer_depth = inner_ptr_depth
+        while self._match(CTokenType.STAR):
+            pointer_depth += 1
+
+        # Parse the typedef name
+        name_token = self._expect(CTokenType.IDENTIFIER, "typedef name")
+        typedef_name = name_token.value
+
+        # Parse optional array size: typedef char name[SIZE];
+        # If explicit size given, it overrides inherited array size
+        array_size = inner_array_size
+        if self._match(CTokenType.LBRACKET):
+            size_token = self._expect(CTokenType.NUMBER, "array size")
+            try:
+                array_size = int(size_token.value)
+                if array_size <= 0:
+                    raise CSyntaxError(
+                        "array size must be positive",
+                        size_token.location,
+                    )
+            except ValueError:
+                raise CSyntaxError(
+                    f"invalid array size: {size_token.value}",
+                    size_token.location,
+                )
+            self._expect(CTokenType.RBRACKET, "']'")
+
+        # Expect semicolon
+        self._expect(CTokenType.SEMICOLON, "';'")
+
+        # Store the typedef with combined pointer depth and array size
+        self._typedefs[typedef_name] = (base_type, is_unsigned, pointer_depth, array_size)
+
     def _parse_function(
         self,
         base_type: BaseType,
@@ -501,9 +589,10 @@ class CParser:
         pointer_depth: int,
         name: str,
         location: SourceLocation,
+        typedef_array_size: int = 0,  # Ignored for return types (can't return arrays)
     ) -> FunctionNode:
         """Parse a function definition."""
-        # Create return type
+        # Create return type (array size ignored - can't return arrays in C)
         return_type = make_type(base_type, is_unsigned, pointer_depth)
 
         # Parse parameters
@@ -569,10 +658,10 @@ class CParser:
                 location=self._peek().location,
             )
 
-        base_type, is_unsigned = type_info
+        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size = type_info
 
-        # Parse pointer prefix
-        pointer_depth = 0
+        # Parse pointer prefix (adds to any typedef pointer depth)
+        pointer_depth = typedef_ptr_depth
         while self._match(CTokenType.STAR):
             pointer_depth += 1
 
@@ -585,6 +674,7 @@ class CParser:
             self._expect(CTokenType.RBRACKET, "']'")
             pointer_depth += 1
 
+        # For parameters, typedef_array_size is informational only (params are by-pointer)
         param_type = make_type(base_type, is_unsigned, pointer_depth)
 
         return ParameterNode(
@@ -598,17 +688,23 @@ class CParser:
         base_type: BaseType,
         is_unsigned: bool,
         is_global: bool,
+        typedef_ptr_depth: int = 0,
+        typedef_array_size: int = 0,
     ) -> VariableDeclaration:
         """
         Parse a single declarator: '*'* IDENTIFIER ('[' NUMBER ']')? ('=' expr)?
 
         This is used for parsing additional variables in multi-variable
         declarations like: int a, *b, c[10];
+
+        For typedef'd array types (e.g., typedef char fp_t[8]):
+            fp_t x;     -> allocates 8 bytes (uses typedef_array_size)
+            fp_t *p;    -> pointer (2 bytes, typedef_array_size ignored)
         """
         location = self._peek().location
 
-        # Parse pointer prefix
-        pointer_depth = 0
+        # Parse pointer prefix (adds to any typedef pointer depth)
+        pointer_depth = typedef_ptr_depth
         while self._match(CTokenType.STAR):
             pointer_depth += 1
 
@@ -621,6 +717,10 @@ class CParser:
             size_token = self._expect(CTokenType.NUMBER, "array size")
             array_size = size_token.value
             self._expect(CTokenType.RBRACKET, "']'")
+
+        # Use typedef array size if no explicit size and not a pointer
+        if array_size == 0 and pointer_depth == 0 and typedef_array_size > 0:
+            array_size = typedef_array_size
 
         var_type = make_type(base_type, is_unsigned, pointer_depth, array_size)
 
@@ -644,6 +744,8 @@ class CParser:
         pointer_depth: int,
         name: str,
         location: SourceLocation,
+        typedef_ptr_depth: int = 0,
+        typedef_array_size: int = 0,
     ) -> list[VariableDeclaration]:
         """
         Parse global variable declaration(s).
@@ -652,6 +754,14 @@ class CParser:
             int a, b, c;
             int x = 1, y = 2;
             char *p, buf[10], c;
+
+        For typedef'd array types (e.g., typedef char fp_t[8]):
+            fp_t x;     -> allocates 8 bytes (uses typedef_array_size)
+            fp_t *p;    -> pointer (2 bytes, typedef_array_size ignored)
+            fp_t x[3];  -> 3 arrays of 8 chars each (explicit size overrides)
+
+        For typedef'd pointer types (e.g., typedef int *intptr):
+            intptr a, b;  -> both are int* (uses typedef_ptr_depth)
         """
         declarations = []
 
@@ -661,6 +771,10 @@ class CParser:
             size_token = self._expect(CTokenType.NUMBER, "array size")
             array_size = size_token.value
             self._expect(CTokenType.RBRACKET, "']'")
+
+        # Use typedef array size if no explicit size and not a pointer
+        if array_size == 0 and pointer_depth == 0 and typedef_array_size > 0:
+            array_size = typedef_array_size
 
         var_type = make_type(base_type, is_unsigned, pointer_depth, array_size)
 
@@ -678,7 +792,9 @@ class CParser:
 
         # Parse additional declarators separated by commas
         while self._match(CTokenType.COMMA):
-            decl = self._parse_declarator(base_type, is_unsigned, is_global=True)
+            decl = self._parse_declarator(base_type, is_unsigned, is_global=True,
+                                          typedef_ptr_depth=typedef_ptr_depth,
+                                          typedef_array_size=typedef_array_size)
             declarations.append(decl)
 
         self._expect(CTokenType.SEMICOLON, "';'")
@@ -717,14 +833,19 @@ class CParser:
         )
 
     def _is_type_keyword(self) -> bool:
-        """Check if current token starts a type specifier."""
-        return self._check(
+        """Check if current token starts a type specifier (including typedef names)."""
+        if self._check(
             CTokenType.VOID,
             CTokenType.CHAR,
             CTokenType.INT,
             CTokenType.UNSIGNED,
             CTokenType.SIGNED,
-        )
+        ):
+            return True
+        # Also check for typedef names
+        if self._check(CTokenType.IDENTIFIER):
+            return self._peek().value in self._typedefs
+        return False
 
     def _parse_local_declaration(self) -> list[VariableDeclaration]:
         """
@@ -737,17 +858,21 @@ class CParser:
         """
         # Parse type (shared by all declarators)
         type_info = self._parse_type_specifier()
-        base_type, is_unsigned = type_info
+        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size = type_info
 
         declarations = []
 
         # Parse first declarator
-        decl = self._parse_declarator(base_type, is_unsigned, is_global=False)
+        decl = self._parse_declarator(base_type, is_unsigned, is_global=False,
+                                       typedef_ptr_depth=typedef_ptr_depth,
+                                       typedef_array_size=typedef_array_size)
         declarations.append(decl)
 
         # Parse additional declarators separated by commas
         while self._match(CTokenType.COMMA):
-            decl = self._parse_declarator(base_type, is_unsigned, is_global=False)
+            decl = self._parse_declarator(base_type, is_unsigned, is_global=False,
+                                           typedef_ptr_depth=typedef_ptr_depth,
+                                           typedef_array_size=typedef_array_size)
             declarations.append(decl)
 
         self._expect(CTokenType.SEMICOLON, "';'")
@@ -1198,15 +1323,20 @@ class CParser:
         return self._parse_postfix()
 
     def _is_type_at_offset(self, offset: int) -> bool:
-        """Check if token at offset is a type keyword."""
+        """Check if token at offset is a type keyword (including typedef names)."""
         token = self._peek(offset)
-        return token.type in (
+        if token.type in (
             CTokenType.VOID,
             CTokenType.CHAR,
             CTokenType.INT,
             CTokenType.UNSIGNED,
             CTokenType.SIGNED,
-        )
+        ):
+            return True
+        # Also check for typedef names
+        if token.type == CTokenType.IDENTIFIER:
+            return token.value in self._typedefs
+        return False
 
     def _parse_sizeof(self) -> Expression:
         """Parse sizeof expression."""
@@ -1217,15 +1347,17 @@ class CParser:
             # sizeof(type) or sizeof(expr)
             if self._is_type_keyword():
                 type_info = self._parse_type_specifier()
-                base_type, is_unsigned = type_info
+                base_type, is_unsigned, typedef_ptr_depth, typedef_array_size = type_info
 
-                pointer_depth = 0
+                pointer_depth = typedef_ptr_depth
                 while self._match(CTokenType.STAR):
                     pointer_depth += 1
 
                 self._expect(CTokenType.RPAREN, "')'")
 
-                target_type = make_type(base_type, is_unsigned, pointer_depth)
+                # For sizeof, array size matters for determining total size
+                array_size = typedef_array_size if pointer_depth == 0 else 0
+                target_type = make_type(base_type, is_unsigned, pointer_depth, array_size)
                 return SizeofExpression(
                     location=location,
                     target_type=target_type,
@@ -1245,14 +1377,15 @@ class CParser:
         self._expect(CTokenType.LPAREN, "'('")
 
         type_info = self._parse_type_specifier()
-        base_type, is_unsigned = type_info
+        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size = type_info
 
-        pointer_depth = 0
+        pointer_depth = typedef_ptr_depth
         while self._match(CTokenType.STAR):
             pointer_depth += 1
 
         self._expect(CTokenType.RPAREN, "')'")
 
+        # For casts, we don't use typedef array size (you can't cast to array type)
         target_type = make_type(base_type, is_unsigned, pointer_depth)
         expr = self._parse_unary()
 

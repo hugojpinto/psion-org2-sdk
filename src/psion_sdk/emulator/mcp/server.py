@@ -438,7 +438,9 @@ class MCPServer:
         self._register_tool(
             "read_screen",
             tools.read_screen,
-            "Read the current display content. Use 'image_lcd' format for "
+            "Read the current display content with cursor position. "
+            "Text formats include cursor row/column coordinates to help with "
+            "navigation and text editing. Use 'image_lcd' format for "
             "realistic LCD rendering with visible pixel matrix grid.",
             {
                 "type": "object",
@@ -827,7 +829,9 @@ class MCPServer:
         self._register_tool(
             "get_display",
             tools.get_display,
-            "Get detailed display state",
+            "Get detailed display state including cursor position (row, column), "
+            "visibility, and style (block/line). Essential for understanding "
+            "screen context during text editing operations.",
             {
                 "type": "object",
                 "properties": {
@@ -862,6 +866,214 @@ class MCPServer:
                     "session_id": {
                         "type": "string",
                         "description": "Session ID to destroy"
+                    }
+                },
+                "required": ["session_id"]
+            }
+        )
+
+        # =====================================================================
+        # Advanced Debugging Tools
+        # =====================================================================
+        # These tools provide enhanced debugging capabilities for understanding
+        # program behavior, particularly useful for debugging the _call_opl
+        # QCode injection mechanism and OPL interpreter interactions.
+        # =====================================================================
+
+        self._register_tool(
+            "get_opl_state",
+            tools.get_opl_state,
+            "Read OPL interpreter system variables (RTA_SP, RTA_FP, RTA_PC). "
+            "Essential for debugging QCode execution and procedure calls.",
+            {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID"
+                    }
+                },
+                "required": ["session_id"]
+            }
+        )
+
+        self._register_tool(
+            "disassemble",
+            tools.disassemble,
+            "Disassemble HD6303 machine code at a memory address into assembly",
+            {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID"
+                    },
+                    "address": {
+                        "type": "integer",
+                        "description": "Starting address to disassemble (0-65535)"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of instructions (default: 16, max: 100)",
+                        "default": 16
+                    },
+                    "show_bytes": {
+                        "type": "boolean",
+                        "description": "Include raw bytes in output (default: true)",
+                        "default": True
+                    }
+                },
+                "required": ["session_id", "address"]
+            }
+        )
+
+        self._register_tool(
+            "disassemble_qcode",
+            tools.disassemble_qcode,
+            "Disassemble OPL QCode bytecode at a memory address. "
+            "Essential for debugging _call_opl buffers and OPL procedures.",
+            {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID"
+                    },
+                    "address": {
+                        "type": "integer",
+                        "description": "Starting address (0-65535)"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of QCode opcodes (default: 16, max: 100)",
+                        "default": 16
+                    },
+                    "call_opl_mode": {
+                        "type": "boolean",
+                        "description": "Special formatting for _call_opl buffers",
+                        "default": False
+                    }
+                },
+                "required": ["session_id", "address"]
+            }
+        )
+
+        self._register_tool(
+            "run_with_trace",
+            tools.run_with_trace,
+            "Run emulator while recording instruction trace. "
+            "Shows last N instructions executed, invaluable for debugging.",
+            {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID"
+                    },
+                    "max_cycles": {
+                        "type": "integer",
+                        "description": "Maximum cycles to run (default: 100000)",
+                        "default": 100000
+                    },
+                    "trace_depth": {
+                        "type": "integer",
+                        "description": "Number of instructions to keep in trace (default: 50, max: 1000)",
+                        "default": 50
+                    },
+                    "stop_address": {
+                        "type": "integer",
+                        "description": "Optional: stop when PC reaches this address"
+                    },
+                    "include_registers": {
+                        "type": "boolean",
+                        "description": "Include full register state in trace (default: false)",
+                        "default": False
+                    }
+                },
+                "required": ["session_id"]
+            }
+        )
+
+        self._register_tool(
+            "set_registers",
+            tools.set_registers,
+            "Set CPU register values (A, B, D, X, SP, PC)",
+            {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID"
+                    },
+                    "a": {
+                        "type": "integer",
+                        "description": "Set A register (0-255)"
+                    },
+                    "b": {
+                        "type": "integer",
+                        "description": "Set B register (0-255)"
+                    },
+                    "d": {
+                        "type": "integer",
+                        "description": "Set D register (0-65535), sets both A and B"
+                    },
+                    "x": {
+                        "type": "integer",
+                        "description": "Set X register (0-65535)"
+                    },
+                    "sp": {
+                        "type": "integer",
+                        "description": "Set SP register (0-65535)"
+                    },
+                    "pc": {
+                        "type": "integer",
+                        "description": "Set PC register (0-65535)"
+                    }
+                },
+                "required": ["session_id"]
+            }
+        )
+
+        self._register_tool(
+            "run_until_address",
+            tools.run_until_address,
+            "Run emulator until PC reaches a specific address",
+            {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID"
+                    },
+                    "address": {
+                        "type": "integer",
+                        "description": "Target PC address to stop at (0-65535)"
+                    },
+                    "max_cycles": {
+                        "type": "integer",
+                        "description": "Maximum cycles before timeout (default: 1000000)",
+                        "default": 1000000
+                    }
+                },
+                "required": ["session_id", "address"]
+            }
+        )
+
+        self._register_tool(
+            "step_with_disasm",
+            tools.step_with_disasm,
+            "Execute CPU instruction(s) with disassembly output and register state",
+            {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of instructions to step (default: 1, max: 100)",
+                        "default": 1
                     }
                 },
                 "required": ["session_id"]

@@ -113,6 +113,7 @@ class CTokenType(Enum):
     # === Keywords - Other ===
     SIZEOF = auto()         # sizeof (limited support)
     EXTERNAL = auto()       # external (OPL procedure declaration)
+    TYPEDEF = auto()        # typedef (type alias)
 
     # === Arithmetic Operators ===
     PLUS = auto()           # +
@@ -205,6 +206,7 @@ KEYWORDS: dict[str, CTokenType] = {
     # Other
     "sizeof": CTokenType.SIZEOF,
     "external": CTokenType.EXTERNAL,
+    "typedef": CTokenType.TYPEDEF,
 }
 
 

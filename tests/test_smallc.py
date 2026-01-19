@@ -1282,3 +1282,379 @@ class TestExternalKeyword:
 
         assert "External" in output
         assert "azMENU" in output
+
+
+# =============================================================================
+# Typedef Tests
+# =============================================================================
+
+class TestTypedef:
+    """Tests for typedef support in Small-C compiler."""
+
+    # -------------------------------------------------------------------------
+    # Lexer Tests
+    # -------------------------------------------------------------------------
+
+    def test_typedef_keyword_lexes(self):
+        """'typedef' keyword should tokenize correctly."""
+        lexer = CLexer("typedef", "test.c")
+        tokens = list(lexer.tokenize())
+        assert tokens[0].type == CTokenType.TYPEDEF
+        assert tokens[0].value == "typedef"
+
+    def test_typedef_in_declaration(self):
+        """Typedef declaration should tokenize all parts."""
+        lexer = CLexer("typedef int myint;", "test.c")
+        tokens = list(lexer.tokenize())
+        assert tokens[0].type == CTokenType.TYPEDEF
+        assert tokens[1].type == CTokenType.INT
+        assert tokens[2].type == CTokenType.IDENTIFIER
+        assert tokens[2].value == "myint"
+        assert tokens[3].type == CTokenType.SEMICOLON
+
+    # -------------------------------------------------------------------------
+    # Parser Tests - Simple Typedefs
+    # -------------------------------------------------------------------------
+
+    def test_simple_typedef_int(self):
+        """Simple typedef for int should parse and work."""
+        source = """
+        typedef int myint;
+        myint x;
+        """
+        ast = parse_source(source)
+
+        # The typedef itself doesn't create a declaration
+        # But the variable using it should
+        assert len(ast.declarations) == 1
+        var = ast.declarations[0]
+        assert isinstance(var, VariableDeclaration)
+        assert var.name == "x"
+        assert var.var_type.base_type == BaseType.INT
+
+    def test_simple_typedef_char(self):
+        """Simple typedef for char should parse and work."""
+        source = """
+        typedef char byte;
+        byte b;
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 1
+        var = ast.declarations[0]
+        assert var.name == "b"
+        assert var.var_type.base_type == BaseType.CHAR
+
+    def test_typedef_unsigned_int(self):
+        """Typedef for unsigned int should parse and work."""
+        source = """
+        typedef unsigned int uint;
+        uint u;
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 1
+        var = ast.declarations[0]
+        assert var.name == "u"
+        assert var.var_type.base_type == BaseType.INT
+        assert var.var_type.is_unsigned
+
+    def test_typedef_unsigned_char(self):
+        """Typedef for unsigned char should parse and work."""
+        source = """
+        typedef unsigned char ubyte;
+        ubyte b;
+        """
+        ast = parse_source(source)
+
+        var = ast.declarations[0]
+        assert var.var_type.base_type == BaseType.CHAR
+        assert var.var_type.is_unsigned
+
+    # -------------------------------------------------------------------------
+    # Parser Tests - Pointer Typedefs
+    # -------------------------------------------------------------------------
+
+    def test_typedef_pointer(self):
+        """Typedef for pointer type should parse and work."""
+        source = """
+        typedef int *intptr;
+        intptr p;
+        """
+        ast = parse_source(source)
+
+        var = ast.declarations[0]
+        assert var.name == "p"
+        assert var.var_type.is_pointer
+        assert var.var_type.pointer_depth == 1
+        assert var.var_type.base_type == BaseType.INT
+
+    def test_typedef_char_pointer(self):
+        """Typedef for char pointer should parse and work."""
+        source = """
+        typedef char *string;
+        string s;
+        """
+        ast = parse_source(source)
+
+        var = ast.declarations[0]
+        assert var.name == "s"
+        assert var.var_type.is_pointer
+        assert var.var_type.base_type == BaseType.CHAR
+
+    def test_pointer_to_typedef(self):
+        """Pointer to typedef type should work."""
+        source = """
+        typedef int myint;
+        myint *p;
+        """
+        ast = parse_source(source)
+
+        var = ast.declarations[0]
+        assert var.name == "p"
+        assert var.var_type.is_pointer
+        assert var.var_type.base_type == BaseType.INT
+
+    # -------------------------------------------------------------------------
+    # Parser Tests - Function Usage
+    # -------------------------------------------------------------------------
+
+    def test_typedef_in_function_parameter(self):
+        """Typedef should work in function parameters."""
+        source = """
+        typedef int myint;
+        void foo(myint x) { }
+        """
+        ast = parse_source(source)
+
+        func = ast.declarations[0]
+        assert func.name == "foo"
+        assert len(func.parameters) == 1
+        assert func.parameters[0].name == "x"
+        assert func.parameters[0].param_type.base_type == BaseType.INT
+
+    def test_typedef_in_function_return(self):
+        """Typedef should work as function return type."""
+        source = """
+        typedef int myint;
+        myint foo() { return 42; }
+        """
+        ast = parse_source(source)
+
+        func = ast.declarations[0]
+        assert func.name == "foo"
+        assert func.return_type.base_type == BaseType.INT
+
+    def test_typedef_in_local_variable(self):
+        """Typedef should work for local variables."""
+        source = """
+        typedef int myint;
+        void main() {
+            myint x;
+            x = 42;
+        }
+        """
+        ast = parse_source(source)
+
+        func = ast.declarations[0]
+        assert len(func.body.declarations) == 1
+        var = func.body.declarations[0]
+        assert var.name == "x"
+        assert var.var_type.base_type == BaseType.INT
+
+    # -------------------------------------------------------------------------
+    # Parser Tests - Multiple Typedefs
+    # -------------------------------------------------------------------------
+
+    def test_multiple_typedefs(self):
+        """Multiple typedef declarations should work."""
+        source = """
+        typedef int myint;
+        typedef char byte;
+        typedef int *intptr;
+        myint a;
+        byte b;
+        intptr p;
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 3
+        assert ast.declarations[0].name == "a"
+        assert ast.declarations[0].var_type.base_type == BaseType.INT
+        assert ast.declarations[1].name == "b"
+        assert ast.declarations[1].var_type.base_type == BaseType.CHAR
+        assert ast.declarations[2].name == "p"
+        assert ast.declarations[2].var_type.is_pointer
+
+    def test_typedef_shadowing(self):
+        """Later typedef can shadow earlier one (though unusual)."""
+        source = """
+        typedef int mytype;
+        typedef char mytype;
+        mytype x;
+        """
+        ast = parse_source(source)
+
+        # The later typedef should take effect
+        var = ast.declarations[0]
+        assert var.var_type.base_type == BaseType.CHAR
+
+    # -------------------------------------------------------------------------
+    # Integration Tests
+    # -------------------------------------------------------------------------
+
+    def test_typedef_full_compilation(self):
+        """Full compilation with typedef should succeed."""
+        source = """
+        typedef int score_t;
+        typedef char *string;
+
+        score_t g_score;
+
+        score_t add_scores(score_t a, score_t b) {
+            return a + b;
+        }
+
+        void main() {
+            score_t total;
+            total = add_scores(10, 20);
+            g_score = total;
+        }
+        """
+        asm = compile_c(source)
+
+        assert "_main:" in asm
+        assert "_add_scores:" in asm
+        assert "_g_score:" in asm
+        assert "ADDD" in asm  # Addition
+
+    def test_typedef_with_conditionals(self):
+        """Typedef with conditional compilation should work."""
+        source = """
+        #ifdef __PSION_4LINE__
+        typedef int wide_t;
+        #else
+        typedef char wide_t;
+        #endif
+        wide_t x;
+        """
+        # Default model is XP (2-line), so wide_t should be char
+        # Need to use preprocess + parse since parse_source doesn't run preprocessor
+        preprocessed = preprocess(source)
+        ast = parse_source(preprocessed)
+
+        var = ast.declarations[0]
+        assert var.var_type.base_type == BaseType.CHAR
+
+    def test_common_type_aliases(self):
+        """Common type aliases like uint8_t, uint16_t should work."""
+        source = """
+        typedef unsigned char uint8_t;
+        typedef unsigned int uint16_t;
+        typedef char int8_t;
+        typedef int int16_t;
+
+        uint8_t byte_val;
+        uint16_t word_val;
+        int8_t signed_byte;
+        int16_t signed_word;
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 4
+
+        # uint8_t
+        assert ast.declarations[0].var_type.base_type == BaseType.CHAR
+        assert ast.declarations[0].var_type.is_unsigned
+
+        # uint16_t
+        assert ast.declarations[1].var_type.base_type == BaseType.INT
+        assert ast.declarations[1].var_type.is_unsigned
+
+        # int8_t
+        assert ast.declarations[2].var_type.base_type == BaseType.CHAR
+        assert not ast.declarations[2].var_type.is_unsigned
+
+        # int16_t
+        assert ast.declarations[3].var_type.base_type == BaseType.INT
+        assert not ast.declarations[3].var_type.is_unsigned
+
+    def test_typedef_array_multi_var(self):
+        """Typedef array in multi-variable declaration should work (bug fix test)."""
+        # This tests the bug where `fp_t a, b, c;` would give a correct size
+        # but b and c would get size 1 instead of the typedef array size
+        source = """
+        typedef char fp_t[8];
+        fp_t a, b, c;
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 3
+
+        # All three should be arrays of 8 chars
+        for i, decl in enumerate(ast.declarations):
+            assert decl.var_type.base_type == BaseType.CHAR, f"var {i} wrong base type"
+            assert decl.var_type.array_size == 8, f"var {i} has array_size {decl.var_type.array_size}, expected 8"
+            assert decl.var_type.total_size == 8, f"var {i} total_size is {decl.var_type.total_size}, expected 8"
+
+    def test_typedef_pointer_multi_var(self):
+        """Typedef pointer in multi-variable declaration should work."""
+        source = """
+        typedef int *intptr;
+        intptr a, b, c;
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 3
+
+        # All three should be int pointers
+        for decl in ast.declarations:
+            assert decl.var_type.base_type == BaseType.INT
+            assert decl.var_type.is_pointer
+            assert decl.var_type.pointer_depth == 1
+
+
+# =============================================================================
+# Float Support Conditional Include Tests
+# =============================================================================
+
+class TestFloatSupportConditional:
+    """Tests for conditional inclusion of fpruntime.inc."""
+
+    def test_float_support_detected_when_float_h_included(self):
+        """has_float_support() should return True when float.h is included."""
+        source = '#include "float.h"\nint x;'
+        pp = Preprocessor(source, "test.c", include_paths=["include"])
+        pp.process()
+        assert pp.has_float_support()
+
+    def test_no_float_support_without_float_h(self):
+        """has_float_support() should return False when float.h is not included."""
+        source = "int x;"
+        pp = Preprocessor(source, "test.c")
+        pp.process()
+        assert not pp.has_float_support()
+
+    def test_included_files_tracking(self):
+        """Preprocessor should track included files."""
+        source = '#include "psion.h"\nint x;'
+        pp = Preprocessor(source, "test.c", include_paths=["include"])
+        pp.process()
+        included = pp.get_included_files()
+        assert "psion.h" in included
+
+    def test_codegen_with_float_support(self):
+        """CodeGenerator should include fpruntime.inc when has_float_support=True."""
+        source = "void main() { }"
+        ast = parse_source(source)
+        gen = CodeGenerator(has_float_support=True)
+        asm = gen.generate(ast)
+        assert 'INCLUDE "fpruntime.inc"' in asm
+
+    def test_codegen_without_float_support(self):
+        """CodeGenerator should NOT include fpruntime.inc when has_float_support=False."""
+        source = "void main() { }"
+        ast = parse_source(source)
+        gen = CodeGenerator(has_float_support=False)
+        asm = gen.generate(ast)
+        assert 'INCLUDE "fpruntime.inc"' not in asm
