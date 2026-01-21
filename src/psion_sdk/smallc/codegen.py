@@ -128,9 +128,13 @@ from psion_sdk.smallc.ast import (
     BinaryOperator,
     UnaryOperator,
     AssignmentOperator,
+    # Struct support
+    StructDefinition,
+    StructField,
+    MemberAccessExpression,
 )
-from psion_sdk.smallc.types import CType, BaseType
-from psion_sdk.smallc.errors import CCodeGenError
+from psion_sdk.smallc.types import CType, BaseType, TYPE_CHAR, TYPE_INT
+from psion_sdk.smallc.errors import CCodeGenError, CTypeError
 
 
 # =============================================================================
@@ -195,6 +199,36 @@ class ExternalFuncInfo:
     return_type: CType
     param_count: int
     param_types: list[CType]
+
+
+@dataclass
+class StructFieldInfo:
+    """
+    Information about a struct field for code generation.
+
+    Attributes:
+        name: Field name
+        field_type: The C type of the field
+        offset: Byte offset within the struct
+    """
+    name: str
+    field_type: CType
+    offset: int
+
+
+@dataclass
+class StructInfo:
+    """
+    Information about a struct type for code generation.
+
+    Attributes:
+        name: Struct type name
+        fields: List of field info in declaration order
+        size: Total size of the struct in bytes
+    """
+    name: str
+    fields: list[StructFieldInfo]
+    size: int
 
 
 # =============================================================================
@@ -279,6 +313,16 @@ class CodeGenerator(ASTVisitor):
         # This enables 8-bit boolean tests: TSTB (1 byte) vs SUBD #0 (3 bytes)
         self._last_expr_size: int = 2
 
+        # Struct type definitions
+        # Maps struct name -> StructInfo for field layout and size computation
+        self._structs: dict[str, StructInfo] = {}
+
+        # Stack depth tracking for function call arguments
+        # When generating function arguments, we push them one by one. Each push
+        # changes SP, so TSX gives a different value. This tracks how many bytes
+        # have been pushed so we can compensate when computing local addresses.
+        self._arg_push_depth: int = 0
+
     def generate(self, program: ProgramNode) -> str:
         """
         Generate assembly code from AST.
@@ -294,13 +338,17 @@ class CodeGenerator(ASTVisitor):
         self._strings = []
         self._label_counter = 0
         self._external_funcs = {}
+        self._structs = {}
         self._last_expr_size = 2  # Reset expression size tracking
 
         # Emit header (includes)
         self._emit_header()
 
-        # First pass: collect global variables and external function declarations
+        # First pass: collect struct definitions, global variables, and external declarations
         for decl in program.declarations:
+            if isinstance(decl, StructDefinition):
+                self._add_struct(decl)
+                continue
             if isinstance(decl, VariableDeclaration) and decl.is_global:
                 self._add_global(decl)
             elif isinstance(decl, FunctionNode) and decl.is_external:
@@ -419,6 +467,542 @@ class CodeGenerator(ASTVisitor):
         return f"_{prefix}{self._label_counter}"
 
     # =========================================================================
+    # Constant Folding
+    # =========================================================================
+
+    def _try_eval_constant(self, expr: Expression) -> Optional[int]:
+        """
+        Try to evaluate an expression as a compile-time constant.
+
+        Returns the constant value (as 16-bit signed int) if the expression
+        can be fully evaluated at compile time, or None if it cannot.
+
+        Supports:
+        - Number literals and char literals
+        - Binary operations: +, -, *, /, %, &, |, ^, <<, >>
+        - Comparison operations: ==, !=, <, >, <=, >=
+        - Unary operations: -, ~, !
+        - Nested constant expressions
+
+        This optimization is called "constant folding" and reduces code size
+        by computing values at compile time instead of runtime.
+        """
+        if isinstance(expr, NumberLiteral):
+            return expr.value & 0xFFFF
+
+        if isinstance(expr, CharLiteral):
+            return expr.value & 0xFF
+
+        if isinstance(expr, UnaryExpression):
+            operand = self._try_eval_constant(expr.operand)
+            if operand is None:
+                return None
+
+            op = expr.operator
+            if op == UnaryOperator.NEGATE:
+                return (-operand) & 0xFFFF
+            elif op == UnaryOperator.POSITIVE:
+                return operand
+            elif op == UnaryOperator.BITWISE_NOT:
+                return (~operand) & 0xFFFF
+            elif op == UnaryOperator.LOGICAL_NOT:
+                return 0 if operand else 1
+            # Other unary ops (address-of, deref, inc/dec) are not constant
+            return None
+
+        if isinstance(expr, BinaryExpression):
+            left = self._try_eval_constant(expr.left)
+            right = self._try_eval_constant(expr.right)
+            if left is None or right is None:
+                return None
+
+            op = expr.operator
+            try:
+                if op == BinaryOperator.ADD:
+                    result = left + right
+                elif op == BinaryOperator.SUBTRACT:
+                    result = left - right
+                elif op == BinaryOperator.MULTIPLY:
+                    result = left * right
+                elif op == BinaryOperator.DIVIDE:
+                    if right == 0:
+                        return None  # Division by zero - let it fail at runtime
+                    result = left // right
+                elif op == BinaryOperator.MODULO:
+                    if right == 0:
+                        return None
+                    result = left % right
+                elif op == BinaryOperator.BITWISE_AND:
+                    result = left & right
+                elif op == BinaryOperator.BITWISE_OR:
+                    result = left | right
+                elif op == BinaryOperator.BITWISE_XOR:
+                    result = left ^ right
+                elif op == BinaryOperator.LEFT_SHIFT:
+                    result = left << (right & 0xF)  # Limit shift to 0-15
+                elif op == BinaryOperator.RIGHT_SHIFT:
+                    result = left >> (right & 0xF)
+                elif op == BinaryOperator.EQUAL:
+                    result = 1 if left == right else 0
+                elif op == BinaryOperator.NOT_EQUAL:
+                    result = 1 if left != right else 0
+                elif op == BinaryOperator.LESS:
+                    result = 1 if left < right else 0
+                elif op == BinaryOperator.GREATER:
+                    result = 1 if left > right else 0
+                elif op == BinaryOperator.LESS_EQ:
+                    result = 1 if left <= right else 0
+                elif op == BinaryOperator.GREATER_EQ:
+                    result = 1 if left >= right else 0
+                elif op == BinaryOperator.LOGICAL_AND:
+                    result = 1 if (left and right) else 0
+                elif op == BinaryOperator.LOGICAL_OR:
+                    result = 1 if (left or right) else 0
+                else:
+                    return None  # Unknown operator
+                return result & 0xFFFF
+            except (ValueError, OverflowError):
+                return None
+
+        if isinstance(expr, CastExpression):
+            value = self._try_eval_constant(expr.expression)
+            if value is None:
+                return None
+            # Apply cast (char truncates to 8 bits)
+            if expr.target_type.base_type == BaseType.CHAR:
+                return value & 0xFF
+            return value & 0xFFFF
+
+        # Not a constant expression
+        return None
+
+    @staticmethod
+    def _is_power_of_2(n: int) -> bool:
+        """Check if n is a positive power of 2."""
+        return n > 0 and (n & (n - 1)) == 0
+
+    @staticmethod
+    def _log2(n: int) -> int:
+        """Return log base 2 of n (assumes n is a power of 2)."""
+        result = 0
+        while n > 1:
+            n >>= 1
+            result += 1
+        return result
+
+    # =========================================================================
+    # Expression Type Inference
+    # =========================================================================
+    #
+    # This section provides methods to determine the type of expressions at
+    # compile time. This is essential for:
+    #
+    # 1. **8-bit char arithmetic**: When both operands of a binary operation
+    #    are `char` type, we can use efficient 8-bit HD6303 instructions
+    #    (ADDB, SUBB, ANDB, ORAB, EORB) instead of 16-bit operations.
+    #
+    # 2. **Type safety**: Mixed char/int operations are disallowed to enforce
+    #    type discipline and avoid implicit promotions that could surprise users.
+    #
+    # 3. **Boolean test optimization**: Knowing expression size allows using
+    #    TSTB (1 byte) vs SUBD #0 (3 bytes) for zero tests.
+    #
+    # Type Rules:
+    # -----------
+    # - CharLiteral ('A')          -> char
+    # - NumberLiteral (42)         -> int
+    # - IdentifierExpression (x)   -> symbol's declared type
+    # - BinaryExpression:
+    #   - char OP char -> char (for +, -, &, |, ^) or int (for *, /, %, <<, >>)
+    #   - int OP int   -> int
+    #   - char OP int  -> ERROR (mixed types not allowed)
+    #   - int OP char  -> ERROR (mixed types not allowed)
+    #
+    # Operations that support 8-bit:  +, -, &, |, ^
+    # Operations that require 16-bit: *, /, %, <<, >> (promote char to int)
+    # =========================================================================
+
+    # Operations that can be performed with 8-bit instructions when both
+    # operands are char. These have direct HD6303 equivalents:
+    # ADDB, SUBB, ANDB, ORAB, EORB
+    _CHAR_SUPPORTED_OPS = frozenset([
+        BinaryOperator.ADD,
+        BinaryOperator.SUBTRACT,
+        BinaryOperator.BITWISE_AND,
+        BinaryOperator.BITWISE_OR,
+        BinaryOperator.BITWISE_XOR,
+    ])
+
+    # Operations that always require 16-bit even for char operands.
+    # These have no 8-bit HD6303 equivalent, so we promote to 16-bit.
+    _CHAR_PROMOTED_OPS = frozenset([
+        BinaryOperator.MULTIPLY,
+        BinaryOperator.DIVIDE,
+        BinaryOperator.MODULO,
+        BinaryOperator.LEFT_SHIFT,
+        BinaryOperator.RIGHT_SHIFT,
+    ])
+
+    # Comparison operations - these compare in the native width but always
+    # produce a 16-bit boolean result (0 or 1).
+    _COMPARISON_OPS = frozenset([
+        BinaryOperator.EQUAL,
+        BinaryOperator.NOT_EQUAL,
+        BinaryOperator.LESS,
+        BinaryOperator.GREATER,
+        BinaryOperator.LESS_EQ,
+        BinaryOperator.GREATER_EQ,
+    ])
+
+    # Logical operations - these always produce 16-bit boolean results
+    # and handle their own short-circuit evaluation.
+    _LOGICAL_OPS = frozenset([
+        BinaryOperator.LOGICAL_AND,
+        BinaryOperator.LOGICAL_OR,
+    ])
+
+    def _get_expression_type(self, expr: Expression) -> CType:
+        """
+        Determine the result type of an expression.
+
+        This method infers the type of any expression in the AST, which is
+        essential for generating correct code (8-bit vs 16-bit) and detecting
+        type errors (mixed char/int operations).
+
+        Type inference rules:
+        - CharLiteral ('A'): Returns TYPE_CHAR
+        - NumberLiteral (42): Returns TYPE_INT
+        - IdentifierExpression: Returns the symbol's declared type
+        - BinaryExpression: Validates operand types and returns result type
+        - UnaryExpression: Returns operand type (with some exceptions)
+        - CastExpression: Returns the target type
+        - ArraySubscript: Returns the element type
+        - CallExpression: Returns int (function return type not tracked here)
+
+        Args:
+            expr: The expression to type-check
+
+        Returns:
+            CType representing the expression's result type
+
+        Raises:
+            CTypeError: If operand types are incompatible (e.g., char + int)
+            CCodeGenError: If expression type cannot be determined
+        """
+        if isinstance(expr, CharLiteral):
+            # Character literals are always char type
+            return TYPE_CHAR
+
+        if isinstance(expr, NumberLiteral):
+            # Numeric literals are always int type
+            # Note: In Small-C, all integer constants are int (16-bit)
+            return TYPE_INT
+
+        if isinstance(expr, StringLiteral):
+            # String literals decay to char* (pointer to char)
+            return CType(BaseType.CHAR, is_pointer=True, pointer_depth=1)
+
+        if isinstance(expr, IdentifierExpression):
+            # Look up the symbol to get its declared type
+            info = self._lookup(expr.name)
+            if info is None:
+                # Unknown identifier - this should have been caught by parser
+                raise CCodeGenError(f"undeclared identifier '{expr.name}'")
+            return info.sym_type
+
+        if isinstance(expr, BinaryExpression):
+            return self._get_binary_expression_type(expr)
+
+        if isinstance(expr, UnaryExpression):
+            return self._get_unary_expression_type(expr)
+
+        if isinstance(expr, CastExpression):
+            # Cast expressions have an explicit target type
+            return expr.target_type
+
+        if isinstance(expr, ArraySubscript):
+            # Array subscript returns the element type
+            return self._get_array_subscript_type(expr)
+
+        if isinstance(expr, CallExpression):
+            # For now, assume all functions return int
+            # TODO: Track function return types for better type checking
+            return TYPE_INT
+
+        if isinstance(expr, TernaryExpression):
+            # Ternary has complex type rules - for now, assume int
+            # Both branches should have compatible types in proper C
+            return TYPE_INT
+
+        if isinstance(expr, AssignmentExpression):
+            # Assignment returns the type of the target
+            return self._get_expression_type(expr.target)
+
+        if isinstance(expr, SizeofExpression):
+            # sizeof always returns int (size in bytes)
+            return TYPE_INT
+
+        if isinstance(expr, MemberAccessExpression):
+            # Member access returns the type of the field
+            object_type = self._get_expression_type(expr.object_expr)
+
+            # Determine struct name based on operator
+            if expr.is_arrow:
+                # ptr->field: object must be pointer to struct
+                if not object_type.is_pointer or not object_type.struct_name:
+                    raise CCodeGenError(
+                        "'->' requires pointer to struct", expr.location
+                    )
+                struct_name = object_type.struct_name
+            else:
+                # obj.field: object must be struct value
+                if object_type.is_pointer:
+                    raise CCodeGenError(
+                        "'.' requires struct value, use '->' for pointers", expr.location
+                    )
+                if not object_type.struct_name:
+                    raise CCodeGenError(
+                        "'.' requires struct type", expr.location
+                    )
+                struct_name = object_type.struct_name
+
+            # Look up field type
+            field_info = self._get_struct_field_info(struct_name, expr.member_name)
+            return field_info.field_type
+
+        # Unknown expression type
+        raise CCodeGenError(f"cannot determine type of expression: {type(expr).__name__}")
+
+    def _get_binary_expression_type(self, expr: BinaryExpression) -> CType:
+        """
+        Determine the result type of a binary expression.
+
+        This method enforces type safety for binary operations:
+        - Both operands must have the same base type (both char or both int)
+        - Mixed char/int operations raise a CTypeError
+        - For char operands, the result type depends on the operation
+
+        Args:
+            expr: The binary expression to type-check
+
+        Returns:
+            CType for the expression result
+
+        Raises:
+            CTypeError: If operand types are incompatible
+        """
+        op = expr.operator
+        left_type = self._get_expression_type(expr.left)
+        right_type = self._get_expression_type(expr.right)
+
+        # Logical operations always produce 16-bit boolean result
+        if op in self._LOGICAL_OPS:
+            return TYPE_INT
+
+        # For pointers, use existing 16-bit path (no 8-bit pointer arithmetic)
+        if left_type.is_pointer or right_type.is_pointer:
+            return TYPE_INT
+
+        # For arrays (which decay to pointers), use 16-bit path
+        if left_type.array_size > 0 or right_type.array_size > 0:
+            return TYPE_INT
+
+        # Determine operand types
+        left_is_char = (left_type.base_type == BaseType.CHAR and
+                        not left_type.is_pointer and
+                        left_type.array_size == 0)
+        right_is_char = (right_type.base_type == BaseType.CHAR and
+                         not right_type.is_pointer and
+                         right_type.array_size == 0)
+        left_is_int = (left_type.base_type == BaseType.INT and
+                       not left_type.is_pointer and
+                       left_type.array_size == 0)
+        right_is_int = (right_type.base_type == BaseType.INT and
+                        not right_type.is_pointer and
+                        right_type.array_size == 0)
+
+        # Mixed char/int handling
+        # For + and -, we allow mixing char and int. The result is char (8-bit)
+        # with natural overflow behavior. This enables common patterns like:
+        #   char c = 'A'; c = c + 1;  // c becomes 'B'
+        #   char c = 'z'; c = c - 32; // c becomes 'Z' (lowercase to uppercase)
+        #
+        # For other operations (&, |, ^, *, /, %, etc.), mixed types are an error.
+        is_mixed = ((left_is_char and right_is_int) or
+                    (left_is_int and right_is_char))
+
+        if is_mixed:
+            # Allow + and - with mixed char/int, result is char (8-bit)
+            if op in (BinaryOperator.ADD, BinaryOperator.SUBTRACT):
+                return TYPE_CHAR
+
+            # Comparisons with mixed types are allowed, result is int (boolean)
+            if op in self._COMPARISON_OPS:
+                return TYPE_INT
+
+            # For all other operations, mixed types are an error
+            left_type_name = "char" if left_is_char else "int"
+            right_type_name = "char" if right_is_char else "int"
+
+            raise CTypeError(
+                f"cannot mix 'char' and 'int' operands in '{op.name.lower()}' expression",
+                expected_type=left_type_name,
+                actual_type=right_type_name,
+                # Note: location would be set by caller if available
+            )
+
+        # Both operands are char
+        if left_is_char and right_is_char:
+            # Comparison operations always return int (16-bit boolean)
+            if op in self._COMPARISON_OPS:
+                return TYPE_INT
+
+            # Operations that support 8-bit return char
+            if op in self._CHAR_SUPPORTED_OPS:
+                return TYPE_CHAR
+
+            # Operations that require 16-bit promote to int
+            if op in self._CHAR_PROMOTED_OPS:
+                return TYPE_INT
+
+        # Both operands are int, or fallback
+        return TYPE_INT
+
+    def _get_unary_expression_type(self, expr: UnaryExpression) -> CType:
+        """
+        Determine the result type of a unary expression.
+
+        Most unary operations preserve the operand type, with exceptions:
+        - Address-of (&x) returns a pointer type
+        - Dereference (*p) returns the pointed-to type
+        - Logical NOT (!) always returns int (boolean)
+
+        Args:
+            expr: The unary expression to type-check
+
+        Returns:
+            CType for the expression result
+        """
+        op = expr.operator
+        operand_type = self._get_expression_type(expr.operand)
+
+        if op == UnaryOperator.ADDRESS_OF:
+            # &x returns pointer to x's type
+            return CType(
+                operand_type.base_type,
+                operand_type.is_unsigned,
+                is_pointer=True,
+                pointer_depth=operand_type.pointer_depth + 1,
+            )
+
+        if op == UnaryOperator.DEREFERENCE:
+            # *p returns the pointed-to type
+            if operand_type.is_pointer and operand_type.pointer_depth > 0:
+                return operand_type.dereference()
+            # Dereferencing non-pointer is an error but let codegen handle it
+            return TYPE_INT
+
+        if op == UnaryOperator.LOGICAL_NOT:
+            # !x always returns int (0 or 1)
+            return TYPE_INT
+
+        # All other unary ops preserve the operand type:
+        # NEGATE (-), POSITIVE (+), BITWISE_NOT (~), PRE/POST INC/DEC
+        return operand_type
+
+    def _get_array_subscript_type(self, expr: ArraySubscript) -> CType:
+        """
+        Determine the result type of an array subscript expression.
+
+        Array subscript returns the element type of the array.
+
+        Args:
+            expr: The array subscript expression
+
+        Returns:
+            CType for the element type
+        """
+        array_type = self._get_expression_type(expr.array)
+
+        if array_type.is_pointer or array_type.array_size > 0:
+            return array_type.dereference()
+
+        # Not an array or pointer - return int as fallback
+        return TYPE_INT
+
+    def _describe_expression(self, expr: Expression) -> str:
+        """
+        Create a human-readable description of an expression for error messages.
+
+        This helps users understand which part of their code caused the error.
+
+        Args:
+            expr: The expression to describe
+
+        Returns:
+            String description like "variable 'x'" or "literal '42'"
+        """
+        if isinstance(expr, CharLiteral):
+            # Format as character literal
+            char_val = expr.value
+            if 32 <= char_val <= 126:
+                return f"character literal '{chr(char_val)}'"
+            else:
+                return f"character literal (value {char_val})"
+
+        if isinstance(expr, NumberLiteral):
+            return f"integer literal '{expr.value}'"
+
+        if isinstance(expr, IdentifierExpression):
+            return f"variable '{expr.name}'"
+
+        if isinstance(expr, BinaryExpression):
+            return "binary expression"
+
+        if isinstance(expr, UnaryExpression):
+            return "unary expression"
+
+        if isinstance(expr, CallExpression):
+            return f"function call '{expr.function_name}()'"
+
+        if isinstance(expr, ArraySubscript):
+            if isinstance(expr.array, IdentifierExpression):
+                return f"array element '{expr.array.name}[...]'"
+            return "array subscript"
+
+        return "expression"
+
+    def _is_char_type(self, ctype: CType) -> bool:
+        """
+        Check if a type is a simple char (not pointer, not array).
+
+        This helper is used to determine if 8-bit operations can be used.
+
+        Args:
+            ctype: The type to check
+
+        Returns:
+            True if type is simple char, False otherwise
+        """
+        return (ctype.base_type == BaseType.CHAR and
+                not ctype.is_pointer and
+                ctype.array_size == 0)
+
+    def _is_int_type(self, ctype: CType) -> bool:
+        """
+        Check if a type is a simple int (not pointer, not array).
+
+        Args:
+            ctype: The type to check
+
+        Returns:
+            True if type is simple int, False otherwise
+        """
+        return (ctype.base_type == BaseType.INT and
+                not ctype.is_pointer and
+                ctype.array_size == 0)
+
+    # =========================================================================
     # Header and Footer Generation
     # =========================================================================
 
@@ -500,6 +1084,94 @@ class CodeGenerator(ASTVisitor):
             name=decl.name,
             sym_type=decl.var_type,
             is_global=True,
+        )
+
+    def _add_struct(self, defn: StructDefinition) -> None:
+        """
+        Add a struct definition to the struct table.
+
+        Computes field offsets and total struct size by traversing fields
+        in declaration order, packing them without any padding (HD6303
+        doesn't benefit from alignment).
+        """
+        fields: list[StructFieldInfo] = []
+        offset = 0
+
+        for field in defn.fields:
+            # Compute field size
+            field_size = self._compute_type_size(field.field_type)
+            fields.append(StructFieldInfo(
+                name=field.name,
+                field_type=field.field_type,
+                offset=offset,
+            ))
+            offset += field_size
+
+        self._structs[defn.name] = StructInfo(
+            name=defn.name,
+            fields=fields,
+            size=offset,
+        )
+
+    def _compute_type_size(self, ctype: CType) -> int:
+        """
+        Compute the size of a type in bytes.
+
+        Handles primitive types, pointers, arrays, and struct types.
+        """
+        # Pointers are always 2 bytes (16-bit addresses)
+        if ctype.is_pointer:
+            if ctype.is_array:
+                return 2 * ctype.array_size  # Array of pointers
+            return 2
+
+        # Struct types
+        if ctype.struct_name is not None:
+            if ctype.struct_name not in self._structs:
+                raise CCodeGenError(f"undefined struct '{ctype.struct_name}'", None)
+            struct_size = self._structs[ctype.struct_name].size
+            if ctype.is_array:
+                return struct_size * ctype.array_size
+            return struct_size
+
+        # Primitive types
+        if ctype.base_type == BaseType.CHAR:
+            element_size = 1
+        elif ctype.base_type == BaseType.INT:
+            element_size = 2
+        elif ctype.base_type == BaseType.VOID:
+            return 0
+        else:
+            element_size = 2  # Default to int size
+
+        if ctype.is_array:
+            return element_size * ctype.array_size
+        return element_size
+
+    def _get_struct_field_info(self, struct_name: str, field_name: str) -> StructFieldInfo:
+        """
+        Get field information for a struct member access.
+
+        Args:
+            struct_name: Name of the struct type
+            field_name: Name of the field
+
+        Returns:
+            StructFieldInfo with offset and type
+
+        Raises:
+            CCodeGenError: If struct or field is not found
+        """
+        if struct_name not in self._structs:
+            raise CCodeGenError(f"undefined struct '{struct_name}'", None)
+
+        struct = self._structs[struct_name]
+        for field in struct.fields:
+            if field.name == field_name:
+                return field
+
+        raise CCodeGenError(
+            f"struct '{struct_name}' has no member '{field_name}'", None
         )
 
     def _add_local(self, name: str, var_type: CType, is_param: bool = False) -> int:
@@ -960,6 +1632,17 @@ class CodeGenerator(ASTVisitor):
         if expr is None:
             return
 
+        # Constant folding optimization: try to evaluate at compile time
+        # Only attempt for compound expressions (binary, unary with const operand)
+        # to avoid redundant work on simple literals
+        if isinstance(expr, (BinaryExpression, UnaryExpression, CastExpression)):
+            const_value = self._try_eval_constant(expr)
+            if const_value is not None:
+                # Emit the pre-computed constant
+                self._emit_instruction("LDD", f"#{const_value}")
+                self._last_expr_size = 2
+                return
+
         if isinstance(expr, NumberLiteral):
             self._generate_number(expr)
         elif isinstance(expr, CharLiteral):
@@ -984,6 +1667,8 @@ class CodeGenerator(ASTVisitor):
             self._generate_cast(expr)
         elif isinstance(expr, SizeofExpression):
             self._generate_sizeof(expr)
+        elif isinstance(expr, MemberAccessExpression):
+            self._generate_member_access(expr)
 
     def _generate_number(self, expr: NumberLiteral) -> None:
         """Generate code for number literal."""
@@ -1052,45 +1737,287 @@ class CodeGenerator(ASTVisitor):
                 self._last_expr_size = 2  # Int: full D register
 
     def _generate_binary(self, expr: BinaryExpression) -> None:
-        """Generate code for binary expression."""
+        """
+        Generate code for binary expression.
+
+        This method handles type checking and routes to either 8-bit (char)
+        or 16-bit (int) code generation paths based on operand types.
+
+        Type Rules:
+        -----------
+        - char OP char: Uses 8-bit instructions for +, -, &, |, ^
+        - int OP int: Uses 16-bit instructions
+        - char +/- int: Uses 8-bit instructions, result is char (with overflow)
+        - char OP int (other ops): Raises CTypeError
+
+        For operations without 8-bit equivalents (*, /, %, <<, >>), char operands
+        are promoted to 16-bit, and mixing with int is still an error.
+        """
         op = expr.operator
 
-        # Optimization: for comparisons with constants, use immediate mode
-        # This avoids pushing to stack which would destroy frame pointer X
-        if op in (BinaryOperator.EQUAL, BinaryOperator.NOT_EQUAL,
-                  BinaryOperator.LESS, BinaryOperator.GREATER,
-                  BinaryOperator.LESS_EQ, BinaryOperator.GREATER_EQ):
+        # =====================================================================
+        # Phase 1: Type Checking
+        # =====================================================================
+        # Determine operand types and check for mixed type errors.
+        # This is done BEFORE generating any code to fail fast on errors.
+
+        # Get the result type - this will raise CTypeError for mixed types
+        # Note: _get_binary_expression_type validates and returns the result type
+        result_type = self._get_binary_expression_type(expr)
+
+        # Determine if both operands are char (for 8-bit path)
+        left_type = self._get_expression_type(expr.left)
+        right_type = self._get_expression_type(expr.right)
+        both_char = (self._is_char_type(left_type) and
+                     self._is_char_type(right_type))
+
+        # =====================================================================
+        # Phase 2: Special Cases (handled before general code gen)
+        # =====================================================================
+
+        # Comparisons with immediate constant - optimization to avoid stack push
+        if op in self._COMPARISON_OPS:
             if isinstance(expr.right, (NumberLiteral, CharLiteral)):
-                # Generate left operand (result in D)
+                # Generate left operand (result in D or B depending on type)
                 self._generate_expression(expr.left)
-                # Compare directly with immediate value (CharLiteral.value is already int)
-                self._generate_comparison_immediate(op, expr.right.value)
-                self._last_expr_size = 2  # Comparisons produce 16-bit boolean
+                # If left is char, we need to ensure proper comparison
+                # CharLiteral.value is already int, works for both
+                if both_char:
+                    # 8-bit comparison with immediate
+                    self._generate_comparison_immediate_char(op, expr.right.value)
+                else:
+                    # 16-bit comparison with immediate
+                    self._generate_comparison_immediate(op, expr.right.value)
+                self._last_expr_size = 2  # Comparisons always produce 16-bit boolean
                 return
 
-        # Logical operators handle their own operands (short-circuit evaluation)
-        # Don't push right operand - they evaluate it only when needed
+        # Logical operators - short-circuit evaluation, always 16-bit result
         if op == BinaryOperator.LOGICAL_AND:
             self._generate_expression(expr.left)
             self._generate_logical_and(expr)
-            self._last_expr_size = 2  # Logical ops produce 16-bit boolean
+            self._last_expr_size = 2
             return
         elif op == BinaryOperator.LOGICAL_OR:
             self._generate_expression(expr.left)
             self._generate_logical_or(expr)
-            self._last_expr_size = 2  # Logical ops produce 16-bit boolean
+            self._last_expr_size = 2
             return
 
-        # General case: push right operand, generate left, operate
+        # Power-of-2 multiply/divide optimization (16-bit shifts)
+        if op in (BinaryOperator.MULTIPLY, BinaryOperator.DIVIDE):
+            const_val = self._try_eval_constant(expr.right)
+            if const_val is not None and const_val > 0 and self._is_power_of_2(const_val):
+                shift_count = self._log2(const_val)
+                if shift_count <= 8:
+                    # Generate left operand
+                    self._generate_expression(expr.left)
+                    # If char, promote to 16-bit first (CLRA already done by char load)
+                    # Emit shifts
+                    if op == BinaryOperator.MULTIPLY:
+                        for _ in range(shift_count):
+                            self._emit_instruction("ASLD", "")
+                    else:  # DIVIDE
+                        for _ in range(shift_count):
+                            self._emit_instruction("LSRD", "")
+                    self._last_expr_size = 2
+                    return
+
+        # =====================================================================
+        # Phase 3: Route to 8-bit or 16-bit code generation
+        # =====================================================================
+
+        # Determine if we have mixed char/int for + or -
+        left_is_char = self._is_char_type(left_type)
+        right_is_char = self._is_char_type(right_type)
+        left_is_int = self._is_int_type(left_type)
+        right_is_int = self._is_int_type(right_type)
+        is_mixed_add_sub = (op in (BinaryOperator.ADD, BinaryOperator.SUBTRACT) and
+                           ((left_is_char and right_is_int) or
+                            (left_is_int and right_is_char)))
+
+        if both_char and op in self._CHAR_SUPPORTED_OPS:
+            # 8-bit path: both operands are char and operation supports 8-bit
+            self._generate_binary_char(expr, op)
+        elif is_mixed_add_sub:
+            # Mixed char/int for + or -: use 8-bit with overflow
+            self._generate_binary_char_int(expr, op, left_is_char)
+        else:
+            # 16-bit path: either int operands or operation requires 16-bit
+            self._generate_binary_int(expr, op)
+
+    def _generate_binary_char(self, expr: BinaryExpression, op: BinaryOperator) -> None:
+        """
+        Generate 8-bit code for binary expression with char operands.
+
+        This method generates efficient 8-bit HD6303 instructions when both
+        operands are char type. The result stays in the B register.
+
+        Supported operations:
+        - ADD: ADDB (add B register)
+        - SUBTRACT: SUBB (subtract from B register)
+        - BITWISE_AND: ANDB (AND with B register)
+        - BITWISE_OR: ORAB (OR with B register)
+        - BITWISE_XOR: EORB (exclusive OR with B register)
+
+        Stack usage: Pushes 1 byte (vs 2 bytes for 16-bit path)
+
+        Register state after:
+        - B: Contains the 8-bit result
+        - A: Cleared to 0 (CLRA)
+        - _last_expr_size: Set to 1
+
+        Args:
+            expr: The binary expression (both operands must be char)
+            op: The operator (must be in _CHAR_SUPPORTED_OPS)
+        """
+        # Generate right operand first (result in B, A=0)
         self._generate_expression(expr.right)
+        # Push only B (1 byte) - more efficient than 16-bit push
+        self._emit_instruction("PSHB", "")
+        self._arg_push_depth += 1  # Track this push for left operand generation
+
+        # Generate left operand (result in B, A=0)
+        self._generate_expression(expr.left)
+
+        # Get stack pointer to access pushed byte
+        self._emit_load_sp()
+
+        # Perform 8-bit operation
+        # Stack layout after PSHB: [right_byte] <- SP
+        # After TSX: X = SP, so 0,X points to right operand
+        if op == BinaryOperator.ADD:
+            self._emit_instruction("ADDB", "0,X")
+        elif op == BinaryOperator.SUBTRACT:
+            self._emit_instruction("SUBB", "0,X")
+        elif op == BinaryOperator.BITWISE_AND:
+            self._emit_instruction("ANDB", "0,X")
+        elif op == BinaryOperator.BITWISE_OR:
+            self._emit_instruction("ORAB", "0,X")
+        elif op == BinaryOperator.BITWISE_XOR:
+            self._emit_instruction("EORB", "0,X")
+
+        # Pop 1 byte from stack
+        self._emit_instruction("INS", "")
+        self._arg_push_depth -= 1  # Restore push depth
+
+        # Ensure A is clear for consistent D register state
+        # (char expressions should have A=0 so D can be used if needed)
+        self._emit_instruction("CLRA", "")
+
+        # Mark result as 8-bit for boolean test optimization
+        self._last_expr_size = 1
+
+    def _generate_binary_char_int(
+        self,
+        expr: BinaryExpression,
+        op: BinaryOperator,
+        left_is_char: bool
+    ) -> None:
+        """
+        Generate 8-bit code for mixed char/int addition or subtraction.
+
+        This method handles expressions like:
+        - char + int  (e.g., c = c + 1)
+        - int + char  (e.g., c = 1 + c)
+        - char - int  (e.g., c = c - 32)
+        - int - char  (less common but supported)
+
+        The result is always 8-bit (char) with natural overflow behavior.
+        Only the low byte of the int operand is used.
+
+        Strategy:
+        - Generate the int operand first (result in D, low byte in B)
+        - Push only B (the low byte) to stack
+        - Generate the char operand (result in B)
+        - Perform 8-bit operation
+        - Result in B, A cleared
+
+        Note: For int - char, we need to handle the operand order correctly:
+        - If left_is_char: char - int -> B(char) - stack(int_low)
+        - If not left_is_char: int - char -> B(int_low) - stack(char)
+          But we want the result to be char, so we need to swap operand order
+
+        Args:
+            expr: The binary expression (one char, one int operand)
+            op: The operator (ADD or SUBTRACT)
+            left_is_char: True if left operand is char, False if right is char
+        """
+        if left_is_char:
+            # Pattern: char OP int
+            # Generate int operand first (result in D, we use only B)
+            self._generate_expression(expr.right)
+            # Push low byte of int
+            self._emit_instruction("PSHB", "")
+            self._arg_push_depth += 1  # Track this push
+
+            # Generate char operand (result in B)
+            self._generate_expression(expr.left)
+
+            # Perform 8-bit operation: B = B OP stack
+            self._emit_load_sp()
+            if op == BinaryOperator.ADD:
+                self._emit_instruction("ADDB", "0,X")
+            elif op == BinaryOperator.SUBTRACT:
+                self._emit_instruction("SUBB", "0,X")
+        else:
+            # Pattern: int OP char
+            # Generate char operand first (result in B)
+            self._generate_expression(expr.right)
+            # Push char byte
+            self._emit_instruction("PSHB", "")
+            self._arg_push_depth += 1  # Track this push
+
+            # Generate int operand (result in D, we use only B)
+            self._generate_expression(expr.left)
+            # B now has low byte of int
+
+            # Perform 8-bit operation: B = B OP stack
+            self._emit_load_sp()
+            if op == BinaryOperator.ADD:
+                self._emit_instruction("ADDB", "0,X")
+            elif op == BinaryOperator.SUBTRACT:
+                self._emit_instruction("SUBB", "0,X")
+
+        # Pop 1 byte from stack
+        self._emit_instruction("INS", "")
+        self._arg_push_depth -= 1  # Restore push depth
+
+        # Clear A for consistent D register state
+        self._emit_instruction("CLRA", "")
+
+        # Result is 8-bit char
+        self._last_expr_size = 1
+
+    def _generate_binary_int(self, expr: BinaryExpression, op: BinaryOperator) -> None:
+        """
+        Generate 16-bit code for binary expression.
+
+        This is the standard path for int operands or operations that require
+        16-bit (*, /, %, <<, >>). Also used when char operands need promotion.
+
+        Stack usage: Pushes 2 bytes (A and B)
+
+        Register state after:
+        - D (A:B): Contains the 16-bit result
+        - _last_expr_size: Set to 2
+
+        Args:
+            expr: The binary expression
+            op: The operator
+        """
+        # Generate right operand (result in D)
+        self._generate_expression(expr.right)
+        # Push 2 bytes to stack
         self._emit_instruction("PSHB", "")
         self._emit_instruction("PSHA", "")
+        self._arg_push_depth += 2  # Track this push for left operand generation
 
         # Generate left operand (result in D)
         self._generate_expression(expr.left)
 
-        # Use _emit_load_sp() to get X = SP, then access pushed word at 0,X
-        # NOTE: This destroys X! Only use for operations that don't need X after
+        # Perform 16-bit operation
+        # Stack layout after PSHA/PSHB: [A][B] <- SP (high byte first)
+        # After TSX: X = SP, so 0,X = A (high), 1,X = B (low)
         if op == BinaryOperator.ADD:
             self._emit_load_sp()
             self._emit_instruction("ADDD", "0,X")
@@ -1129,17 +2056,51 @@ class CodeGenerator(ASTVisitor):
             self._emit_load_sp()
             self._emit_instruction("LDAB", "1,X")
             self._emit_instruction("JSR", "__shr16")
-        elif op in (BinaryOperator.EQUAL, BinaryOperator.NOT_EQUAL,
-                    BinaryOperator.LESS, BinaryOperator.GREATER,
-                    BinaryOperator.LESS_EQ, BinaryOperator.GREATER_EQ):
+        elif op in self._COMPARISON_OPS:
             self._generate_comparison(op)
 
-        # Pop operand from stack
+        # Pop 2 bytes from stack
         self._emit_instruction("INS", "")
         self._emit_instruction("INS", "")
+        self._arg_push_depth -= 2  # Restore push depth
 
-        # All binary operations produce 16-bit results in D
+        # Mark result as 16-bit
         self._last_expr_size = 2
+
+    def _generate_comparison_immediate_char(self, op: BinaryOperator, value: int) -> None:
+        """
+        Generate 8-bit comparison with immediate value.
+
+        This optimized path is used when comparing a char expression against
+        a char literal. Uses CMPB instead of SUBD for efficiency.
+
+        Args:
+            op: The comparison operator
+            value: The immediate value to compare against
+        """
+        true_label = self._new_label("true")
+        end_label = self._new_label("cmpend")
+
+        # B already has left operand (char), compare with immediate
+        # CMPB sets flags like SUBB but doesn't modify B
+        self._emit_instruction("CMPB", f"#{value & 0xFF}")
+
+        # Branch on condition
+        branch_map = {
+            BinaryOperator.EQUAL: "BEQ",
+            BinaryOperator.NOT_EQUAL: "BNE",
+            BinaryOperator.LESS: "BLT",
+            BinaryOperator.GREATER: "BGT",
+            BinaryOperator.LESS_EQ: "BLE",
+            BinaryOperator.GREATER_EQ: "BGE",
+        }
+
+        self._emit_instruction(branch_map[op], true_label)
+        self._emit_instruction("LDD", "#0")   # False (16-bit result)
+        self._emit_instruction("BRA", end_label)
+        self._emit_label(true_label)
+        self._emit_instruction("LDD", "#1")   # True (16-bit result)
+        self._emit_label(end_label)
 
     def _generate_comparison(self, op: BinaryOperator) -> None:
         """Generate code for comparison operators."""
@@ -1286,10 +2247,13 @@ class CodeGenerator(ASTVisitor):
                     self._emit_instruction("LDD", f"#_{expr.operand.name}")
                 else:
                     # Calculate address from frame pointer
-                    self._emit_instruction("TXA", "")
-                    self._emit_instruction("TAB", "")
-                    self._emit_instruction("LDAA", "#0")
-                    self._emit_instruction("ADDD", f"#{info.offset}")
+                    # TSX gives current SP, which may differ from original frame if
+                    # we're in the middle of pushing function arguments.
+                    # Compensate by adding _arg_push_depth to the offset.
+                    adjusted_offset = info.offset + self._arg_push_depth
+                    self._emit_instruction("TSX", "")
+                    self._emit_instruction("XGDX", "")
+                    self._emit_instruction("ADDD", f"#{adjusted_offset}")
             self._last_expr_size = 2  # Addresses are always 16-bit
 
         elif op == UnaryOperator.DEREFERENCE:
@@ -1409,6 +2373,8 @@ class CodeGenerator(ASTVisitor):
                 else:
                     self._emit_instruction("STD", f"_{target.name}")
             else:
+                # Refresh frame pointer - X may have been corrupted by expression evaluation
+                self._emit_instruction("TSX", "")
                 if info.sym_type.size == 1:
                     self._emit_instruction("STAB", f"{info.offset},X")
                 else:
@@ -1418,6 +2384,7 @@ class CodeGenerator(ASTVisitor):
             # Store to array element
             self._emit_instruction("PSHB", "")
             self._emit_instruction("PSHA", "")  # Save value
+            self._arg_push_depth += 2  # Track this temporary push
 
             # Calculate address
             self._generate_subscript_address(target)
@@ -1426,6 +2393,7 @@ class CodeGenerator(ASTVisitor):
             element_size = self._get_array_element_size(target)
             self._emit_instruction("PULA", "")
             self._emit_instruction("PULB", "")
+            self._arg_push_depth -= 2  # Restore push depth
             if element_size == 1:
                 self._emit_instruction("STAB", "0,X")  # Store single byte
             else:
@@ -1435,11 +2403,38 @@ class CodeGenerator(ASTVisitor):
             # Store through pointer
             self._emit_instruction("PSHB", "")
             self._emit_instruction("PSHA", "")  # Save value
+            self._arg_push_depth += 2  # Track this temporary push
             self._generate_expression(target.operand)
             self._emit_instruction("XGDX", "")  # Pointer to X
             self._emit_instruction("PULA", "")
             self._emit_instruction("PULB", "")
+            self._arg_push_depth -= 2  # Restore push depth
             self._emit_instruction("STD", "0,X")
+
+        elif isinstance(target, MemberAccessExpression):
+            # Store to struct member: p.x = value or p->x = value
+            self._emit_instruction("PSHB", "")
+            self._emit_instruction("PSHA", "")  # Save value to stack
+            self._arg_push_depth += 2  # Track this temporary push
+
+            # Compute address of member
+            self._generate_member_access_address(target)
+            self._emit_instruction("XGDX", "")  # Address to X
+
+            # Get field type to determine store size
+            object_type = self._get_expression_type(target.object_expr)
+            struct_name = object_type.struct_name
+            field_info = self._get_struct_field_info(struct_name, target.member_name)
+
+            # Restore value and store
+            self._emit_instruction("PULA", "")
+            self._emit_instruction("PULB", "")
+            self._arg_push_depth -= 2  # Restore push depth
+
+            if field_info.field_type.size == 1:
+                self._emit_instruction("STAB", "0,X")  # Store char (1 byte)
+            else:
+                self._emit_instruction("STD", "0,X")   # Store int/ptr (2 bytes)
 
     def _generate_call(self, expr: CallExpression) -> None:
         """
@@ -1576,18 +2571,22 @@ class CodeGenerator(ASTVisitor):
         # Regular C function call
         # =====================================================================
         # Push arguments right-to-left
+        # Track push depth so local address calculations can compensate
+        saved_push_depth = self._arg_push_depth
         for arg in reversed(expr.arguments):
             self._generate_expression(arg)
             self._emit_instruction("PSHB", "")
             self._emit_instruction("PSHA", "")
+            self._arg_push_depth += 2  # Track stack growth
 
         # Call function
         self._emit_instruction("JSR", f"_{expr.function_name}")
 
-        # Clean up arguments
+        # Clean up arguments and reset push depth
         arg_bytes = len(expr.arguments) * 2
         for _ in range(arg_bytes):
             self._emit_instruction("INS", "")
+        self._arg_push_depth = saved_push_depth  # Restore to pre-call depth
 
         # Function calls return 16-bit values in D
         self._last_expr_size = 2
@@ -1614,10 +2613,11 @@ class CodeGenerator(ASTVisitor):
                 self._emit_instruction("LDX", f"#_{expr.array.name}")
             else:
                 # Local array: address is frame + offset
-                self._emit_instruction("TXA", "")
-                self._emit_instruction("TAB", "")
-                self._emit_instruction("LDAA", "#0")
-                self._emit_instruction("ADDD", f"#{info.offset}")
+                # Compensate for any bytes pushed during argument generation
+                adjusted_offset = info.offset + self._arg_push_depth
+                self._emit_instruction("TSX", "")
+                self._emit_instruction("XGDX", "")
+                self._emit_instruction("ADDD", f"#{adjusted_offset}")
                 self._emit_instruction("XGDX", "")
         else:
             # Pointer expression
@@ -1626,6 +2626,7 @@ class CodeGenerator(ASTVisitor):
 
         # Save base address
         self._emit_instruction("PSHX", "")
+        self._arg_push_depth += 2  # Track this temporary push
 
         # Generate index
         self._generate_expression(expr.index)
@@ -1640,6 +2641,7 @@ class CodeGenerator(ASTVisitor):
         self._emit_instruction("ADDD", "0,X")
         self._emit_instruction("INS", "")
         self._emit_instruction("INS", "")
+        self._arg_push_depth -= 2  # Restore push depth
         self._emit_instruction("XGDX", "")
 
     def _generate_ternary(self, expr: TernaryExpression) -> None:
@@ -1681,10 +2683,187 @@ class CodeGenerator(ASTVisitor):
     def _generate_sizeof(self, expr: SizeofExpression) -> None:
         """Generate code for sizeof expression."""
         if expr.target_type:
-            size = expr.target_type.size
+            # Use the type's size property, which handles structs via size_resolver
+            if expr.target_type.struct_name and expr.target_type.struct_name in self._structs:
+                # Struct type - get size from our struct table
+                struct_info = self._structs[expr.target_type.struct_name]
+                if expr.target_type.is_array:
+                    size = struct_info.size * expr.target_type.array_size
+                elif expr.target_type.is_pointer:
+                    size = 2  # Pointer to struct
+                else:
+                    size = struct_info.size
+            else:
+                size = expr.target_type.size
         else:
-            # Would need type analysis to determine expression type
+            # sizeof(expr) - would need type analysis to determine expression type
             size = 2  # Default to int size
 
         self._emit_instruction("LDD", f"#{size}")
         self._last_expr_size = 2  # sizeof returns 16-bit int
+
+    def _generate_member_access(self, expr: MemberAccessExpression) -> None:
+        """
+        Generate code for struct member access (. and ->).
+
+        For p.x (dot operator):
+            - Get address of struct variable
+            - Add field offset
+            - Load value from that address
+
+        For p->x (arrow operator):
+            - Get pointer value (already an address)
+            - Add field offset
+            - Load value from that address
+
+        Result is in D register.
+        """
+        # Get the struct type from the object expression
+        object_type = self._get_expression_type(expr.object_expr)
+
+        # Determine the struct name
+        if expr.is_arrow:
+            # ptr->field: object_expr is a pointer to struct
+            if not object_type.is_pointer or not object_type.struct_name:
+                raise CCodeGenError(
+                    "'->' requires pointer to struct", expr.location
+                )
+            struct_name = object_type.struct_name
+        else:
+            # obj.field: object_expr is a struct value
+            if object_type.is_pointer or not object_type.struct_name:
+                raise CCodeGenError(
+                    "'.' requires struct value, not pointer", expr.location
+                )
+            struct_name = object_type.struct_name
+
+        # Get field information (offset and type)
+        field_info = self._get_struct_field_info(struct_name, expr.member_name)
+
+        if expr.is_arrow:
+            # Arrow operator: object_expr evaluates to a pointer
+            # Generate: D = ptr, X = D, then access X+offset
+            self._generate_expression(expr.object_expr)
+            # Transfer D to X for indexed addressing
+            self._emit_instruction("XGDX", "")  # Exchange D and X
+        else:
+            # Dot operator: need address of the struct variable
+            self._generate_member_address(expr.object_expr)
+            # Address is now in D, transfer to X
+            self._emit_instruction("XGDX", "")  # Exchange D and X
+
+        # Now X holds the struct base address
+        # Load the field value from X+offset
+        offset = field_info.offset
+        field_type = field_info.field_type
+
+        if field_type.is_struct and not field_type.is_pointer:
+            # Nested struct by value - return address (like array decay)
+            if offset == 0:
+                self._emit_instruction("XGDX", "")  # D = X (struct address)
+            else:
+                self._emit_instruction("XGDX", "")  # D = X
+                self._emit_instruction("ADDD", f"#{offset}")  # D = base + offset
+            self._last_expr_size = 2  # Address is 16-bit
+        elif field_type.is_pointer or field_type.base_type == BaseType.INT or field_type.is_array:
+            # 16-bit value or pointer
+            if offset <= 255:
+                self._emit_instruction("LDD", f"{offset},X")
+            else:
+                # Large offset - need to compute address
+                self._emit_instruction("XGDX", "")  # D = base address
+                self._emit_instruction("ADDD", f"#{offset}")
+                self._emit_instruction("XGDX", "")  # X = computed address
+                self._emit_instruction("LDD", "0,X")
+            self._last_expr_size = 2
+        elif field_type.base_type == BaseType.CHAR and not field_type.is_array:
+            # 8-bit char value
+            if offset <= 255:
+                self._emit_instruction("LDAB", f"{offset},X")
+            else:
+                # Large offset
+                self._emit_instruction("XGDX", "")
+                self._emit_instruction("ADDD", f"#{offset}")
+                self._emit_instruction("XGDX", "")
+                self._emit_instruction("LDAB", "0,X")
+            self._emit_instruction("CLRA", "")
+            self._last_expr_size = 1
+        else:
+            # Default: 16-bit
+            if offset <= 255:
+                self._emit_instruction("LDD", f"{offset},X")
+            else:
+                self._emit_instruction("XGDX", "")
+                self._emit_instruction("ADDD", f"#{offset}")
+                self._emit_instruction("XGDX", "")
+                self._emit_instruction("LDD", "0,X")
+            self._last_expr_size = 2
+
+    def _generate_member_address(self, expr: Expression) -> None:
+        """
+        Generate code to compute the address of an expression.
+
+        For identifiers (variables), emits code to load the address.
+        For other expressions, this would need lvalue analysis.
+
+        Result is in D register.
+        """
+        if isinstance(expr, IdentifierExpression):
+            # Variable: get its address
+            info = self._lookup(expr.name)
+            if info is None:
+                raise CCodeGenError(f"undefined variable '{expr.name}'", expr.location)
+
+            if info.is_global:
+                # Global: load address constant
+                self._emit_instruction("LDD", f"#_{expr.name}")
+            else:
+                # Local: compute address from frame pointer
+                # Compensate for any bytes pushed during argument generation
+                adjusted_offset = info.offset + self._arg_push_depth
+                self._emit_instruction("TSX", "")  # X = SP
+                if adjusted_offset == 0:
+                    self._emit_instruction("XGDX", "")  # D = X
+                else:
+                    self._emit_instruction("XGDX", "")  # D = X
+                    self._emit_instruction("ADDD", f"#{adjusted_offset}")  # D = X + offset
+        elif isinstance(expr, MemberAccessExpression):
+            # Nested member access: compute address of the nested member
+            self._generate_member_access_address(expr)
+        elif isinstance(expr, ArraySubscript):
+            # Array element: compute address
+            self._generate_subscript_address(expr)
+        else:
+            raise CCodeGenError(
+                "cannot take address of expression", expr.location
+            )
+
+    def _generate_member_access_address(self, expr: MemberAccessExpression) -> None:
+        """
+        Generate code to compute the address of a member access.
+
+        This is for lvalues like p.x or p->x when used as assignment targets
+        or for nested struct access.
+
+        Result is in D register.
+        """
+        # Get the struct type
+        object_type = self._get_expression_type(expr.object_expr)
+
+        if expr.is_arrow:
+            struct_name = object_type.struct_name
+        else:
+            struct_name = object_type.struct_name
+
+        field_info = self._get_struct_field_info(struct_name, expr.member_name)
+
+        if expr.is_arrow:
+            # ptr->field: ptr + offset
+            self._generate_expression(expr.object_expr)  # D = ptr
+            if field_info.offset > 0:
+                self._emit_instruction("ADDD", f"#{field_info.offset}")
+        else:
+            # obj.field: &obj + offset
+            self._generate_member_address(expr.object_expr)  # D = &obj
+            if field_info.offset > 0:
+                self._emit_instruction("ADDD", f"#{field_info.offset}")

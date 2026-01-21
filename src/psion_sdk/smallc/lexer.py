@@ -114,6 +114,7 @@ class CTokenType(Enum):
     SIZEOF = auto()         # sizeof (limited support)
     EXTERNAL = auto()       # external (OPL procedure declaration)
     TYPEDEF = auto()        # typedef (type alias)
+    STRUCT = auto()         # struct (aggregate type definition)
 
     # === Arithmetic Operators ===
     PLUS = auto()           # +
@@ -171,6 +172,8 @@ class CTokenType(Enum):
     COMMA = auto()          # ,
     COLON = auto()          # :
     QUESTION = auto()       # ? (ternary operator)
+    DOT = auto()            # . (struct member access)
+    ARROW = auto()          # -> (struct pointer member access)
 
     # === Preprocessor (handled specially) ===
     HASH = auto()           # # (preprocessor directive start)
@@ -207,6 +210,7 @@ KEYWORDS: dict[str, CTokenType] = {
     "sizeof": CTokenType.SIZEOF,
     "external": CTokenType.EXTERNAL,
     "typedef": CTokenType.TYPEDEF,
+    "struct": CTokenType.STRUCT,
 }
 
 
@@ -822,6 +826,8 @@ class CLexer:
                 return self._make_token(CTokenType.DECREMENT, "--", start_line, start_column)
             if self._match("="):
                 return self._make_token(CTokenType.MINUS_ASSIGN, "-=", start_line, start_column)
+            if self._match(">"):
+                return self._make_token(CTokenType.ARROW, "->", start_line, start_column)
             return self._make_token(CTokenType.MINUS, "-", start_line, start_column)
 
         if char == "*":
@@ -900,6 +906,7 @@ class CLexer:
             "?": CTokenType.QUESTION,
             "~": CTokenType.TILDE,
             "#": CTokenType.HASH,
+            ".": CTokenType.DOT,
         }
 
         if char in single_tokens:

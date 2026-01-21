@@ -56,6 +56,8 @@ _CALL_OPL_REST  EQU     UTW_T2  ; $82: Restore function address (2 bytes, $82-$8
 _strlen:        JMP     __strlen        ; char *s -> int length
 _memcpy:        JMP     __memcpy        ; void *dest, void *src, int n -> void *dest
 _memset:        JMP     __memset        ; void *dest, int c, int n -> void *dest
+_struct_copy:   JMP     __memcpy        ; void *dest, void *src, int size -> void *dest
+                                        ; Alias for struct copying: struct_copy(&dest, &src, sizeof(T))
 
 ; =============================================================================
 ; 16-bit Signed Multiplication: D = D * X

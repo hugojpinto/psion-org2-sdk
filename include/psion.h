@@ -501,6 +501,29 @@ char *strcat(char *dest, char *src);
 void *memcpy(void *dest, void *src, int n);
 
 /*
+ * struct_copy - Copy a struct
+ *
+ * Convenience wrapper for memcpy to copy struct values.
+ * This is the recommended way to copy structs since by-value
+ * struct assignment is not supported.
+ *
+ * Parameters:
+ *   dest - Pointer to destination struct
+ *   src  - Pointer to source struct
+ *   size - Size of struct in bytes (use sizeof)
+ *
+ * Returns:
+ *   Pointer to dest
+ *
+ * Example:
+ *   struct Point p1, p2;
+ *   p1.x = 10;
+ *   p1.y = 20;
+ *   struct_copy(&p2, &p1, sizeof(struct Point));
+ */
+void *struct_copy(void *dest, void *src, int size);
+
+/*
  * memset - Fill memory
  *
  * Sets n bytes of dest to value c.

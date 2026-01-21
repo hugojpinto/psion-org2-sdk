@@ -14,6 +14,7 @@ Supported Types
 - unsigned int: 16-bit unsigned integer (0 to 65535)
 - void: no value (for function returns)
 - Pointers to any type (char*, int*, etc.)
+- struct: Aggregate types containing multiple fields
 
 Type Representation
 -------------------
@@ -23,6 +24,7 @@ Types are represented as CType objects with the following attributes:
 - is_pointer: True for pointer types
 - pointer_depth: Number of indirection levels (**)
 - array_size: For array types, the element count (0 = not array)
+- struct_name: For struct types, the struct's name (None for non-structs)
 
 Size Information (HD6303)
 -------------------------
@@ -34,10 +36,24 @@ Size Information (HD6303)
 | unsigned int  | 2            |
 | pointer       | 2            |
 | void          | 0            |
+| struct        | varies (sum of field sizes) |
+
+Struct Types
+------------
+Struct types are identified by the struct_name field. When struct_name is set:
+- The type represents a struct (or pointer/array to struct)
+- base_type is ignored (can be any value, typically VOID)
+- Actual struct size must be looked up from the struct registry in codegen
+
+Example struct types:
+- struct Point          : CType(VOID, struct_name="Point")
+- struct Point *        : CType(VOID, struct_name="Point", is_pointer=True)
+- struct Point arr[5]   : CType(VOID, struct_name="Point", array_size=5)
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import Optional, Callable
 
 
 # =============================================================================
@@ -70,7 +86,7 @@ class CType:
     Represents a C type in the Small-C type system.
 
     This immutable class represents any type that can appear in a
-    Small-C program, including primitives, pointers, and arrays.
+    Small-C program, including primitives, pointers, arrays, and structs.
 
     Attributes:
         base_type: The fundamental type (CHAR, INT, VOID)
@@ -78,29 +94,47 @@ class CType:
         is_pointer: True if this is a pointer type
         pointer_depth: Number of indirection levels (e.g., ** = 2)
         array_size: For arrays, the element count (0 = not array)
+        struct_name: For struct types, the name of the struct (None = not a struct)
+        struct_size_resolver: Optional callback to resolve struct sizes at runtime.
+                             This is set by the code generator to allow size lookups.
 
     Examples:
-        - char         : CType(CHAR, False, False, 0, 0)
-        - unsigned int : CType(INT, True, False, 0, 0)
-        - int *        : CType(INT, False, True, 1, 0)
-        - char **      : CType(CHAR, False, True, 2, 0)
-        - int arr[10]  : CType(INT, False, False, 0, 10)
+        - char             : CType(CHAR, False, False, 0, 0, None)
+        - unsigned int     : CType(INT, True, False, 0, 0, None)
+        - int *            : CType(INT, False, True, 1, 0, None)
+        - char **          : CType(CHAR, False, True, 2, 0, None)
+        - int arr[10]      : CType(INT, False, False, 0, 10, None)
+        - struct Point     : CType(VOID, struct_name="Point")
+        - struct Point *   : CType(VOID, struct_name="Point", is_pointer=True)
+        - struct Point[3]  : CType(VOID, struct_name="Point", array_size=3)
 
     Note:
         For array types, is_pointer is False but array_size > 0.
         When an array decays to a pointer (in expressions), a new
         CType is created with is_pointer=True, pointer_depth=1.
+
+        For struct types, base_type is typically VOID (ignored), and
+        struct_name identifies the struct definition. The actual struct
+        size must be looked up from the struct registry during code
+        generation using struct_size_resolver.
     """
     base_type: BaseType
     is_unsigned: bool = False
     is_pointer: bool = False
     pointer_depth: int = 0
     array_size: int = 0  # 0 = not an array
+    struct_name: Optional[str] = None  # None = not a struct type
+    # Callback to resolve struct sizes. Set by code generator.
+    # Signature: (struct_name: str) -> int
+    # This allows the type system to query struct sizes without circular imports.
+    struct_size_resolver: Optional[Callable[[str], int]] = field(
+        default=None, compare=False, hash=False
+    )
 
     def __post_init__(self):
         """Validate type consistency."""
-        # Void cannot be unsigned
-        if self.base_type == BaseType.VOID and self.is_unsigned:
+        # Void cannot be unsigned (but struct types use VOID as placeholder)
+        if self.base_type == BaseType.VOID and self.is_unsigned and self.struct_name is None:
             raise ValueError("void cannot be unsigned")
         # If is_pointer, pointer_depth must be >= 1
         if self.is_pointer and self.pointer_depth < 1:
@@ -108,6 +142,34 @@ class CType:
         # If not pointer, pointer_depth must be 0
         if not self.is_pointer and self.pointer_depth != 0:
             object.__setattr__(self, "pointer_depth", 0)
+
+    @property
+    def is_struct(self) -> bool:
+        """
+        Return True if this is a struct type (value, not pointer).
+
+        A type is a struct if struct_name is set AND it's not a pointer.
+        Struct pointers have is_struct=False, is_struct_pointer=True.
+        """
+        return self.struct_name is not None and not self.is_pointer
+
+    @property
+    def is_struct_pointer(self) -> bool:
+        """
+        Return True if this is a pointer to a struct.
+
+        This is the case when struct_name is set AND is_pointer is True.
+        """
+        return self.struct_name is not None and self.is_pointer
+
+    @property
+    def is_struct_type(self) -> bool:
+        """
+        Return True if this type involves a struct (value, pointer, or array).
+
+        Use this to check if struct_name is meaningful for this type.
+        """
+        return self.struct_name is not None
 
     @property
     def size(self) -> int:
@@ -119,10 +181,27 @@ class CType:
 
         Returns:
             Size in bytes (1 for char, 2 for int/pointers, 0 for void)
+
+        Note:
+            For struct types without a size resolver, returns 0.
+            The actual struct size must be looked up from the struct registry.
         """
         # Pointers are always 16-bit (2 bytes) on HD6303
-        if self.is_pointer or self.array_size > 0:
+        if self.is_pointer:
             return 2
+
+        # Arrays (of non-structs) - the variable itself holds a pointer worth
+        # But for struct arrays, we need the struct size
+        if self.array_size > 0 and self.struct_name is None:
+            return 2
+
+        # Struct types - need to look up actual size
+        if self.struct_name is not None:
+            if self.struct_size_resolver is not None:
+                return self.struct_size_resolver(self.struct_name)
+            # No resolver available - return 0 as placeholder
+            # Code generator will provide actual size during compilation
+            return 0
 
         if self.base_type == BaseType.VOID:
             return 0
@@ -141,14 +220,26 @@ class CType:
         For non-pointer types, returns the type's own size.
         For pointers, returns the size of the pointed-to type.
         For arrays, returns the size of each array element.
+
+        For struct pointers/arrays, returns the struct size.
         """
         if self.is_pointer:
             # Create the dereferenced type
             deref = self.dereference()
             return deref.size
         elif self.array_size > 0:
-            # Array element size
-            return CType(self.base_type, self.is_unsigned).size
+            # Array element size - could be struct
+            if self.struct_name is not None:
+                # Struct array - element is the struct type
+                element_type = CType(
+                    BaseType.VOID,
+                    struct_name=self.struct_name,
+                    struct_size_resolver=self.struct_size_resolver,
+                )
+                return element_type.size
+            else:
+                # Primitive array
+                return CType(self.base_type, self.is_unsigned).size
         else:
             return self.size
 
@@ -159,10 +250,22 @@ class CType:
 
         For arrays, this is element_count * element_size.
         For non-arrays, this equals size.
+
+        For struct arrays, returns array_size * struct_size.
         """
         if self.array_size > 0:
-            element_type = CType(self.base_type, self.is_unsigned)
-            return self.array_size * element_type.size
+            if self.struct_name is not None:
+                # Struct array
+                element_type = CType(
+                    BaseType.VOID,
+                    struct_name=self.struct_name,
+                    struct_size_resolver=self.struct_size_resolver,
+                )
+                return self.array_size * element_type.size
+            else:
+                # Primitive array
+                element_type = CType(self.base_type, self.is_unsigned)
+                return self.array_size * element_type.size
         return self.size
 
     @property
@@ -180,15 +283,33 @@ class CType:
         """
         Return True if this is a scalar (non-aggregate) type.
 
-        Scalars are: char, int, pointers.
-        Non-scalars are: arrays, void.
+        Scalars are: char, int, pointers (including struct pointers).
+        Non-scalars are: arrays, void, struct values.
+
+        Note: Struct values are aggregates, but struct pointers are scalars.
         """
-        return not self.is_void and not self.is_array
+        return not self.is_void and not self.is_array and not self.is_struct
 
     @property
     def is_integer(self) -> bool:
-        """Return True if this is an integer type (char or int)."""
-        return self.base_type in (BaseType.CHAR, BaseType.INT) and not self.is_pointer
+        """
+        Return True if this is an integer type (char or int).
+
+        Struct types are not integers even if base_type happens to be INT/CHAR.
+        """
+        return (self.base_type in (BaseType.CHAR, BaseType.INT)
+                and not self.is_pointer
+                and self.struct_name is None)
+
+    @property
+    def is_aggregate(self) -> bool:
+        """
+        Return True if this is an aggregate (non-scalar) type.
+
+        Aggregates are: arrays and struct values.
+        Note: Pointers (including struct pointers) are NOT aggregates.
+        """
+        return self.is_array or self.is_struct
 
     def dereference(self) -> "CType":
         """
@@ -196,6 +317,7 @@ class CType:
 
         For int*, returns int.
         For int**, returns int*.
+        For struct Point*, returns struct Point.
         For arrays, returns the element type.
 
         Raises:
@@ -203,17 +325,36 @@ class CType:
         """
         if self.is_array:
             # Array access yields element type
-            return CType(self.base_type, self.is_unsigned)
+            if self.struct_name is not None:
+                # Struct array - element is struct type
+                return CType(
+                    BaseType.VOID,
+                    struct_name=self.struct_name,
+                    struct_size_resolver=self.struct_size_resolver,
+                )
+            else:
+                return CType(self.base_type, self.is_unsigned)
         elif self.is_pointer:
             if self.pointer_depth > 1:
+                # Multi-level pointer (e.g., int** -> int*)
                 return CType(
                     self.base_type,
                     self.is_unsigned,
                     is_pointer=True,
                     pointer_depth=self.pointer_depth - 1,
+                    struct_name=self.struct_name,
+                    struct_size_resolver=self.struct_size_resolver,
                 )
             else:
-                return CType(self.base_type, self.is_unsigned)
+                # Single pointer (e.g., int* -> int, struct Point* -> struct Point)
+                if self.struct_name is not None:
+                    return CType(
+                        BaseType.VOID,
+                        struct_name=self.struct_name,
+                        struct_size_resolver=self.struct_size_resolver,
+                    )
+                else:
+                    return CType(self.base_type, self.is_unsigned)
         else:
             raise TypeError(f"cannot dereference non-pointer type {self}")
 
@@ -223,6 +364,8 @@ class CType:
 
         For int, returns int*.
         For int*, returns int**.
+        For struct Point, returns struct Point*.
+        For struct Point*, returns struct Point**.
         """
         if self.is_array:
             # Array of T becomes pointer to T
@@ -231,6 +374,8 @@ class CType:
                 self.is_unsigned,
                 is_pointer=True,
                 pointer_depth=1,
+                struct_name=self.struct_name,
+                struct_size_resolver=self.struct_size_resolver,
             )
         elif self.is_pointer:
             return CType(
@@ -238,6 +383,8 @@ class CType:
                 self.is_unsigned,
                 is_pointer=True,
                 pointer_depth=self.pointer_depth + 1,
+                struct_name=self.struct_name,
+                struct_size_resolver=self.struct_size_resolver,
             )
         else:
             return CType(
@@ -245,6 +392,8 @@ class CType:
                 self.is_unsigned,
                 is_pointer=True,
                 pointer_depth=1,
+                struct_name=self.struct_name,
+                struct_size_resolver=self.struct_size_resolver,
             )
 
     def decay(self) -> "CType":
@@ -254,6 +403,8 @@ class CType:
         In C, arrays decay to pointers in most expression contexts.
         This method returns the pointer type that the array decays to.
         For non-array types, returns self.
+
+        For struct arrays, decays to pointer to struct.
         """
         if self.is_array:
             return CType(
@@ -261,6 +412,8 @@ class CType:
                 self.is_unsigned,
                 is_pointer=True,
                 pointer_depth=1,
+                struct_name=self.struct_name,
+                struct_size_resolver=self.struct_size_resolver,
             )
         return self
 
@@ -274,6 +427,8 @@ class CType:
         3. char and int are compatible (implicit promotion)
         4. Pointer types are compatible with each other (with warning)
         5. Integer 0 is compatible with any pointer type (NULL)
+        6. Struct types are only compatible with same struct type
+        7. Struct pointers follow pointer rules (void* compatible with all)
 
         Args:
             other: The type to check compatibility with
@@ -292,15 +447,30 @@ class CType:
         if self_decay == other_decay:
             return True
 
+        # Struct types - must be exact same struct (no struct assignment anyway)
+        if self_decay.is_struct or other_decay.is_struct:
+            # Struct values can only be compatible with same struct
+            return (self_decay.struct_name == other_decay.struct_name and
+                    self_decay.is_struct == other_decay.is_struct)
+
         # Integer types are compatible with each other
         if self_decay.is_integer and other_decay.is_integer:
             return True
 
         # Pointer types are loosely compatible (void* with anything)
         if self_decay.is_pointer and other_decay.is_pointer:
-            # void* is compatible with any pointer
-            if self_decay.base_type == BaseType.VOID or other_decay.base_type == BaseType.VOID:
+            # void* is compatible with any pointer (including struct pointers)
+            if (self_decay.base_type == BaseType.VOID and
+                    self_decay.struct_name is None):
                 return True
+            if (other_decay.base_type == BaseType.VOID and
+                    other_decay.struct_name is None):
+                return True
+
+            # Same struct pointer types are compatible
+            if self_decay.struct_name is not None or other_decay.struct_name is not None:
+                return self_decay.struct_name == other_decay.struct_name
+
             # Same base type pointers are compatible
             return self_decay.base_type == other_decay.base_type
 
@@ -310,16 +480,42 @@ class CType:
 
         return False
 
+    def with_size_resolver(self, resolver: Callable[[str], int]) -> "CType":
+        """
+        Return a copy of this type with a struct size resolver attached.
+
+        This is used by the code generator to provide struct size lookups
+        to the type system without creating circular dependencies.
+
+        Args:
+            resolver: A function that takes a struct name and returns its size
+
+        Returns:
+            A new CType with the resolver attached
+        """
+        return CType(
+            self.base_type,
+            self.is_unsigned,
+            self.is_pointer,
+            self.pointer_depth,
+            self.array_size,
+            self.struct_name,
+            resolver,
+        )
+
     def __str__(self) -> str:
         """Return the C type string representation."""
         parts = []
 
-        # Unsigned prefix
-        if self.is_unsigned:
-            parts.append("unsigned")
-
-        # Base type
-        parts.append(str(self.base_type))
+        # Struct types
+        if self.struct_name is not None:
+            parts.append(f"struct {self.struct_name}")
+        else:
+            # Unsigned prefix
+            if self.is_unsigned:
+                parts.append("unsigned")
+            # Base type
+            parts.append(str(self.base_type))
 
         # Pointer stars
         if self.is_pointer:
@@ -411,6 +607,7 @@ def make_type(
     is_unsigned: bool = False,
     pointer_depth: int = 0,
     array_size: int = 0,
+    struct_name: Optional[str] = None,
 ) -> CType:
     """
     Create a CType from components.
@@ -422,6 +619,7 @@ def make_type(
         is_unsigned: True for unsigned variants
         pointer_depth: Number of pointer indirections
         array_size: For arrays, the element count
+        struct_name: For struct types, the struct name
 
     Returns:
         A CType representing the specified type
@@ -432,6 +630,45 @@ def make_type(
         is_pointer=pointer_depth > 0,
         pointer_depth=pointer_depth,
         array_size=array_size,
+        struct_name=struct_name,
+    )
+
+
+def make_struct_type(
+    struct_name: str,
+    size_resolver: Optional[Callable[[str], int]] = None,
+    pointer_depth: int = 0,
+    array_size: int = 0,
+) -> CType:
+    """
+    Create a struct type.
+
+    This is a convenience function for creating struct CType instances.
+    Struct types use VOID as their base_type (which is ignored).
+
+    Args:
+        struct_name: The name of the struct
+        size_resolver: Optional callback to compute struct size (used for sizeof)
+        pointer_depth: Number of pointer indirections (0 = struct value)
+        array_size: For arrays of structs, the element count
+
+    Returns:
+        A CType representing the struct type
+
+    Examples:
+        make_struct_type("Point")             -> struct Point
+        make_struct_type("Point", None, 1)    -> struct Point *
+        make_struct_type("Point", None, 0, 5) -> struct Point[5]
+        make_struct_type("Point", resolver)   -> struct Point with size resolver
+    """
+    return CType(
+        base_type=BaseType.VOID,  # Placeholder, ignored for structs
+        is_unsigned=False,
+        is_pointer=pointer_depth > 0,
+        pointer_depth=pointer_depth,
+        array_size=array_size,
+        struct_name=struct_name,
+        struct_size_resolver=size_resolver,
     )
 
 
@@ -449,6 +686,9 @@ def promote_type(type_a: CType, type_b: CType) -> CType:
     3. Otherwise result is char
     4. Unsigned wins over signed of same size
 
+    Note: Struct types cannot be combined in expressions (no struct arithmetic).
+    This function should not be called with struct operands.
+
     Args:
         type_a: First operand type
         type_b: Second operand type
@@ -459,6 +699,13 @@ def promote_type(type_a: CType, type_b: CType) -> CType:
     # Decay arrays to pointers
     a = type_a.decay()
     b = type_b.decay()
+
+    # Struct values cannot be combined in expressions
+    # But struct pointers can participate in pointer arithmetic
+    if a.is_struct or b.is_struct:
+        # This shouldn't happen - codegen should catch this
+        # Return int as fallback
+        return TYPE_INT
 
     # Pointer arithmetic: pointer +/- int = pointer
     if a.is_pointer and not b.is_pointer:

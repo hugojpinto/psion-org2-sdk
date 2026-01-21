@@ -585,6 +585,85 @@ class SizeofExpression(Expression):
 
 
 # =============================================================================
+# Struct-Related AST Nodes
+# =============================================================================
+
+@dataclass
+class StructField(ASTNode):
+    """
+    A single field within a struct definition.
+
+    Represents one field declaration inside a struct, e.g.:
+        int x;
+        char name[20];
+        struct Point *next;
+
+    Attributes:
+        name: The field name
+        field_type: The type of this field (can be any type including
+                   pointers, arrays, and other struct types)
+
+    Note:
+        Unlike VariableDeclaration, struct fields cannot have initializers.
+        Fields are always contiguous in memory with no padding.
+    """
+    name: str = ""
+    field_type: CType = field(default=None)
+
+
+@dataclass
+class StructDefinition(Declaration):
+    """
+    Struct type definition.
+
+    Represents a complete struct definition:
+        struct Point {
+            int x;
+            int y;
+        };
+
+    Attributes:
+        name: The struct name (e.g., "Point")
+        fields: List of fields in declaration order
+
+    Note:
+        Fields are laid out in memory in declaration order with no padding.
+        The struct size is the sum of all field sizes.
+        Maximum struct size is 255 bytes (HD6303 indexed addressing limit).
+    """
+    name: str = ""
+    fields: list[StructField] = field(default_factory=list)
+
+
+@dataclass
+class MemberAccessExpression(Expression):
+    """
+    Member access expression: obj.member or ptr->member.
+
+    Represents accessing a field of a struct, either directly
+    (using dot operator) or through a pointer (using arrow operator).
+
+    Examples:
+        point.x         -> MemberAccess(point, "x", is_arrow=False)
+        ptr->y          -> MemberAccess(ptr, "y", is_arrow=True)
+        rect.origin.x   -> MemberAccess(MemberAccess(rect, "origin"), "x")
+
+    Attributes:
+        object_expr: The struct or struct pointer expression
+        member_name: Name of the field being accessed
+        is_arrow: True for -> operator (pointer), False for . operator (value)
+
+    Code Generation Notes:
+        For direct access (.), the object_expr must be a struct type.
+        For arrow access (->), the object_expr must be a struct pointer.
+        The generated code computes: base_address + field_offset.
+    """
+    object_expr: Expression = None
+    member_name: str = ""
+    is_arrow: bool = False
+
+
+# =============================================================================
 # AST Visitor Pattern
 # =============================================================================
 
@@ -664,6 +743,10 @@ class ASTVisitor:
     def visit_StringLiteral(self, node: StringLiteral): return self.generic_visit(node)
     def visit_CastExpression(self, node: CastExpression): return self.generic_visit(node)
     def visit_SizeofExpression(self, node: SizeofExpression): return self.generic_visit(node)
+    # Struct-related nodes
+    def visit_StructField(self, node: "StructField"): return self.generic_visit(node)
+    def visit_StructDefinition(self, node: "StructDefinition"): return self.generic_visit(node)
+    def visit_MemberAccessExpression(self, node: "MemberAccessExpression"): return self.generic_visit(node)
 
 
 # =============================================================================
@@ -855,4 +938,15 @@ class ASTPrinter(ASTVisitor):
             return f"({self._expr_str(expr.condition)} ? {self._expr_str(expr.then_expr)} : {self._expr_str(expr.else_expr)})"
         if isinstance(expr, VariableDeclaration):
             return f"{expr.var_type} {expr.name}"
+        if isinstance(expr, MemberAccessExpression):
+            op = "->" if expr.is_arrow else "."
+            return f"{self._expr_str(expr.object_expr)}{op}{expr.member_name}"
         return f"<{type(expr).__name__}>"
+
+    def visit_StructDefinition(self, node: "StructDefinition"):
+        """Print a struct definition."""
+        self._emit(f"Struct: {node.name}")
+        self._indent()
+        for field in node.fields:
+            self._emit(f"Field: {field.field_type} {field.name}")
+        self._dedent()

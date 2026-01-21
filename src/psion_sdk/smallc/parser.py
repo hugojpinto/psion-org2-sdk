@@ -73,6 +73,7 @@ from psion_sdk.smallc.types import (
     TYPE_UINT,
     parse_type_specifiers,
     make_type,
+    make_struct_type,
 )
 from psion_sdk.smallc.ast import (
     ProgramNode,
@@ -108,6 +109,10 @@ from psion_sdk.smallc.ast import (
     BinaryOperator,
     UnaryOperator,
     AssignmentOperator,
+    # Struct-related nodes
+    StructField,
+    StructDefinition,
+    MemberAccessExpression,
 )
 from psion_sdk.smallc.errors import (
     CSyntaxError,
@@ -159,7 +164,23 @@ class CParser:
 
         # Typedef table: maps type name -> (base_type, is_unsigned, pointer_depth, array_size)
         # Example: "fp_t" -> (BaseType.CHAR, False, 0, 8) for "typedef char fp_t[8]"
+        # For struct typedefs, base_type is VOID and we also store struct_name in _struct_typedefs
         self._typedefs: dict[str, tuple[BaseType, bool, int, int]] = {}
+
+        # ==========================================================================
+        # Struct Support
+        # ==========================================================================
+        # Struct definitions table: maps struct name -> list of (field_name, field_type)
+        # This is populated when parsing struct definitions and used when:
+        # - Checking if 'struct Name' refers to a valid struct type
+        # - Computing struct sizes (sum of field sizes)
+        # - Resolving field offsets for member access
+        self._structs: dict[str, list[tuple[str, CType]]] = {}
+
+        # Struct typedef aliases: maps typedef name -> struct name
+        # When a typedef is created for a struct (typedef struct Point Point;),
+        # we need to know which struct it refers to
+        self._struct_typedefs: dict[str, str] = {}
 
     def parse(self) -> ProgramNode:
         """
@@ -317,6 +338,16 @@ class CParser:
         - No body (declaration only, implemented in OPL)
         """
         # =====================================================================
+        # Check for 'struct' keyword - struct definition or variable
+        # =====================================================================
+        # Struct can appear in several contexts:
+        #   struct Point { int x; int y; };        - definition only
+        #   struct Point p;                        - variable declaration
+        #   struct Point { int x; int y; } p;     - definition + variable
+        if self._check(CTokenType.STRUCT):
+            return self._parse_struct_or_struct_variable()
+
+        # =====================================================================
         # Check for 'external' keyword - OPL procedure declaration
         # =====================================================================
         # External declarations allow C code to call OPL procedures.
@@ -332,6 +363,7 @@ class CParser:
         #   typedef char mychar;           - simple alias
         #   typedef char buffer[100];      - array typedef
         #   typedef int *intptr;           - pointer typedef
+        #   typedef struct Point Point;    - struct alias
         if self._match(CTokenType.TYPEDEF):
             self._parse_typedef()
             return None  # Typedef doesn't produce AST nodes
@@ -345,7 +377,15 @@ class CParser:
                 location=self._peek().location,
             )
 
-        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size = type_info
+        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size, struct_name = type_info
+
+        # If this is a struct type (not a variable), redirect to struct handling
+        # This catches cases like: struct Point p; (parsed after initial type check)
+        if struct_name is not None:
+            # Let struct variable handling take over
+            return self._parse_struct_variable_declarators_from_type(
+                struct_name, typedef_ptr_depth, typedef_array_size
+            )
 
         # Parse pointer prefix (adds to any typedef pointer depth)
         pointer_depth = typedef_ptr_depth
@@ -365,17 +405,45 @@ class CParser:
             return self._parse_global_variable(base_type, is_unsigned, pointer_depth, name, name_token.location,
                                                typedef_ptr_depth, typedef_array_size)
 
-    def _parse_type_specifier(self) -> Optional[tuple[BaseType, bool, int, int]]:
+    def _parse_type_specifier(self) -> Optional[tuple[BaseType, bool, int, int, Optional[str]]]:
         """
-        Parse type specifier keywords or typedef names.
+        Parse type specifier keywords, typedef names, or struct types.
 
         Returns:
-            Tuple of (base_type, is_unsigned, typedef_pointer_depth, typedef_array_size)
+            Tuple of (base_type, is_unsigned, typedef_pointer_depth, typedef_array_size, struct_name)
             or None if not a type.
 
-            For built-in types, typedef_pointer_depth and typedef_array_size are 0.
+            For built-in types, typedef_pointer_depth, typedef_array_size are 0 and struct_name is None.
             For typedef'd types, these carry the typedef's pointer/array info.
+            For struct types, base_type is VOID and struct_name contains the struct name.
         """
+        # =================================================================
+        # Check for 'struct' keyword
+        # =================================================================
+        # Struct type: struct Name
+        if self._check(CTokenType.STRUCT):
+            self._advance()  # consume 'struct'
+
+            # Must be followed by struct name (we don't support anonymous structs here)
+            if not self._check(CTokenType.IDENTIFIER):
+                raise UnexpectedTokenError(
+                    self._peek().value or self._peek().type.name,
+                    expected="struct name",
+                    location=self._peek().location,
+                )
+
+            struct_name_token = self._advance()
+            struct_name = struct_name_token.value
+
+            # Check if struct is defined (allow forward reference if it's a pointer)
+            # We'll validate this later during parsing when we know if it's a pointer
+            # For now, just return the type info
+            # Note: VOID is used as placeholder base_type for struct types
+            return (BaseType.VOID, False, 0, 0, struct_name)
+
+        # =================================================================
+        # Check for built-in type specifiers
+        # =================================================================
         specifiers = []
 
         # Collect type specifier keywords
@@ -392,17 +460,27 @@ class CParser:
         if specifiers:
             try:
                 base_type, is_unsigned = parse_type_specifiers(specifiers)
-                return (base_type, is_unsigned, 0, 0)  # No typedef info
+                return (base_type, is_unsigned, 0, 0, None)  # No typedef info, no struct
             except ValueError as e:
                 raise CSyntaxError(str(e), self._peek().location)
 
-        # No built-in type specifiers - check for typedef name
+        # =================================================================
+        # Check for typedef name (including struct typedefs)
+        # =================================================================
         if self._check(CTokenType.IDENTIFIER):
             name = self._peek().value
+
+            # Check if it's a struct typedef (e.g., "Point" -> struct Point)
+            if name in self._struct_typedefs:
+                self._advance()  # consume the typedef name
+                struct_name = self._struct_typedefs[name]
+                return (BaseType.VOID, False, 0, 0, struct_name)
+
+            # Check if it's a regular typedef
             if name in self._typedefs:
                 self._advance()  # consume the typedef name
                 base_type, is_unsigned, ptr_depth, array_size = self._typedefs[name]
-                return (base_type, is_unsigned, ptr_depth, array_size)
+                return (base_type, is_unsigned, ptr_depth, array_size, None)
 
         return None
 
@@ -508,7 +586,14 @@ class CParser:
                 hint="external void procedureName(); or external int procedureName();",
             )
 
-        base_type, is_unsigned, ptr_depth, _ = type_info
+        base_type, is_unsigned, ptr_depth, _, struct_name = type_info
+
+        # External OPL procedures cannot have struct return types
+        if struct_name is not None:
+            raise CSyntaxError(
+                "external OPL procedures cannot return struct types",
+                self._peek().location,
+            )
 
         # Validate that the return type is void, int, or char (no pointers)
         if base_type == BaseType.VOID:
@@ -645,7 +730,7 @@ class CParser:
             )
 
         # Unpack type info - for typedef of typedef, we flatten to the base
-        base_type, is_unsigned, inner_ptr_depth, inner_array_size = type_info
+        base_type, is_unsigned, inner_ptr_depth, inner_array_size, struct_name = type_info
 
         # Parse optional pointer prefix (adds to any inherited pointer depth)
         pointer_depth = inner_ptr_depth
@@ -678,8 +763,419 @@ class CParser:
         # Expect semicolon
         self._expect(CTokenType.SEMICOLON, "';'")
 
-        # Store the typedef with combined pointer depth and array size
-        self._typedefs[typedef_name] = (base_type, is_unsigned, pointer_depth, array_size)
+        # Handle struct typedefs specially
+        if struct_name is not None:
+            # typedef struct Name AliasName;
+            # Store both in struct_typedefs and regular typedefs
+            self._struct_typedefs[typedef_name] = struct_name
+            # Also store in regular typedefs with VOID as base type
+            self._typedefs[typedef_name] = (BaseType.VOID, False, pointer_depth, array_size)
+        else:
+            # Regular typedef
+            self._typedefs[typedef_name] = (base_type, is_unsigned, pointer_depth, array_size)
+
+    # =========================================================================
+    # Struct Parsing
+    # =========================================================================
+
+    def _parse_struct_or_struct_variable(self):
+        """
+        Parse a struct definition and/or struct variable declaration.
+
+        This method handles all cases where 'struct' keyword appears at top level:
+
+        1. Struct definition only:
+           struct Point { int x; int y; };
+
+        2. Struct definition with variable:
+           struct Point { int x; int y; } p;
+
+        3. Struct variable (using existing type):
+           struct Point p;
+
+        4. Anonymous struct (NOT supported):
+           struct { int x; } p;  -> Error
+
+        Returns:
+            StructDefinition for case 1 (definition only),
+            list containing StructDefinition + VariableDeclaration(s) for case 2,
+            list[VariableDeclaration] for case 3
+        """
+        struct_loc = self._peek().location
+        self._expect(CTokenType.STRUCT, "struct")
+
+        # Must have a struct name (we don't support anonymous structs)
+        if not self._check(CTokenType.IDENTIFIER):
+            if self._check(CTokenType.LBRACE):
+                raise CSyntaxError(
+                    "anonymous structs are not supported; give the struct a name",
+                    self._peek().location,
+                )
+            raise UnexpectedTokenError(
+                self._peek().value or self._peek().type.name,
+                expected="struct name",
+                location=self._peek().location,
+            )
+
+        name_token = self._advance()
+        struct_name = name_token.value
+
+        # Check for definition (has body)
+        if self._check(CTokenType.LBRACE):
+            # Parse struct body
+            struct_def = self._parse_struct_definition(struct_name, struct_loc)
+
+            # Check if followed by variable declaration
+            if self._check(CTokenType.SEMICOLON):
+                # Definition only: struct Point { ... };
+                self._advance()  # consume ;
+                return struct_def
+            else:
+                # Definition + variable: struct Point { ... } p;
+                vars = self._parse_struct_variable_declarators(struct_name)
+                return [struct_def] + vars
+        else:
+            # No body - must be using existing struct type
+            if struct_name not in self._structs:
+                raise CSyntaxError(
+                    f"undefined struct type '{struct_name}'",
+                    name_token.location,
+                )
+            # Parse variable declarator(s)
+            return self._parse_struct_variable_declarators(struct_name)
+
+    def _parse_struct_definition(self, struct_name: str, location: SourceLocation) -> StructDefinition:
+        """
+        Parse the body of a struct definition.
+
+        Args:
+            struct_name: The name of the struct being defined
+            location: Source location of the 'struct' keyword
+
+        Returns:
+            StructDefinition AST node
+        """
+        # Check for duplicate definition
+        if struct_name in self._structs:
+            raise CSyntaxError(
+                f"struct '{struct_name}' is already defined",
+                location,
+            )
+
+        self._expect(CTokenType.LBRACE, "'{'")
+
+        fields: list[StructField] = []
+        field_names: set[str] = set()  # Track for duplicate detection
+        total_size = 0
+
+        while not self._check(CTokenType.RBRACE) and not self._at_end():
+            field = self._parse_struct_field(struct_name)
+
+            # Check for duplicate field name
+            if field.name in field_names:
+                raise CSyntaxError(
+                    f"duplicate field '{field.name}' in struct '{struct_name}'",
+                    field.location,
+                )
+            field_names.add(field.name)
+
+            # Track total size
+            field_size = self._get_type_size(field.field_type)
+            total_size += field_size
+
+            # Check struct size limit (HD6303 indexed addressing: 0-255)
+            if total_size > 255:
+                raise CSyntaxError(
+                    f"struct '{struct_name}' size ({total_size} bytes) exceeds maximum (255 bytes)",
+                    field.location,
+                )
+
+            fields.append(field)
+
+        self._expect(CTokenType.RBRACE, "'}'")
+
+        # Store struct definition for later lookup
+        self._structs[struct_name] = [(f.name, f.field_type) for f in fields]
+
+        return StructDefinition(
+            location=location,
+            name=struct_name,
+            fields=fields,
+        )
+
+    def _parse_struct_field(self, struct_name: str) -> StructField:
+        """
+        Parse a single field declaration within a struct.
+
+        Fields have the form:
+            type_spec declarator ;
+
+        Examples:
+            int x;
+            char *ptr;
+            struct Point nested;
+            char data[10];
+        """
+        field_loc = self._peek().location
+
+        # Parse type specifier (handles 'struct Name' as well)
+        type_info = self._parse_type_specifier()
+        if type_info is None:
+            raise UnexpectedTokenError(
+                self._peek().value or self._peek().type.name,
+                expected="field type",
+                location=self._peek().location,
+            )
+
+        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size, field_struct_name = type_info
+
+        # Parse pointer prefix
+        pointer_depth = typedef_ptr_depth
+        while self._match(CTokenType.STAR):
+            pointer_depth += 1
+
+        # Parse field name
+        name_token = self._expect(CTokenType.IDENTIFIER, "field name")
+        field_name = name_token.value
+
+        # Parse optional array size
+        array_size = typedef_array_size
+        if self._match(CTokenType.LBRACKET):
+            size_token = self._expect(CTokenType.NUMBER, "array size")
+            try:
+                array_size = int(size_token.value)
+                if array_size <= 0:
+                    raise CSyntaxError(
+                        "array size must be positive",
+                        size_token.location,
+                    )
+            except ValueError:
+                raise CSyntaxError(
+                    f"invalid array size: {size_token.value}",
+                    size_token.location,
+                )
+            self._expect(CTokenType.RBRACKET, "']'")
+
+        # Construct field type
+        if field_struct_name is not None:
+            # Field is of struct type
+            # Check for self-reference: struct can only contain pointer to itself, not itself
+            if field_struct_name == struct_name and pointer_depth == 0:
+                raise CSyntaxError(
+                    f"struct '{struct_name}' cannot contain itself directly; use a pointer",
+                    field_loc,
+                )
+            # Check if nested struct is defined (unless it's a pointer forward reference)
+            if pointer_depth == 0 and field_struct_name not in self._structs:
+                raise CSyntaxError(
+                    f"undefined struct type '{field_struct_name}'",
+                    field_loc,
+                )
+            field_type = make_struct_type(field_struct_name, self._get_type_size, pointer_depth, array_size)
+        else:
+            # Primitive field type
+            field_type = make_type(base_type, is_unsigned, pointer_depth, array_size)
+
+        self._expect(CTokenType.SEMICOLON, "';'")
+
+        return StructField(
+            location=field_loc,
+            name=field_name,
+            field_type=field_type,
+        )
+
+    def _parse_struct_variable_declarators(self, struct_name: str) -> list[VariableDeclaration]:
+        """
+        Parse variable declarators after a struct type.
+
+        Handles: struct Point *p1, p2[3], *p3;
+
+        Args:
+            struct_name: The struct type name
+
+        Returns:
+            List of VariableDeclaration nodes
+        """
+        declarations = []
+
+        while True:
+            decl_loc = self._peek().location
+
+            # Parse pointer prefix
+            pointer_depth = 0
+            while self._match(CTokenType.STAR):
+                pointer_depth += 1
+
+            # Parse variable name
+            name_token = self._expect(CTokenType.IDENTIFIER, "variable name")
+
+            # Parse optional array size
+            array_size = 0
+            if self._match(CTokenType.LBRACKET):
+                size_token = self._expect(CTokenType.NUMBER, "array size")
+                try:
+                    array_size = int(size_token.value)
+                    if array_size <= 0:
+                        raise CSyntaxError(
+                            "array size must be positive",
+                            size_token.location,
+                        )
+                except ValueError:
+                    raise CSyntaxError(
+                        f"invalid array size: {size_token.value}",
+                        size_token.location,
+                    )
+                self._expect(CTokenType.RBRACKET, "']'")
+
+            # Create struct type for the variable
+            var_type = make_struct_type(struct_name, self._get_type_size, pointer_depth, array_size)
+
+            declarations.append(VariableDeclaration(
+                location=decl_loc,
+                name=name_token.value,
+                var_type=var_type,
+                initializer=None,  # Struct initializers not supported
+                is_global=True,
+            ))
+
+            # Check for more declarators
+            if not self._match(CTokenType.COMMA):
+                break
+
+        self._expect(CTokenType.SEMICOLON, "';'")
+        return declarations
+
+    def _parse_struct_variable_declarators_from_type(
+        self,
+        struct_name: str,
+        typedef_ptr_depth: int = 0,
+        typedef_array_size: int = 0,
+    ) -> list[VariableDeclaration]:
+        """
+        Parse variable declarators when the type specifier has already been parsed.
+
+        This is called when we get a struct type from _parse_type_specifier (e.g.,
+        from a struct typedef like `Point p;` where Point is typedef'd to struct Point).
+
+        Handles: Point *p1, p2[3], *p3;
+
+        Args:
+            struct_name: The struct type name
+            typedef_ptr_depth: Pointer depth from typedef (e.g., typedef struct Point *PointPtr)
+            typedef_array_size: Array size from typedef
+
+        Returns:
+            List of VariableDeclaration nodes
+        """
+        declarations = []
+
+        while True:
+            decl_loc = self._peek().location
+
+            # Parse pointer prefix (adds to any typedef pointer depth)
+            pointer_depth = typedef_ptr_depth
+            while self._match(CTokenType.STAR):
+                pointer_depth += 1
+
+            # Parse variable name
+            name_token = self._expect(CTokenType.IDENTIFIER, "variable name")
+
+            # Parse optional array size
+            array_size = 0
+            if self._match(CTokenType.LBRACKET):
+                size_token = self._expect(CTokenType.NUMBER, "array size")
+                try:
+                    array_size = int(size_token.value)
+                    if array_size <= 0:
+                        raise CSyntaxError(
+                            "array size must be positive",
+                            size_token.location,
+                        )
+                except ValueError:
+                    raise CSyntaxError(
+                        f"invalid array size: {size_token.value}",
+                        size_token.location,
+                    )
+                self._expect(CTokenType.RBRACKET, "']'")
+
+            # Use typedef array size if no explicit size and not a pointer
+            if array_size == 0 and pointer_depth == 0 and typedef_array_size > 0:
+                array_size = typedef_array_size
+
+            # Create struct type for the variable
+            var_type = make_struct_type(struct_name, self._get_type_size, pointer_depth, array_size)
+
+            declarations.append(VariableDeclaration(
+                location=decl_loc,
+                name=name_token.value,
+                var_type=var_type,
+                initializer=None,  # Struct initializers not supported
+                is_global=True,
+            ))
+
+            # Check for more declarators
+            if not self._match(CTokenType.COMMA):
+                break
+
+        self._expect(CTokenType.SEMICOLON, "';'")
+        return declarations
+
+    def _get_type_size(self, struct_name: str) -> int:
+        """
+        Get the size of a struct type in bytes.
+
+        This is the callback passed to make_struct_type() for computing
+        struct sizes. It takes a struct name and returns the total size.
+
+        Args:
+            struct_name: The name of the struct type
+
+        Returns:
+            Size in bytes, or 0 if struct is undefined
+        """
+        if struct_name not in self._structs:
+            return 0  # Unknown struct, let codegen handle error
+
+        # Calculate size by summing field sizes
+        struct_size = 0
+        for _, field_type in self._structs[struct_name]:
+            struct_size += self._compute_field_size(field_type)
+
+        return struct_size
+
+    def _compute_field_size(self, field_type: CType) -> int:
+        """
+        Compute the size of a field type in bytes.
+
+        Args:
+            field_type: The CType of the field
+
+        Returns:
+            Size in bytes
+        """
+        if field_type.is_pointer:
+            return 2  # All pointers are 16-bit
+
+        if field_type.struct_name is not None:
+            # Nested struct - recursively compute size
+            base_size = self._get_type_size(field_type.struct_name)
+            if field_type.array_size > 0:
+                return base_size * field_type.array_size
+            return base_size
+
+        # Primitive type
+        if field_type.base_type == BaseType.CHAR:
+            element_size = 1
+        elif field_type.base_type == BaseType.INT:
+            element_size = 2
+        elif field_type.base_type == BaseType.VOID:
+            return 0
+        else:
+            element_size = 2  # Default to int size
+
+        if field_type.array_size > 0:
+            return element_size * field_type.array_size
+        return element_size
 
     def _parse_function(
         self,
@@ -757,12 +1253,19 @@ class CParser:
                 location=self._peek().location,
             )
 
-        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size = type_info
+        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size, param_struct_name = type_info
 
         # Parse pointer prefix (adds to any typedef pointer depth)
         pointer_depth = typedef_ptr_depth
         while self._match(CTokenType.STAR):
             pointer_depth += 1
+
+        # Struct parameters must be pointers (no by-value struct passing)
+        if param_struct_name is not None and pointer_depth == 0:
+            raise CSyntaxError(
+                f"struct parameters must be passed by pointer; use 'struct {param_struct_name} *'",
+                location,
+            )
 
         # Parse name (optional in declarations, but we require it)
         name_token = self._expect(CTokenType.IDENTIFIER, "parameter name")
@@ -773,8 +1276,12 @@ class CParser:
             self._expect(CTokenType.RBRACKET, "']'")
             pointer_depth += 1
 
-        # For parameters, typedef_array_size is informational only (params are by-pointer)
-        param_type = make_type(base_type, is_unsigned, pointer_depth)
+        # Construct parameter type
+        if param_struct_name is not None:
+            param_type = make_struct_type(param_struct_name, pointer_depth)
+        else:
+            # For parameters, typedef_array_size is informational only (params are by-pointer)
+            param_type = make_type(base_type, is_unsigned, pointer_depth)
 
         return ParameterNode(
             location=location,
@@ -789,6 +1296,7 @@ class CParser:
         is_global: bool,
         typedef_ptr_depth: int = 0,
         typedef_array_size: int = 0,
+        struct_name: Optional[str] = None,
     ) -> VariableDeclaration:
         """
         Parse a single declarator: '*'* IDENTIFIER ('[' NUMBER ']')? ('=' expr)?
@@ -799,6 +1307,10 @@ class CParser:
         For typedef'd array types (e.g., typedef char fp_t[8]):
             fp_t x;     -> allocates 8 bytes (uses typedef_array_size)
             fp_t *p;    -> pointer (2 bytes, typedef_array_size ignored)
+
+        For struct types:
+            struct Point p;     -> allocates struct size
+            struct Point *pp;   -> pointer (2 bytes)
         """
         location = self._peek().location
 
@@ -821,7 +1333,11 @@ class CParser:
         if array_size == 0 and pointer_depth == 0 and typedef_array_size > 0:
             array_size = typedef_array_size
 
-        var_type = make_type(base_type, is_unsigned, pointer_depth, array_size)
+        # Create the appropriate type
+        if struct_name:
+            var_type = make_struct_type(struct_name, self._get_type_size, pointer_depth, array_size)
+        else:
+            var_type = make_type(base_type, is_unsigned, pointer_depth, array_size)
 
         # Check for initializer
         initializer = None
@@ -845,6 +1361,7 @@ class CParser:
         location: SourceLocation,
         typedef_ptr_depth: int = 0,
         typedef_array_size: int = 0,
+        struct_name: Optional[str] = None,
     ) -> list[VariableDeclaration]:
         """
         Parse global variable declaration(s).
@@ -861,6 +1378,10 @@ class CParser:
 
         For typedef'd pointer types (e.g., typedef int *intptr):
             intptr a, b;  -> both are int* (uses typedef_ptr_depth)
+
+        For struct types:
+            struct Point p;     -> allocates struct size
+            struct Point *pp;   -> pointer (2 bytes)
         """
         declarations = []
 
@@ -875,7 +1396,11 @@ class CParser:
         if array_size == 0 and pointer_depth == 0 and typedef_array_size > 0:
             array_size = typedef_array_size
 
-        var_type = make_type(base_type, is_unsigned, pointer_depth, array_size)
+        # Create the appropriate type
+        if struct_name:
+            var_type = make_struct_type(struct_name, self._get_type_size, pointer_depth, array_size)
+        else:
+            var_type = make_type(base_type, is_unsigned, pointer_depth, array_size)
 
         initializer = None
         if self._match(CTokenType.ASSIGN):
@@ -893,7 +1418,8 @@ class CParser:
         while self._match(CTokenType.COMMA):
             decl = self._parse_declarator(base_type, is_unsigned, is_global=True,
                                           typedef_ptr_depth=typedef_ptr_depth,
-                                          typedef_array_size=typedef_array_size)
+                                          typedef_array_size=typedef_array_size,
+                                          struct_name=struct_name)
             declarations.append(decl)
 
         self._expect(CTokenType.SEMICOLON, "';'")
@@ -932,18 +1458,20 @@ class CParser:
         )
 
     def _is_type_keyword(self) -> bool:
-        """Check if current token starts a type specifier (including typedef names)."""
+        """Check if current token starts a type specifier (including typedef names and struct)."""
         if self._check(
             CTokenType.VOID,
             CTokenType.CHAR,
             CTokenType.INT,
             CTokenType.UNSIGNED,
             CTokenType.SIGNED,
+            CTokenType.STRUCT,
         ):
             return True
-        # Also check for typedef names
+        # Also check for typedef names (including struct typedefs)
         if self._check(CTokenType.IDENTIFIER):
-            return self._peek().value in self._typedefs
+            name = self._peek().value
+            return name in self._typedefs or name in self._struct_typedefs
         return False
 
     def _parse_local_declaration(self) -> list[VariableDeclaration]:
@@ -957,21 +1485,23 @@ class CParser:
         """
         # Parse type (shared by all declarators)
         type_info = self._parse_type_specifier()
-        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size = type_info
+        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size, struct_name = type_info
 
         declarations = []
 
         # Parse first declarator
         decl = self._parse_declarator(base_type, is_unsigned, is_global=False,
                                        typedef_ptr_depth=typedef_ptr_depth,
-                                       typedef_array_size=typedef_array_size)
+                                       typedef_array_size=typedef_array_size,
+                                       struct_name=struct_name)
         declarations.append(decl)
 
         # Parse additional declarators separated by commas
         while self._match(CTokenType.COMMA):
             decl = self._parse_declarator(base_type, is_unsigned, is_global=False,
                                            typedef_ptr_depth=typedef_ptr_depth,
-                                           typedef_array_size=typedef_array_size)
+                                           typedef_array_size=typedef_array_size,
+                                           struct_name=struct_name)
             declarations.append(decl)
 
         self._expect(CTokenType.SEMICOLON, "';'")
@@ -1422,7 +1952,7 @@ class CParser:
         return self._parse_postfix()
 
     def _is_type_at_offset(self, offset: int) -> bool:
-        """Check if token at offset is a type keyword (including typedef names)."""
+        """Check if token at offset is a type keyword (including typedef names and struct)."""
         token = self._peek(offset)
         if token.type in (
             CTokenType.VOID,
@@ -1430,11 +1960,13 @@ class CParser:
             CTokenType.INT,
             CTokenType.UNSIGNED,
             CTokenType.SIGNED,
+            CTokenType.STRUCT,
         ):
             return True
-        # Also check for typedef names
+        # Also check for typedef names (including struct typedefs)
         if token.type == CTokenType.IDENTIFIER:
-            return token.value in self._typedefs
+            name = token.value
+            return name in self._typedefs or name in self._struct_typedefs
         return False
 
     def _parse_sizeof(self) -> Expression:
@@ -1446,7 +1978,7 @@ class CParser:
             # sizeof(type) or sizeof(expr)
             if self._is_type_keyword():
                 type_info = self._parse_type_specifier()
-                base_type, is_unsigned, typedef_ptr_depth, typedef_array_size = type_info
+                base_type, is_unsigned, typedef_ptr_depth, typedef_array_size, struct_name = type_info
 
                 pointer_depth = typedef_ptr_depth
                 while self._match(CTokenType.STAR):
@@ -1456,7 +1988,12 @@ class CParser:
 
                 # For sizeof, array size matters for determining total size
                 array_size = typedef_array_size if pointer_depth == 0 else 0
-                target_type = make_type(base_type, is_unsigned, pointer_depth, array_size)
+
+                # Handle struct types
+                if struct_name:
+                    target_type = make_struct_type(struct_name, self._get_type_size, pointer_depth, array_size)
+                else:
+                    target_type = make_type(base_type, is_unsigned, pointer_depth, array_size)
                 return SizeofExpression(
                     location=location,
                     target_type=target_type,
@@ -1476,7 +2013,7 @@ class CParser:
         self._expect(CTokenType.LPAREN, "'('")
 
         type_info = self._parse_type_specifier()
-        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size = type_info
+        base_type, is_unsigned, typedef_ptr_depth, typedef_array_size, struct_name = type_info
 
         pointer_depth = typedef_ptr_depth
         while self._match(CTokenType.STAR):
@@ -1485,7 +2022,16 @@ class CParser:
         self._expect(CTokenType.RPAREN, "')'")
 
         # For casts, we don't use typedef array size (you can't cast to array type)
-        target_type = make_type(base_type, is_unsigned, pointer_depth)
+        # For struct types, only pointer casts are allowed
+        if struct_name:
+            if pointer_depth == 0:
+                raise CSyntaxError(
+                    f"cannot cast to struct type '{struct_name}' by value; use pointer cast",
+                    location,
+                )
+            target_type = make_struct_type(struct_name, self._get_type_size, pointer_depth)
+        else:
+            target_type = make_type(base_type, is_unsigned, pointer_depth)
         expr = self._parse_unary()
 
         return CastExpression(
@@ -1527,6 +2073,26 @@ class CParser:
                     location=expr.location,
                     operator=UnaryOperator.POST_DECREMENT,
                     operand=expr,
+                )
+
+            # Member access: struct.field
+            elif self._match(CTokenType.DOT):
+                member_token = self._expect(CTokenType.IDENTIFIER, "member name")
+                expr = MemberAccessExpression(
+                    location=expr.location,
+                    object_expr=expr,
+                    member_name=member_token.value,
+                    is_arrow=False,
+                )
+
+            # Pointer member access: ptr->field
+            elif self._match(CTokenType.ARROW):
+                member_token = self._expect(CTokenType.IDENTIFIER, "member name")
+                expr = MemberAccessExpression(
+                    location=expr.location,
+                    object_expr=expr,
+                    member_name=member_token.value,
+                    is_arrow=True,
                 )
 
             else:
