@@ -70,7 +70,7 @@ from psion_sdk.assembler.parser import (
     ParsedAddressingMode,
     Parser,
 )
-from psion_sdk.assembler.opcodes import (
+from psion_sdk.cpu import (
     AddressingMode,
     OPCODE_TABLE,
     BRANCH_INSTRUCTIONS,
@@ -78,6 +78,12 @@ from psion_sdk.assembler.opcodes import (
     NO_IMMEDIATE_INSTRUCTIONS,
     get_instruction_info,
     get_valid_modes,
+    # Branch relaxation support
+    get_inverted_branch,
+    is_conditional_branch,
+    is_unconditional_branch,
+    get_long_branch_size,
+    get_short_branch_size,
 )
 from psion_sdk.assembler.expressions import ExpressionEvaluator
 from psion_sdk.opk.records import OB3File
@@ -286,6 +292,28 @@ class CodeGenerator:
         self._user_code_start = 0          # Offset in _code where user code begins
         self._in_include_file = False      # Track if we're processing an include file
 
+        # Branch relaxation support
+        # -------------------------
+        # The HD6303 branch instructions have a limited range of -128 to +127 bytes.
+        # When a branch target is beyond this range, we need to generate a "long branch"
+        # sequence using the inverted condition + JMP pattern.
+        #
+        # This is implemented using iterative relaxation:
+        # 1. Pass 1: Assume all branches are short, collect symbols
+        # 2. Relaxation check: Find branches that are out of range
+        # 3. If any found, mark them as long and restart pass 1
+        # 4. Repeat until stable (no more branches need relaxation)
+        # 5. Pass 2: Generate code with correct branch forms
+        #
+        # _long_branches: Set of SourceLocation for branches that need long form.
+        #                 We use SourceLocation (file:line:column) as a stable
+        #                 identifier instead of id(stmt) because statements from
+        #                 included files are re-created on each relaxation iteration.
+        # _branch_locations: Maps SourceLocation to (pc_address, operand, mnemonic)
+        #                    for checking branch offsets after pass 1.
+        self._long_branches: set[SourceLocation] = set()  # Locations needing long form
+        self._branch_locations: dict[SourceLocation, tuple[int, Operand, str]] = {}  # loc -> (pc, operand, mnemonic)
+
         # Model callback for .MODEL directive
         self._model_callback = model_callback
 
@@ -337,7 +365,7 @@ class CodeGenerator:
         Raises:
             AssemblerError: If assembly fails (also check has_errors())
         """
-        # Reset state
+        # Reset state for fresh assembly
         self._code.clear()
         self._origin = 0
         self._pc = 0
@@ -346,12 +374,69 @@ class CodeGenerator:
         self._listing_lines.clear()
         self._fixups.clear()
         self._user_code_start = 0  # Will be set properly in build_ob3 for relocatable
+        # Clear branch relaxation state for fresh assembly
+        # (will accumulate during relaxation iterations, but starts empty)
+        self._long_branches.clear()
+        self._branch_locations.clear()
 
-        # Pass 1: Collect symbols
-        self._pass1(statements)
+        # =====================================================================
+        # Iterative Branch Relaxation
+        # =====================================================================
+        # The algorithm works by iterating between pass 1 (symbol collection)
+        # and a relaxation check until no more branches need to be converted
+        # to long form. This is necessary because:
+        # 1. In pass 1, we don't know all symbol addresses (forward references)
+        # 2. When we mark a branch as long, it grows from 2 to 3-5 bytes
+        # 3. This shifts all subsequent addresses, potentially causing more
+        #    branches to go out of range
+        #
+        # The algorithm converges because branches only grow (never shrink),
+        # so eventually all out-of-range branches are identified.
+        # =====================================================================
 
-        if self._errors.has_errors():
-            raise AssemblerError(f"Assembly failed with {self._errors.error_count()} errors")
+        MAX_RELAXATION_ITERATIONS = 100  # Safety limit to prevent infinite loops
+
+        # Save predefined symbols before starting iterations
+        # Predefined symbols are added via define_symbol() before generate() is called
+        # They have is_constant=True and is_external=True
+        predefined_symbols = {
+            name: sym for name, sym in self._symbols.items()
+            if sym.is_constant and sym.is_external
+        }
+
+        for iteration in range(MAX_RELAXATION_ITERATIONS):
+            # Reset per-iteration state (but keep _long_branches and predefined symbols)
+            self._symbols.clear()
+            self._evaluator = ExpressionEvaluator()
+            self._branch_locations.clear()
+            self._origin = 0
+            self._pc = 0
+            self._current_global_label = None
+            self._processed_includes.clear()
+
+            # Restore predefined symbols from before the iteration loop
+            for name, sym in predefined_symbols.items():
+                self._symbols[name] = sym
+                self._evaluator.set_symbol(name, sym.value)
+
+            # Pass 1: Collect symbols and record branch locations
+            self._pass1(statements)
+
+            if self._errors.has_errors():
+                raise AssemblerError(f"Assembly failed with {self._errors.error_count()} errors")
+
+            # Relaxation check: Find branches that are out of range
+            newly_relaxed = self._check_branch_relaxation()
+
+            if not newly_relaxed:
+                # All branches are within range, we can proceed to pass 2
+                break
+        else:
+            # If we hit the iteration limit, something is wrong
+            raise AssemblerError(
+                f"Branch relaxation did not converge after {MAX_RELAXATION_ITERATIONS} iterations. "
+                "This may indicate a bug in the assembler."
+            )
 
         # Pass 2: Generate code
         self._pass2(statements)
@@ -625,6 +710,13 @@ class CodeGenerator:
             self._define_label(stmt)
 
         elif isinstance(stmt, Instruction):
+            mnemonic = stmt.mnemonic.upper()
+
+            # Record branch instruction locations for relaxation checking
+            # We use stmt.location (SourceLocation) as a stable identifier
+            if mnemonic in BRANCH_INSTRUCTIONS and stmt.operand:
+                self._branch_locations[stmt.location] = (self._pc, stmt.operand, mnemonic)
+
             size = self._calculate_instruction_size(stmt)
             self._pc += size
 
@@ -642,6 +734,54 @@ class CodeGenerator:
             # Macro calls would be expanded here
             # For now, just estimate size based on macro definition
             pass
+
+    def _check_branch_relaxation(self) -> bool:
+        """
+        Check if any branches need to be relaxed to long form.
+
+        After pass 1, all symbol addresses are known. This method checks each
+        branch instruction to see if its target is within the -128 to +127 byte
+        range. If not, the branch is marked as needing long form.
+
+        Returns:
+            True if any new branches were marked for relaxation, False if all
+            branches are within range (or were already marked as long).
+        """
+        newly_relaxed = False
+
+        for loc, (pc, operand, mnemonic) in self._branch_locations.items():
+            # Skip if already marked as needing long form
+            if loc in self._long_branches:
+                continue
+
+            # Evaluate the target address
+            try:
+                # Use allow_undefined=False since all symbols should be defined after pass 1
+                target = self._evaluator.evaluate(operand.tokens, allow_undefined=False)
+            except Exception:
+                # If we can't evaluate (undefined symbol), let pass 2 handle the error
+                continue
+
+            # Calculate the instruction size for this branch (may already be long)
+            # Note: This check is redundant due to the skip above, but kept for clarity
+            if loc in self._long_branches:
+                inst_size = get_long_branch_size(mnemonic)
+            else:
+                inst_size = get_short_branch_size()
+
+            # Calculate offset from the instruction following the branch
+            # For short branch: offset is from (pc + 2)
+            # For long branch with conditional: offset is from (pc + 2) for the initial branch
+            # But the JMP target is absolute, so we need to check the initial branch offset
+            offset = target - (pc + 2)
+
+            # Check if offset is within range for short branch
+            if offset < -128 or offset > 127:
+                # Mark this branch as needing long form (by SourceLocation)
+                self._long_branches.add(loc)
+                newly_relaxed = True
+
+        return newly_relaxed
 
     def _define_label(self, label: LabelDef) -> None:
         """Define a label in the symbol table."""
@@ -713,7 +853,12 @@ class CodeGenerator:
             return 2  # opcode + offset
 
         if mode == ParsedAddressingMode.RELATIVE:
-            return 2  # opcode + displacement
+            # Check if this branch instruction needs long form
+            # We use inst.location (SourceLocation) to look up whether this
+            # specific instruction was marked as needing relaxation
+            if inst.location in self._long_branches:
+                return get_long_branch_size(mnemonic)
+            return get_short_branch_size()  # Default: 2 bytes (opcode + displacement)
 
         if mode == ParsedAddressingMode.DIRECT_OR_EXTENDED:
             # Need to evaluate to determine, default to extended for safety
@@ -1032,7 +1177,7 @@ class CodeGenerator:
             self._emit_indexed(mnemonic, operand, inst.location)
 
         elif operand.mode == ParsedAddressingMode.RELATIVE:
-            self._emit_relative(mnemonic, operand, inst.location)
+            self._emit_branch(mnemonic, operand, inst.location, inst)
 
         elif operand.mode == ParsedAddressingMode.DIRECT_OR_EXTENDED:
             self._emit_direct_or_extended(mnemonic, operand, inst.location)
@@ -1115,30 +1260,152 @@ class CodeGenerator:
         self._emit_byte(offset & 0xFF)  # Convert to unsigned byte
         self._pc += info.size
 
-    def _emit_relative(self, mnemonic: str, operand: Operand, location: SourceLocation) -> None:
-        """Emit a relative (branch) instruction."""
-        info = get_instruction_info(mnemonic, AddressingMode.RELATIVE)
-        if info is None:
-            raise AddressingModeError(
-                mnemonic, "relative", location,
-                valid_modes=[str(m) for m in get_valid_modes(mnemonic)]
-            )
+    def _emit_branch(
+        self,
+        mnemonic: str,
+        operand: Operand,
+        location: SourceLocation,
+        inst: Instruction
+    ) -> None:
+        """
+        Emit a branch instruction with automatic long branch relaxation.
 
+        This method handles all branch instructions (BRA, BSR, BEQ, BNE, etc.)
+        and automatically selects between short and long forms based on whether
+        the instruction was marked for relaxation during pass 1.
+
+        Short branch (2 bytes):
+            Standard relative branch when target is within -128 to +127 bytes.
+
+        Long branch (3-5 bytes):
+            Used when target is beyond short branch range.
+
+            For conditional branches (BEQ, BNE, etc.):
+                Original: Bcc target        (2 bytes, target out of range)
+                Becomes:  Bcc_inv skip      (2 bytes, inverted condition)
+                          JMP target        (3 bytes, extended addressing)
+                    skip:                   (total: 5 bytes)
+
+            For unconditional branches:
+                BRA target  -->  JMP target  (3 bytes)
+                BSR target  -->  JSR target  (3 bytes)
+
+        Note: In relocatable mode, the JMP/JSR absolute address is added to
+        the fixup table since it needs relocation at load time.
+        """
+        mnemonic = mnemonic.upper()
+
+        # Check if this instruction needs long form (by SourceLocation)
+        needs_long = inst.location in self._long_branches
+
+        if needs_long:
+            # Emit long branch sequence
+            self._emit_long_branch(mnemonic, operand, location)
+        else:
+            # Emit standard short branch
+            info = get_instruction_info(mnemonic, AddressingMode.RELATIVE)
+            if info is None:
+                raise AddressingModeError(
+                    mnemonic, "relative", location,
+                    valid_modes=[str(m) for m in get_valid_modes(mnemonic)]
+                )
+
+            target = self._evaluator.evaluate(operand.tokens, location)
+
+            # Calculate offset from next instruction
+            offset = target - (self._pc + 2)
+
+            # Validate range (should always be in range if relaxation worked correctly)
+            if offset < -128 or offset > 127:
+                # This shouldn't happen if relaxation worked, but provide clear error
+                target_name = "target"
+                if operand.tokens and operand.tokens[0].type == TokenType.IDENTIFIER:
+                    target_name = operand.tokens[0].value
+                raise BranchRangeError(target_name, offset, location)
+
+            self._emit_opcode(info.opcode)
+            self._emit_byte(offset & 0xFF)
+            self._pc += info.size
+
+    def _emit_long_branch(
+        self,
+        mnemonic: str,
+        operand: Operand,
+        location: SourceLocation
+    ) -> None:
+        """
+        Emit a long branch sequence for out-of-range branch targets.
+
+        This is called by _emit_relative when a branch needs long form.
+        """
         target = self._evaluator.evaluate(operand.tokens, location)
+        mnemonic = mnemonic.upper()
 
-        # Calculate offset from next instruction
-        offset = target - (self._pc + 2)
+        if mnemonic == "BRA":
+            # BRA target --> JMP target (3 bytes)
+            jmp_info = get_instruction_info("JMP", AddressingMode.EXTENDED)
+            self._emit_opcode(jmp_info.opcode)  # 0x7E
+            self._emit_word(target)
+            # Record fixup AFTER emitting the word (fixup offset calculation is len-2)
+            if self._needs_fixup(operand):
+                self._record_fixup()
+            self._pc += 3
 
-        if offset < -128 or offset > 127:
-            # Find target name for error message
-            target_name = "target"
-            if operand.tokens and operand.tokens[0].type == TokenType.IDENTIFIER:
-                target_name = operand.tokens[0].value
-            raise BranchRangeError(target_name, offset, location)
+        elif mnemonic == "BSR":
+            # BSR target --> JSR target (3 bytes)
+            jsr_info = get_instruction_info("JSR", AddressingMode.EXTENDED)
+            self._emit_opcode(jsr_info.opcode)  # 0xBD
+            self._emit_word(target)
+            # Record fixup AFTER emitting the word (fixup offset calculation is len-2)
+            if self._needs_fixup(operand):
+                self._record_fixup()
+            self._pc += 3
 
-        self._emit_opcode(info.opcode)
-        self._emit_byte(offset & 0xFF)
-        self._pc += info.size
+        elif mnemonic == "BRN":
+            # BRN (branch never) is rare, but long form is just JMP
+            # since BRN always falls through, we emit nothing + JMP
+            # Actually for BRN long, we should emit JMP to maintain semantics
+            # But BRN means "never branch", so we just emit JMP for consistency
+            jmp_info = get_instruction_info("JMP", AddressingMode.EXTENDED)
+            self._emit_opcode(jmp_info.opcode)
+            self._emit_word(target)
+            # Record fixup AFTER emitting the word (fixup offset calculation is len-2)
+            if self._needs_fixup(operand):
+                self._record_fixup()
+            self._pc += 3
+
+        else:
+            # Conditional branch: emit inverted condition + JMP
+            # Sequence: Bcc_inv skip; JMP target; skip:
+            inverted = get_inverted_branch(mnemonic)
+            if inverted is None:
+                raise AssemblerError(
+                    f"Cannot invert branch '{mnemonic}' for long branch",
+                    location
+                )
+
+            # Get opcode for inverted branch
+            inv_info = get_instruction_info(inverted, AddressingMode.RELATIVE)
+            if inv_info is None:
+                raise AssemblerError(
+                    f"Cannot find opcode for inverted branch '{inverted}'",
+                    location
+                )
+
+            # Emit: Bcc_inv skip (offset = +3, to skip over JMP)
+            # The inverted branch jumps over the 3-byte JMP instruction
+            self._emit_opcode(inv_info.opcode)
+            self._emit_byte(3)  # Skip over JMP instruction (3 bytes)
+            self._pc += 2
+
+            # Emit: JMP target (3 bytes)
+            jmp_info = get_instruction_info("JMP", AddressingMode.EXTENDED)
+            self._emit_opcode(jmp_info.opcode)  # 0x7E
+            self._emit_word(target)
+            # Record fixup AFTER emitting the word (fixup offset calculation is len-2)
+            if self._needs_fixup(operand):
+                self._record_fixup()
+            self._pc += 3
 
     def _emit_direct_or_extended(
         self,

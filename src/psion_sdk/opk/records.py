@@ -52,7 +52,6 @@ Reference
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
-from typing import Optional, Union
 import struct
 
 
@@ -78,6 +77,7 @@ class PackType(IntEnum):
     RAMPAK = 0x40           # RAM pack, linear addressing (bit 6 set = not flash)
     DATAPAK = 0x56          # EPROM (Datapak), matches official DOS SDK (bit 6 + bit 4 + bit 2 + bit 1)
     DATAPAK_PAGED = 0x46    # EPROM (Datapak), paged addressing (bit 6 + bit 2 + bit 1)
+    DATAPAK_SIMPLE = 0x4a   # EPROM (Datapak), simple format like fnkey40.opk (bit 6 + bit 3 + bit 1)
     FLASHPAK = 0x02         # Flash pack, linear addressing (bit 6 clear = flash)
     FLASHPAK_PAGED = 0x06   # Flash pack, paged addressing
     MK1 = 0xFB              # Organiser I (MK1) pack format

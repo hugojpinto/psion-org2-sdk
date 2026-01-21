@@ -31,10 +31,10 @@ Copyright (c) 2025 Hugo José Pinto & Contributors
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union, List, Callable
+from typing import Optional, Union, List
 
-from .cpu import HD6303, CPUState
-from .bus import Bus, BusState
+from .cpu import HD6303
+from .bus import Bus
 from .memory import Memory
 from .display import Display
 from .keyboard import Keyboard

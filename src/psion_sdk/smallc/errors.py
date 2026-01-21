@@ -36,7 +36,6 @@ Example:
     hint: did you mean 'print'?
 """
 
-from dataclasses import dataclass
 from typing import Optional, List
 
 from psion_sdk.errors import PsionError, SourceLocation

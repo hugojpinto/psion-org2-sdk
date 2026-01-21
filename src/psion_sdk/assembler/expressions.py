@@ -74,8 +74,8 @@ handles forward references by doing two passes:
 2. Pass 2: Evaluate expressions with full symbol table
 """
 
-from dataclasses import dataclass, field
-from typing import Optional, Callable
+from dataclasses import dataclass
+from typing import Optional
 from enum import Enum, auto
 
 from psion_sdk.errors import (

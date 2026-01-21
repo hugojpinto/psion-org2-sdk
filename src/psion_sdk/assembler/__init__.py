@@ -69,7 +69,7 @@ from psion_sdk.assembler.assembler import Assembler, assemble, assemble_file
 from psion_sdk.assembler.lexer import Lexer, Token, TokenType
 from psion_sdk.assembler.parser import Parser, Statement, Instruction, Directive, LabelDef
 from psion_sdk.assembler.codegen import CodeGenerator
-from psion_sdk.assembler.opcodes import (
+from psion_sdk.cpu import (
     AddressingMode,
     InstructionInfo,
     OPCODE_TABLE,

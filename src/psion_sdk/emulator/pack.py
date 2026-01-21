@@ -33,8 +33,7 @@ Ported from JAPE by Jaap Scherphuis
 
 from abc import ABC, abstractmethod
 from enum import IntEnum
-from typing import Optional, List, Callable
-from dataclasses import dataclass
+from typing import Optional, List
 
 
 class PackPin(IntEnum):

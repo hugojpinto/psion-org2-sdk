@@ -30,7 +30,7 @@ Copyright (c) 2025-2026 Hugo José Pinto & Contributors
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 from enum import Enum, auto
 
 

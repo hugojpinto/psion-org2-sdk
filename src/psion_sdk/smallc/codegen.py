@@ -90,7 +90,7 @@ Usage
 """
 
 from typing import Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from psion_sdk.smallc.ast import (
     ASTNode,
@@ -129,8 +129,8 @@ from psion_sdk.smallc.ast import (
     UnaryOperator,
     AssignmentOperator,
 )
-from psion_sdk.smallc.types import CType, BaseType, TYPE_INT, TYPE_CHAR
-from psion_sdk.smallc.errors import CCodeGenError, UnsupportedFeatureError
+from psion_sdk.smallc.types import CType, BaseType
+from psion_sdk.smallc.errors import CCodeGenError
 
 
 # =============================================================================
@@ -171,6 +171,30 @@ class FunctionInfo:
     return_type: CType
     param_count: int = 0
     local_size: int = 0
+
+
+@dataclass
+class ExternalFuncInfo:
+    """
+    Information about an external OPL procedure declaration.
+
+    External procedures are declared with the 'external' keyword and represent
+    OPL procedures that exist on the Psion device. Calls to these are transformed
+    into QCode injection sequences at runtime.
+
+    Attributes:
+        name: Procedure name (as declared in C, without OPL suffix)
+        return_type: Return type determines OPL name suffix and restore function:
+                    - void: no suffix, _call_opl (return ignored)
+                    - int: % suffix, _call_opl (BCD float to int)
+                    - char: $ suffix, _call_opl_str (first char of string)
+        param_count: Number of parameters (0-4, enforced by parser)
+        param_types: List of parameter types (all must be int or char)
+    """
+    name: str
+    return_type: CType
+    param_count: int
+    param_types: list[CType]
 
 
 # =============================================================================
@@ -243,7 +267,10 @@ class CodeGenerator(ASTVisitor):
         # These are procedures declared with 'external' keyword that exist in
         # OPL code on the device. Calls to these are transformed into QCode
         # injection sequences at runtime.
-        self._external_funcs: set[str] = set()
+        # Maps function name -> ExternalFuncInfo for complete procedure info:
+        #   - Return type (determines OPL suffix and restore function)
+        #   - Parameter count and types (for QCode buffer generation)
+        self._external_funcs: dict[str, ExternalFuncInfo] = {}
 
     def generate(self, program: ProgramNode) -> str:
         """
@@ -259,7 +286,7 @@ class CodeGenerator(ASTVisitor):
         self._globals = {}
         self._strings = []
         self._label_counter = 0
-        self._external_funcs = set()
+        self._external_funcs = {}
 
         # Emit header (includes)
         self._emit_header()
@@ -269,9 +296,17 @@ class CodeGenerator(ASTVisitor):
             if isinstance(decl, VariableDeclaration) and decl.is_global:
                 self._add_global(decl)
             elif isinstance(decl, FunctionNode) and decl.is_external:
-                # Track external OPL procedure declarations
+                # Track external OPL procedure declarations with their complete info
                 # These will be called via QCode injection at runtime
-                self._external_funcs.add(decl.name)
+                # Stored info includes:
+                #   - Return type (determines OPL suffix and restore function)
+                #   - Parameter count and types (for QCode buffer generation)
+                self._external_funcs[decl.name] = ExternalFuncInfo(
+                    name=decl.name,
+                    return_type=decl.return_type,
+                    param_count=len(decl.parameters),
+                    param_types=[p.param_type for p in decl.parameters],
+                )
 
         # Emit startup code - must be first executable code
         # Uses BSR (relative branch) so _main must follow immediately
@@ -1355,49 +1390,123 @@ class CodeGenerator(ASTVisitor):
         - Clean up stack after return
 
         For external OPL procedures:
-        - No arguments (enforced by parser)
-        - Load procedure name string address into D
-        - Call _call_opl which handles QCode injection and resumption
-        - D register returns 0 (standard USR return)
+        - Push arguments right-to-left (for procedures with parameters)
+        - Push name pointer
+        - Push parameter count
+        - Call _call_opl_param which handles QCode injection with parameters
+        - D register contains return value (if any)
         """
         # =====================================================================
         # Check for external OPL procedure call
         # =====================================================================
-        # External procedures are called via QCode injection. The _call_opl
-        # runtime function builds a synthetic QCode buffer containing:
-        #   1. The procedure call (e.g., "azMENU:")
-        #   2. USR(restore_address, saved_SP)
+        # External procedures are called via QCode injection. The runtime
+        # function builds a synthetic QCode buffer containing:
+        #   1. Parameter pushes (if any): $22 HH LL for each int param
+        #   2. Parameter count: $20 NN
+        #   3. Procedure call: $7D len name
+        #   4. Return sequence: $22 restore_addr $22 saved_SP $9F
         # It then unwinds the stack and exits to the OPL interpreter, which
         # executes the buffer, calls the OPL procedure, then calls USR() to
         # resume C execution.
         if expr.function_name in self._external_funcs:
-            # Verify no arguments (should be enforced by parser, but double-check)
-            if expr.arguments:
+            ext_func = self._external_funcs[expr.function_name]
+
+            # Validate argument count matches declared parameter count
+            if len(expr.arguments) != ext_func.param_count:
                 raise CCodeGenError(
-                    f"external procedure '{expr.function_name}' cannot have arguments",
+                    f"external procedure '{expr.function_name}' expects "
+                    f"{ext_func.param_count} argument(s), got {len(expr.arguments)}",
                     expr.location,
                 )
 
             # Create a string literal for the procedure name
-            # This will be used by _call_opl to build the QCode buffer
+            # The C return type determines the OPL name suffix:
+            #   external char GETVAL()  -> calls GETVAL$ in OPL (string)
+            #   external int GETVAL()   -> calls GETVAL% in OPL (integer)
+            #   external void GETVAL()  -> calls GETVAL in OPL (no suffix)
             proc_name_label = self._new_label("_PROC")
-            self._strings.append((proc_name_label, expr.function_name))
+            return_type = ext_func.return_type
+            opl_name = expr.function_name
+            if return_type and return_type.base_type == BaseType.CHAR:
+                opl_name = expr.function_name + "$"
+            elif return_type and return_type.base_type == BaseType.INT:
+                opl_name = expr.function_name + "%"
+            # void has no suffix
+            self._strings.append((proc_name_label, opl_name))
 
-            self._emit_comment(f"Call external OPL procedure: {expr.function_name}")
-            # Load address of procedure name string into D
-            self._emit_instruction("LDD", f"#{proc_name_label}")
-            # Push name pointer argument to stack (standard calling convention)
-            self._emit_instruction("PSHB", "")
-            self._emit_instruction("PSHA", "")
-            # Call the OPL invocation runtime
-            # This will unwind stack, call the OPL procedure, and resume here
-            self._emit_instruction("JSR", "_call_opl")
-            # Cleanup: REQUIRED! _call_opl calculates resume_addr = return_addr + 2
-            # This expects exactly two INS instructions after the JSR, which the
-            # restore function jumps past to reach the next statement.
-            self._emit_instruction("INS", "")
-            self._emit_instruction("INS", "")
-            # D register now contains 0 (USR return value, discarded)
+            # ─────────────────────────────────────────────────────────────────
+            # Handle external procedure with parameters
+            # ─────────────────────────────────────────────────────────────────
+            # Stack layout for _call_opl_param (rightmost argument at lowest address):
+            #   SP -> [param_count][name_ptr][param N]...[param 1][return addr]
+            #
+            # The runtime function reads:
+            #   - param_count from SP+0
+            #   - name_ptr from SP+2
+            #   - parameters from SP+4 onwards (first param at highest addr)
+            if ext_func.param_count > 0:
+                self._emit_comment(f"Call external OPL procedure: {opl_name} "
+                                   f"({ext_func.param_count} params)")
+
+                # Push arguments right-to-left (last argument first)
+                # This places first argument at highest address, matching C convention
+                for arg in reversed(expr.arguments):
+                    self._generate_expression(arg)
+                    self._emit_instruction("PSHB", "")
+                    self._emit_instruction("PSHA", "")
+
+                # Push name pointer
+                self._emit_instruction("LDD", f"#{proc_name_label}")
+                self._emit_instruction("PSHB", "")
+                self._emit_instruction("PSHA", "")
+
+                # Push parameter count
+                self._emit_instruction("LDD", f"#{ext_func.param_count}")
+                self._emit_instruction("PSHB", "")
+                self._emit_instruction("PSHA", "")
+
+                # Select runtime function based on return type:
+                #   - char: _call_opl_str_param (returns first char of string)
+                #   - int/void: _call_opl_param (converts BCD float to int)
+                if return_type and return_type.base_type == BaseType.CHAR:
+                    self._emit_instruction("JSR", "_call_opl_str_param")
+                else:
+                    self._emit_instruction("JSR", "_call_opl_param")
+
+                # Cleanup: REQUIRED! Resume calculation expects exactly 2 INS after JSR
+                # The restore function jumps past these to reach the next statement.
+                # Total stack cleanup: param_count(2) + name_ptr(2) + params(2*N)
+                self._emit_instruction("INS", "")
+                self._emit_instruction("INS", "")
+
+            # ─────────────────────────────────────────────────────────────────
+            # Handle external procedure without parameters (original path)
+            # ─────────────────────────────────────────────────────────────────
+            # This uses the simpler _call_opl which doesn't need to read params
+            else:
+                self._emit_comment(f"Call external OPL procedure: {opl_name}")
+
+                # Push name pointer
+                self._emit_instruction("LDD", f"#{proc_name_label}")
+                self._emit_instruction("PSHB", "")
+                self._emit_instruction("PSHA", "")
+
+                # Select runtime function based on return type:
+                #   - char: _call_opl_str (returns first char of string)
+                #   - int/void: _call_opl (converts BCD float to int)
+                if return_type and return_type.base_type == BaseType.CHAR:
+                    self._emit_instruction("JSR", "_call_opl_str")
+                else:
+                    self._emit_instruction("JSR", "_call_opl")
+
+                # Cleanup: REQUIRED! Resume calculation expects exactly 2 INS after JSR
+                self._emit_instruction("INS", "")
+                self._emit_instruction("INS", "")
+
+            # D register now contains the OPL procedure's return value:
+            #   - For char: first character of the returned string
+            #   - For int: the integer return value (converted from BCD float)
+            #   - For void: garbage (caller should ignore)
             # Execution resumes here after OPL procedure completes
             return
 

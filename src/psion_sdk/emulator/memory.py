@@ -25,7 +25,6 @@ Copyright (c) 2025 Hugo José Pinto & Contributors
 Ported from JAPE by Jaap Scherphuis
 """
 
-from dataclasses import dataclass, field
 from typing import Optional
 
 

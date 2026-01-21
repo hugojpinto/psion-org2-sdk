@@ -525,19 +525,34 @@ SUB:        RTS
         assert code[0] == 0x8D  # BSR opcode
         assert code[1] == 0x01  # Skip RTS
 
-    def test_branch_range_error(self):
-        """Branch out of range should raise error."""
+    def test_branch_range_relaxation(self):
+        """Branch out of range should be relaxed to JMP (branch relaxation).
+
+        The assembler implements automatic branch relaxation: when a branch
+        target is beyond the ±127 byte range of relative branches, BRA is
+        automatically converted to JMP. See TestBranchRelaxation in
+        test_assembler.py for comprehensive branch relaxation tests.
+        """
         # Create source with branch target more than 127 bytes away
-        # Note: The assembler wraps specific errors in AssemblerError
-        from psion_sdk.errors import AssemblerError
         source = """
             ORG $2100
             BRA FAR
             RMB 200
 FAR:        NOP
         """
-        with pytest.raises(AssemblerError):
-            assemble(source)
+        # Should NOT raise an error - branch relaxation converts BRA to JMP
+        # Note: assemble() helper already strips OB3 header
+        code = assemble(source)
+
+        # BRA becomes JMP (3 bytes) + 200 bytes RMB + NOP (1 byte) = 204 bytes
+        assert len(code) == 204
+
+        # First instruction should be JMP (opcode $7E) not BRA
+        assert code[0] == 0x7E  # JMP extended addressing opcode
+
+        # JMP target should point to FAR label (at $2100 + 3 + 200 = $21CB)
+        jmp_target = (code[1] << 8) | code[2]
+        assert jmp_target == 0x2100 + 3 + 200  # $21CB
 
 
 # =============================================================================

@@ -22,9 +22,8 @@ Copyright (c) 2025 Hugo José Pinto & Contributors
 Ported from JAPE by Jaap Scherphuis
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List
-from enum import IntEnum
 
 # =============================================================================
 # CHARACTER BITMAP DATA

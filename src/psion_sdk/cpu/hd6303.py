@@ -1,13 +1,26 @@
 """
-HD6303 Instruction Set Definition
+HD6303 CPU Architecture Definition
 ==================================
 
 This module defines the complete HD6303 instruction set with opcodes,
-addressing modes, and instruction sizes. The HD6303 is a Hitachi derivative
-of the Motorola 6803, with additional instructions for bit manipulation.
+addressing modes, and instruction sizes. It serves as the single source
+of truth for HD6303 CPU knowledge used by multiple tools in the SDK:
 
-The HD6303 in the Psion Organiser II runs at 921.6 kHz and uses big-endian
-byte ordering (most significant byte first).
+    - Assembler: Uses this to encode assembly mnemonics into machine code
+    - Disassembler: Uses this to decode machine code back into mnemonics
+    - Emulator: May reference this for instruction validation
+
+The HD6303 is a Hitachi derivative of the Motorola 6803, with additional
+instructions for bit manipulation. It's the CPU used in all Psion Organiser II
+models (CM, XP, LA, LZ, LZ64).
+
+Hardware Specifications:
+    - Clock: 921.6 kHz
+    - Data bus: 8-bit
+    - Address bus: 16-bit (64KB address space)
+    - Byte order: Big-endian (most significant byte first)
+    - Registers: A, B (8-bit), D (A:B combined, 16-bit), X (16-bit index), SP, PC
+    - Stack: Grows downward
 
 Addressing Modes
 ----------------
@@ -49,14 +62,23 @@ The HD6303 adds these instructions not found in the 6801:
 - OIM #,addr : OR immediate with memory
 - EIM #,addr : XOR immediate with memory
 - TIM #,addr : Test immediate with memory
-- XGDX      : Exchange D and X registers
-- SLP       : Sleep (low-power mode)
+- XGDX       : Exchange D and X registers
+- SLP        : Sleep (low-power mode)
+
+Important Notes
+---------------
+- CPD (Compare D) is NOT an HD6303 instruction - it's 68HC11 only!
+  Use CMPA/CMPB or SUBD for D register comparisons.
+- TSX gives X=SP directly (not X=SP+1 as some docs incorrectly state)
+- Branch range is -128 to +127 bytes relative to the byte AFTER the branch
 
 Reference
 ---------
 - Psion Technical Reference: https://www.jaapsch.net/psion/mcmnemal.htm
 - HD6303 Datasheet (Hitachi)
 - Motorola M6800 Programming Reference Manual
+
+Copyright (c) 2025-2026 Hugo Jose Pinto & Contributors
 """
 
 from dataclasses import dataclass
@@ -74,6 +96,14 @@ class AddressingMode(Enum):
 
     Each addressing mode determines how the operand is interpreted
     and affects the instruction encoding and size.
+
+    Modes:
+        INHERENT: No operand needed (NOP, RTS, PSHA, etc.)
+        IMMEDIATE: Literal value embedded in instruction (#$xx or #$xxxx)
+        DIRECT: Zero-page address ($00-$FF), fast access
+        EXTENDED: Full 16-bit address ($0000-$FFFF)
+        INDEXED: Base register X plus 8-bit unsigned offset (offset,X)
+        RELATIVE: PC-relative signed 8-bit displacement (branches only)
     """
     INHERENT = auto()   # No operand (NOP, RTS)
     IMMEDIATE = auto()  # #value or ##value (literal)
@@ -83,7 +113,7 @@ class AddressingMode(Enum):
     RELATIVE = auto()   # Branch displacement (signed 8-bit)
 
     def __str__(self) -> str:
-        """Return human-readable name for error messages."""
+        """Return human-readable name for error messages and display."""
         return {
             AddressingMode.INHERENT: "inherent",
             AddressingMode.IMMEDIATE: "immediate",
@@ -104,15 +134,20 @@ class InstructionInfo:
     Information about a specific instruction encoding.
 
     This dataclass is immutable (frozen) to prevent accidental modification
-    of the opcode table at runtime.
+    of the opcode table at runtime. Each entry describes one specific
+    combination of mnemonic + addressing mode.
 
     Attributes:
-        opcode: The opcode byte(s) for this instruction
-        size: Total instruction size in bytes (including operand)
-        cycles: Number of CPU cycles (for timing analysis)
-        operand_size: Size of operand in bytes (0, 1, or 2)
+        opcode: The opcode byte for this instruction/mode combination
+        size: Total instruction size in bytes (opcode + operand)
+        cycles: Number of CPU cycles for execution (useful for timing analysis)
+        operand_size: Size of operand in bytes (0=none, 1=byte, 2=word)
+
+    Example:
+        LDAA #$41 -> InstructionInfo(opcode=0x86, size=2, cycles=2, operand_size=1)
+        JSR $1234 -> InstructionInfo(opcode=0xBD, size=3, cycles=6, operand_size=2)
     """
-    opcode: int          # Opcode byte (or first byte if multi-byte)
+    opcode: int          # Opcode byte (single byte for all HD6303 instructions)
     size: int            # Total instruction size in bytes
     cycles: int          # CPU cycles for execution
     operand_size: int    # Size of operand (0=none, 1=byte, 2=word)
@@ -125,17 +160,24 @@ class InstructionInfo:
 # Opcode Table
 # =============================================================================
 # This is the master table of all HD6303 instructions.
-# Key: (mnemonic, addressing_mode)
+#
+# Key: (mnemonic, addressing_mode) tuple
 # Value: InstructionInfo(opcode, total_size, cycles, operand_size)
 #
-# The table is built from the JAPE emulator's hd6303.js which contains
-# a complete and verified implementation of the HD6303 instruction set.
+# The table is derived from the JAPE emulator's hd6303.js which contains
+# a complete and verified implementation of the HD6303 instruction set,
+# cross-referenced with Hitachi and Motorola documentation.
+#
+# This table is used by:
+#   - Assembler: Look up (mnemonic, mode) -> get opcode byte and size
+#   - Disassembler: Build reverse table (opcode -> mnemonic, mode, size)
 # =============================================================================
 
 OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     # =========================================================================
     # INHERENT INSTRUCTIONS (no operand)
-    # These instructions operate on registers or have no operand.
+    # These instructions operate on registers or have implicit operands.
+    # All are 1 byte in size.
     # =========================================================================
 
     # Control instructions
@@ -155,7 +197,7 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     ("CLI", AddressingMode.INHERENT): InstructionInfo(0x0E, 1, 1, 0),   # Clear interrupt mask
     ("SEI", AddressingMode.INHERENT): InstructionInfo(0x0F, 1, 1, 0),   # Set interrupt mask
 
-    # Register operations
+    # Register-to-register operations
     ("SBA", AddressingMode.INHERENT): InstructionInfo(0x10, 1, 1, 0),   # Subtract B from A
     ("CBA", AddressingMode.INHERENT): InstructionInfo(0x11, 1, 1, 0),   # Compare B to A
     ("TAB", AddressingMode.INHERENT): InstructionInfo(0x16, 1, 1, 0),   # Transfer A to B
@@ -213,7 +255,8 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
 
     # =========================================================================
     # INDEXED MEMORY OPERATIONS (offset,X)
-    # These operate on memory at address X + offset
+    # These operate on memory at effective address = X + offset
+    # Format: opcode + offset_byte (2 bytes total)
     # =========================================================================
 
     ("NEG", AddressingMode.INDEXED): InstructionInfo(0x60, 2, 6, 1),   # Negate memory
@@ -232,6 +275,7 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
 
     # =========================================================================
     # EXTENDED MEMORY OPERATIONS (16-bit address)
+    # Format: opcode + addr_high + addr_low (3 bytes total)
     # =========================================================================
 
     ("NEG", AddressingMode.EXTENDED): InstructionInfo(0x70, 3, 6, 2),   # Negate memory
@@ -251,10 +295,14 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     # =========================================================================
     # HD6303-SPECIFIC BIT MANIPULATION INSTRUCTIONS
     # These are unique to the HD6303 (not found in 6801/6803)
-    # Format: AIM #mask, address (AND immediate with memory)
-    #         OIM #mask, address (OR immediate with memory)
-    #         EIM #mask, address (XOR immediate with memory)
-    #         TIM #mask, address (Test immediate with memory, no store)
+    #
+    # Format for INDEXED mode: opcode + mask + offset (3 bytes)
+    # Format for DIRECT mode:  opcode + mask + address (3 bytes)
+    #
+    # AIM #mask, addr : AND immediate with memory (result stored)
+    # OIM #mask, addr : OR immediate with memory (result stored)
+    # EIM #mask, addr : XOR immediate with memory (result stored)
+    # TIM #mask, addr : Test immediate with memory (flags only, no store)
     # =========================================================================
 
     # Indexed mode (offset,X) - opcode + mask + offset = 3 bytes
@@ -271,9 +319,10 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
 
     # =========================================================================
     # ACCUMULATOR A OPERATIONS
+    # These instructions operate on accumulator A with various addressing modes
     # =========================================================================
 
-    # Immediate mode
+    # Immediate mode (#$xx)
     ("SUBA", AddressingMode.IMMEDIATE): InstructionInfo(0x80, 2, 2, 1),  # Subtract from A
     ("CMPA", AddressingMode.IMMEDIATE): InstructionInfo(0x81, 2, 2, 1),  # Compare A
     ("SBCA", AddressingMode.IMMEDIATE): InstructionInfo(0x82, 2, 2, 1),  # Subtract with borrow from A
@@ -298,7 +347,7 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     ("ORAA", AddressingMode.DIRECT): InstructionInfo(0x9A, 2, 3, 1),
     ("ADDA", AddressingMode.DIRECT): InstructionInfo(0x9B, 2, 3, 1),
 
-    # Indexed mode
+    # Indexed mode (offset,X)
     ("SUBA", AddressingMode.INDEXED): InstructionInfo(0xA0, 2, 4, 1),
     ("CMPA", AddressingMode.INDEXED): InstructionInfo(0xA1, 2, 4, 1),
     ("SBCA", AddressingMode.INDEXED): InstructionInfo(0xA2, 2, 4, 1),
@@ -311,7 +360,7 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     ("ORAA", AddressingMode.INDEXED): InstructionInfo(0xAA, 2, 4, 1),
     ("ADDA", AddressingMode.INDEXED): InstructionInfo(0xAB, 2, 4, 1),
 
-    # Extended mode
+    # Extended mode (16-bit address)
     ("SUBA", AddressingMode.EXTENDED): InstructionInfo(0xB0, 3, 4, 2),
     ("CMPA", AddressingMode.EXTENDED): InstructionInfo(0xB1, 3, 4, 2),
     ("SBCA", AddressingMode.EXTENDED): InstructionInfo(0xB2, 3, 4, 2),
@@ -326,9 +375,10 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
 
     # =========================================================================
     # ACCUMULATOR B OPERATIONS
+    # These instructions operate on accumulator B with various addressing modes
     # =========================================================================
 
-    # Immediate mode
+    # Immediate mode (#$xx)
     ("SUBB", AddressingMode.IMMEDIATE): InstructionInfo(0xC0, 2, 2, 1),
     ("CMPB", AddressingMode.IMMEDIATE): InstructionInfo(0xC1, 2, 2, 1),
     ("SBCB", AddressingMode.IMMEDIATE): InstructionInfo(0xC2, 2, 2, 1),
@@ -340,7 +390,7 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     ("ORAB", AddressingMode.IMMEDIATE): InstructionInfo(0xCA, 2, 2, 1),
     ("ADDB", AddressingMode.IMMEDIATE): InstructionInfo(0xCB, 2, 2, 1),
 
-    # Direct mode
+    # Direct mode (zero page)
     ("SUBB", AddressingMode.DIRECT): InstructionInfo(0xD0, 2, 3, 1),
     ("CMPB", AddressingMode.DIRECT): InstructionInfo(0xD1, 2, 3, 1),
     ("SBCB", AddressingMode.DIRECT): InstructionInfo(0xD2, 2, 3, 1),
@@ -353,7 +403,7 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     ("ORAB", AddressingMode.DIRECT): InstructionInfo(0xDA, 2, 3, 1),
     ("ADDB", AddressingMode.DIRECT): InstructionInfo(0xDB, 2, 3, 1),
 
-    # Indexed mode
+    # Indexed mode (offset,X)
     ("SUBB", AddressingMode.INDEXED): InstructionInfo(0xE0, 2, 4, 1),
     ("CMPB", AddressingMode.INDEXED): InstructionInfo(0xE1, 2, 4, 1),
     ("SBCB", AddressingMode.INDEXED): InstructionInfo(0xE2, 2, 4, 1),
@@ -366,7 +416,7 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     ("ORAB", AddressingMode.INDEXED): InstructionInfo(0xEA, 2, 4, 1),
     ("ADDB", AddressingMode.INDEXED): InstructionInfo(0xEB, 2, 4, 1),
 
-    # Extended mode
+    # Extended mode (16-bit address)
     ("SUBB", AddressingMode.EXTENDED): InstructionInfo(0xF0, 3, 4, 2),
     ("CMPB", AddressingMode.EXTENDED): InstructionInfo(0xF1, 3, 4, 2),
     ("SBCB", AddressingMode.EXTENDED): InstructionInfo(0xF2, 3, 4, 2),
@@ -380,7 +430,8 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     ("ADDB", AddressingMode.EXTENDED): InstructionInfo(0xFB, 3, 4, 2),
 
     # =========================================================================
-    # 16-BIT OPERATIONS (D register = A:B)
+    # 16-BIT OPERATIONS (D register = A:B combined)
+    # D is a virtual 16-bit register formed by concatenating A (high) and B (low)
     # =========================================================================
 
     # SUBD - Subtract from D
@@ -401,24 +452,25 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     ("LDD", AddressingMode.INDEXED): InstructionInfo(0xEC, 2, 5, 1),
     ("LDD", AddressingMode.EXTENDED): InstructionInfo(0xFC, 3, 5, 2),
 
-    # STD - Store D
+    # STD - Store D (no immediate mode - can't store TO a literal!)
     ("STD", AddressingMode.DIRECT): InstructionInfo(0xDD, 2, 4, 1),
     ("STD", AddressingMode.INDEXED): InstructionInfo(0xED, 2, 5, 1),
     ("STD", AddressingMode.EXTENDED): InstructionInfo(0xFD, 3, 5, 2),
 
     # =========================================================================
     # INDEX REGISTER (X) OPERATIONS
+    # X is the primary 16-bit index register
     # =========================================================================
 
-    # CPX - Compare X
+    # CPX - Compare X (sets flags based on X - operand)
     ("CPX", AddressingMode.IMMEDIATE): InstructionInfo(0x8C, 3, 3, 2),   # 16-bit immediate
     ("CPX", AddressingMode.DIRECT): InstructionInfo(0x9C, 2, 4, 1),
     ("CPX", AddressingMode.INDEXED): InstructionInfo(0xAC, 2, 5, 1),
     ("CPX", AddressingMode.EXTENDED): InstructionInfo(0xBC, 3, 5, 2),
 
     # NOTE: CPD (Compare D) is NOT an HD6303 instruction - it's 68HC11 only!
-    # The HD6303 does not have CPD. Use CMPA/CMPB or SUBD for comparisons.
-    # These entries have been removed to prevent generating invalid opcodes.
+    # The HD6303 does not have CPD. Use CMPA/CMPB or SUBD for D comparisons.
+    # These entries have been intentionally omitted to prevent generating invalid opcodes.
 
     # LDX - Load X
     ("LDX", AddressingMode.IMMEDIATE): InstructionInfo(0xCE, 3, 3, 2),   # 16-bit immediate
@@ -426,13 +478,14 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     ("LDX", AddressingMode.INDEXED): InstructionInfo(0xEE, 2, 5, 1),
     ("LDX", AddressingMode.EXTENDED): InstructionInfo(0xFE, 3, 5, 2),
 
-    # STX - Store X
+    # STX - Store X (no immediate mode)
     ("STX", AddressingMode.DIRECT): InstructionInfo(0xDF, 2, 4, 1),
     ("STX", AddressingMode.INDEXED): InstructionInfo(0xEF, 2, 5, 1),
     ("STX", AddressingMode.EXTENDED): InstructionInfo(0xFF, 3, 5, 2),
 
     # =========================================================================
     # STACK POINTER (S) OPERATIONS
+    # S is the 16-bit stack pointer, grows downward
     # =========================================================================
 
     # LDS - Load Stack Pointer
@@ -441,7 +494,7 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     ("LDS", AddressingMode.INDEXED): InstructionInfo(0xAE, 2, 5, 1),
     ("LDS", AddressingMode.EXTENDED): InstructionInfo(0xBE, 3, 5, 2),
 
-    # STS - Store Stack Pointer
+    # STS - Store Stack Pointer (no immediate mode)
     ("STS", AddressingMode.DIRECT): InstructionInfo(0x9F, 2, 4, 1),
     ("STS", AddressingMode.INDEXED): InstructionInfo(0xAF, 2, 5, 1),
     ("STS", AddressingMode.EXTENDED): InstructionInfo(0xBF, 3, 5, 2),
@@ -450,7 +503,7 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
     # BRANCH INSTRUCTIONS (relative addressing)
     # All branch instructions are 2 bytes: opcode + signed offset
     # Offset is relative to address of byte AFTER the branch instruction
-    # Range: -128 to +127 bytes
+    # Range: -128 to +127 bytes from (PC + 2)
     # =========================================================================
 
     ("BRA", AddressingMode.RELATIVE): InstructionInfo(0x20, 2, 3, 1),   # Branch always
@@ -475,7 +528,8 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
 
     # =========================================================================
     # JUMP/CALL INSTRUCTIONS
-    # JSR - Jump to Subroutine (pushes return address)
+    # JSR - Jump to Subroutine (pushes return address onto stack)
+    # JMP is defined above in extended/indexed memory operations
     # =========================================================================
 
     ("JSR", AddressingMode.DIRECT): InstructionInfo(0x9D, 2, 5, 1),
@@ -487,6 +541,8 @@ OPCODE_TABLE: dict[tuple[str, AddressingMode], InstructionInfo] = {
 # =============================================================================
 # Instruction Set Reference Lists
 # =============================================================================
+# These derived collections provide quick lookups for specific instruction
+# categories, avoiding repeated iteration over OPCODE_TABLE.
 
 # Set of all valid mnemonics (for lexer/parser validation)
 MNEMONICS: frozenset[str] = frozenset({
@@ -500,17 +556,83 @@ BRANCH_INSTRUCTIONS: frozenset[str] = frozenset({
     "BGT", "BLE", "BSR",
 })
 
-# Instructions that require 16-bit immediate operand
+
+# =============================================================================
+# Branch Inversion Mapping for Long Branch Relaxation
+# =============================================================================
+#
+# When a branch target is beyond the -128 to +127 byte range, the assembler
+# automatically generates a "long branch" sequence. This process is called
+# "branch relaxation".
+#
+# Transformation for conditional branches:
+#
+#   Short branch (2 bytes):        Long branch (5 bytes):
+#   ┌──────────────────────┐       ┌───────────────────────────┐
+#   │  Bcc target          │  -->  │  Bcc_inv skip  ; 2 bytes  │
+#   └──────────────────────┘       │  JMP target    ; 3 bytes  │
+#                                  │ skip:                     │
+#                                  └───────────────────────────┘
+#
+# Transformation for unconditional branches:
+#   BRA target  -->  JMP target (3 bytes)
+#   BSR target  -->  JSR target (3 bytes)
+#
+# This mapping provides the inverted condition for each conditional branch,
+# enabling the assembler to generate correct long branch sequences.
+
+BRANCH_INVERSION: dict[str, str] = {
+    # Equality conditions
+    "BEQ": "BNE",   # Equal -> Not Equal
+    "BNE": "BEQ",   # Not Equal -> Equal
+
+    # Carry/Unsigned comparison
+    "BCC": "BCS",   # Carry Clear (Higher or Same) -> Carry Set (Lower)
+    "BHS": "BLO",   # Higher or Same -> Lower (alias)
+    "BCS": "BCC",   # Carry Set (Lower) -> Carry Clear (Higher or Same)
+    "BLO": "BHS",   # Lower -> Higher or Same (alias)
+
+    # Unsigned comparison (compound conditions)
+    "BHI": "BLS",   # Higher -> Lower or Same
+    "BLS": "BHI",   # Lower or Same -> Higher
+
+    # Overflow
+    "BVC": "BVS",   # Overflow Clear -> Overflow Set
+    "BVS": "BVC",   # Overflow Set -> Overflow Clear
+
+    # Sign/Negative
+    "BPL": "BMI",   # Plus -> Minus
+    "BMI": "BPL",   # Minus -> Plus
+
+    # Signed comparison
+    "BGE": "BLT",   # Greater or Equal -> Less Than
+    "BLT": "BGE",   # Less Than -> Greater or Equal
+    "BGT": "BLE",   # Greater Than -> Less or Equal
+    "BLE": "BGT",   # Less or Equal -> Greater Than
+
+    # Note: BRA and BSR don't need inversion - they convert directly to JMP/JSR
+    # BRN (never) is rarely used and converts to nothing + JMP
+}
+
+# Conditional branches that can be inverted for long branch sequences
+CONDITIONAL_BRANCHES: frozenset[str] = frozenset(BRANCH_INVERSION.keys())
+
+# Unconditional branches that convert directly to jump instructions
+UNCONDITIONAL_BRANCHES: frozenset[str] = frozenset({"BRA", "BRN", "BSR"})
+
+# Instructions that require 16-bit immediate operand (word operations)
 WORD_IMMEDIATE_INSTRUCTIONS: frozenset[str] = frozenset({
-    "LDD", "LDX", "LDS", "CPX", "ADDD", "SUBD",  # Note: CPD removed - not valid HD6303
+    "LDD", "LDX", "LDS", "CPX", "ADDD", "SUBD",
+    # Note: CPD is intentionally NOT included - it's not a valid HD6303 instruction
 })
 
 # Instructions that cannot use immediate mode (store instructions)
+# You can't store TO a literal value!
 NO_IMMEDIATE_INSTRUCTIONS: frozenset[str] = frozenset({
     "STAA", "STAB", "STD", "STX", "STS",
 })
 
-# Instructions that only have inherent mode
+# Instructions that only have inherent mode (no operand)
 INHERENT_ONLY_INSTRUCTIONS: frozenset[str] = frozenset({
     "NOP", "RTS", "RTI", "SWI", "WAI", "SLP", "TRAP",
     "TAB", "TBA", "TAP", "TPA", "ABA", "SBA", "CBA",
@@ -528,6 +650,9 @@ INHERENT_ONLY_INSTRUCTIONS: frozenset[str] = frozenset({
 # =============================================================================
 # Lookup Functions
 # =============================================================================
+# These functions provide the primary interface for looking up instruction
+# information. They encapsulate access to OPCODE_TABLE and handle
+# case normalization.
 
 def get_instruction_info(
     mnemonic: str,
@@ -536,12 +661,22 @@ def get_instruction_info(
     """
     Look up instruction information by mnemonic and addressing mode.
 
+    This is the primary lookup function used by the assembler to find
+    the opcode byte and size for a given instruction.
+
     Args:
-        mnemonic: The instruction mnemonic (e.g., "LDAA")
-        mode: The addressing mode
+        mnemonic: The instruction mnemonic (e.g., "LDAA", "JSR")
+                 Case-insensitive.
+        mode: The addressing mode to use
 
     Returns:
-        InstructionInfo if found, None if the combination is invalid
+        InstructionInfo if the combination is valid, None if the
+        mnemonic doesn't support the given addressing mode.
+
+    Example:
+        >>> info = get_instruction_info("LDAA", AddressingMode.IMMEDIATE)
+        >>> print(f"Opcode: ${info.opcode:02X}, Size: {info.size}")
+        Opcode: $86, Size: 2
     """
     return OPCODE_TABLE.get((mnemonic.upper(), mode))
 
@@ -550,11 +685,20 @@ def get_valid_modes(mnemonic: str) -> list[AddressingMode]:
     """
     Get all valid addressing modes for an instruction.
 
+    Useful for error messages and validation - tells the user what
+    addressing modes are actually supported by a given mnemonic.
+
     Args:
-        mnemonic: The instruction mnemonic
+        mnemonic: The instruction mnemonic (case-insensitive)
 
     Returns:
-        List of valid AddressingModes for this instruction
+        List of valid AddressingModes for this instruction.
+        Empty list if the mnemonic is invalid.
+
+    Example:
+        >>> modes = get_valid_modes("LDAA")
+        >>> print([str(m) for m in modes])
+        ['immediate', 'direct', 'indexed', 'extended']
     """
     mnemonic = mnemonic.upper()
     return [
@@ -568,10 +712,10 @@ def is_valid_instruction(mnemonic: str) -> bool:
     Check if a mnemonic is a valid HD6303 instruction.
 
     Args:
-        mnemonic: The instruction mnemonic to check
+        mnemonic: The instruction mnemonic to check (case-insensitive)
 
     Returns:
-        True if valid, False otherwise
+        True if valid HD6303 instruction, False otherwise
     """
     return mnemonic.upper() in MNEMONICS
 
@@ -580,11 +724,15 @@ def is_branch_instruction(mnemonic: str) -> bool:
     """
     Check if an instruction is a branch (uses relative addressing).
 
+    Branch instructions use PC-relative addressing with a signed 8-bit
+    displacement. The assembler handles these specially for label
+    resolution and long branch relaxation.
+
     Args:
-        mnemonic: The instruction mnemonic
+        mnemonic: The instruction mnemonic (case-insensitive)
 
     Returns:
-        True if it's a branch instruction
+        True if it's a branch instruction (BRA, BNE, BSR, etc.)
     """
     return mnemonic.upper() in BRANCH_INSTRUCTIONS
 
@@ -593,13 +741,135 @@ def uses_word_immediate(mnemonic: str) -> bool:
     """
     Check if an instruction uses 16-bit immediate values.
 
-    Instructions like LDX, LDD, LDS, CPX use 16-bit immediate
-    values instead of 8-bit.
+    Most instructions use 8-bit immediate values, but some 16-bit
+    operations (LDX, LDD, LDS, CPX, ADDD, SUBD) use 16-bit immediates.
 
     Args:
-        mnemonic: The instruction mnemonic
+        mnemonic: The instruction mnemonic (case-insensitive)
 
     Returns:
         True if 16-bit immediate, False if 8-bit
     """
     return mnemonic.upper() in WORD_IMMEDIATE_INSTRUCTIONS
+
+
+# =============================================================================
+# Branch Relaxation Helper Functions
+# =============================================================================
+# These functions support the assembler's automatic branch relaxation feature,
+# which converts short branches to long branches when targets are out of range.
+
+def get_inverted_branch(mnemonic: str) -> Optional[str]:
+    """
+    Get the inverted condition for a conditional branch.
+
+    Used for long branch relaxation: when a branch target is out of range,
+    we emit the inverted condition (to skip over a JMP) followed by a JMP
+    to the actual target.
+
+    Args:
+        mnemonic: The branch instruction mnemonic (e.g., "BEQ", "BNE")
+                 Case-insensitive.
+
+    Returns:
+        The inverted branch mnemonic, or None if not a conditional branch.
+        Returns None for BRA, BSR, BRN which don't need inversion.
+
+    Example:
+        >>> get_inverted_branch("BEQ")
+        "BNE"
+        >>> get_inverted_branch("BRA")
+        None
+    """
+    return BRANCH_INVERSION.get(mnemonic.upper())
+
+
+def is_conditional_branch(mnemonic: str) -> bool:
+    """
+    Check if a branch instruction is conditional (can be inverted).
+
+    Conditional branches test a condition (carry, zero, sign, etc.)
+    and branch if the condition is true. They can be inverted for
+    long branch sequences.
+
+    Args:
+        mnemonic: The instruction mnemonic (case-insensitive)
+
+    Returns:
+        True if it's a conditional branch that can be inverted
+    """
+    return mnemonic.upper() in CONDITIONAL_BRANCHES
+
+
+def is_unconditional_branch(mnemonic: str) -> bool:
+    """
+    Check if a branch instruction is unconditional.
+
+    Unconditional branches (BRA, BSR, BRN) convert directly to
+    JMP/JSR for long distances without needing condition inversion.
+
+    Args:
+        mnemonic: The instruction mnemonic (case-insensitive)
+
+    Returns:
+        True if it's an unconditional branch (BRA, BSR, or BRN)
+    """
+    return mnemonic.upper() in UNCONDITIONAL_BRANCHES
+
+
+def get_long_branch_size(mnemonic: str) -> int:
+    """
+    Get the size of a long branch sequence for a given branch instruction.
+
+    Long branch sequences are used when the target is beyond the -128 to +127
+    byte range of normal relative branches. The size varies based on whether
+    the branch needs condition inversion.
+
+    Args:
+        mnemonic: The branch instruction mnemonic (case-insensitive)
+
+    Returns:
+        Size in bytes of the long branch sequence:
+        - 5 bytes for conditional branches (inverted_branch + JMP)
+        - 3 bytes for BRA (just JMP)
+        - 3 bytes for BSR (just JSR)
+        - 3 bytes for BRN (just JMP, branch never = always skip)
+
+    Raises:
+        ValueError: If not a valid branch instruction
+    """
+    mnemonic = mnemonic.upper()
+    if mnemonic not in BRANCH_INSTRUCTIONS:
+        raise ValueError(f"'{mnemonic}' is not a branch instruction")
+
+    if mnemonic in CONDITIONAL_BRANCHES:
+        # Conditional: inverted_branch (2) + JMP (3) = 5 bytes
+        return 5
+    elif mnemonic == "BRA":
+        # Unconditional: just JMP (3 bytes)
+        return 3
+    elif mnemonic == "BSR":
+        # Subroutine: just JSR (3 bytes)
+        return 3
+    elif mnemonic == "BRN":
+        # Branch never: effectively just JMP (3 bytes)
+        # The BRN + JMP would be 5 bytes but BRN is a no-op,
+        # so we can just emit JMP
+        return 3
+    else:
+        # Shouldn't reach here, but default to conditional size
+        return 5
+
+
+def get_short_branch_size() -> int:
+    """
+    Get the size of a short (normal) branch instruction.
+
+    All HD6303 branch instructions are 2 bytes: opcode + signed offset.
+    This function exists for symmetry with get_long_branch_size() and
+    to document this assumption explicitly.
+
+    Returns:
+        2 (always - all branches are 2 bytes)
+    """
+    return 2

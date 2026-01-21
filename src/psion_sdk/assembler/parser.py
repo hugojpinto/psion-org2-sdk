@@ -70,7 +70,7 @@ from psion_sdk.errors import (
     SourceLocation,
 )
 from psion_sdk.assembler.lexer import Token, TokenType, Lexer
-from psion_sdk.assembler.opcodes import (
+from psion_sdk.cpu import (
     AddressingMode,
     MNEMONICS,
     BRANCH_INSTRUCTIONS,

@@ -140,11 +140,17 @@ class PackBuilder:
     # Pack size in kilobytes
     size_kb: int = 16
 
-    # Pack type (default: Datapak for EPROM-like storage)
-    pack_type: PackType = PackType.DATAPAK
+    # Pack type (default: DATAPAK_SIMPLE - works reliably with BOOT protocol)
+    # DATAPAK_SIMPLE (0x4a) uses a simple structure without complex MAIN data
+    # and works with exact checksum calculation (no protection bit offset)
+    pack_type: PackType = PackType.DATAPAK_SIMPLE
 
     # Timestamp for the pack header
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Whether to inject a MAIN header automatically
+    # Set to False if you want to add your own MAIN record (e.g., for auto-start)
+    inject_main: bool = True
 
     # Internal list of records to include
     _records: list[PackRecord] = field(default_factory=list, repr=False)
@@ -417,7 +423,11 @@ class PackBuilder:
         pack_data = self._build_pack_data()
 
         # Build OPK header
-        opk_header = create_opk_header(len(pack_data))
+        # Use UNMAKE-style length (excludes FF FF terminator) to match JAPE format
+        # JAPE packs use: length = pack_data_size - 2 (without FF FF)
+        # Our pack_data ends with FF FF, so subtract 2 for the length field
+        data_length = len(pack_data) - 2  # Exclude FF FF terminator
+        opk_header = create_opk_header(data_length)
 
         # Combine header and pack data
         return opk_header + pack_data
@@ -460,33 +470,64 @@ class PackBuilder:
         # Calculate checksum from header components
         # The Psion checksum is the sum of 16-bit words at offsets 0, 2, 4, 6
         # of the pack header (flags, size, timestamp, etc.)
+        #
+        # Checksum calculation varies by pack type:
+        # - DATAPAK_SIMPLE (0x4a): Exact checksum, no offset, use standard timestamp
+        # - DATAPAK_PAGED (0x46): Needs protection bit offset and specific timestamp
+        # - Other types: Use exact checksum calculation
         size_indicator = self.size_kb // 8
-        year = self.timestamp.year % 100
-        month = self.timestamp.month - 1  # 0-indexed
-        day = self.timestamp.day - 1      # 0-indexed
-        hour = self.timestamp.hour
+
+        # Use a standard timestamp format that works with JAPE and real hardware
+        # Format: year, month, day, hour, reserved, frame_counter
+        # DATAPAK_SIMPLE uses: 00 00 20 00 00 00 (like fnkey40.opk)
+        # DATAPAK_PAGED uses: 00 90 10 90 00 19 (like games.opk)
+        if self.pack_type == PackType.DATAPAK_SIMPLE:
+            year, month, day, hour, reserved, frame_counter = 0x00, 0x00, 0x20, 0x00, 0x00, 0x00
+            checksum_flags = self.pack_type  # Exact checksum, no offset
+        elif self.pack_type == PackType.DATAPAK_PAGED:
+            year, month, day, hour, reserved, frame_counter = 0x00, 0x90, 0x10, 0x90, 0x00, 0x19
+            # DATAPAK_PAGED needs protection bit offset for checksum
+            # 0x28 = 0x20 (copy-protect) + 0x08 (write-protect)
+            checksum_flags = (self.pack_type + 0x28) & 0xFF
+        else:
+            # For other pack types, use exact checksum with standard timestamp
+            year = self.timestamp.year % 100
+            month = self.timestamp.month - 1
+            day = self.timestamp.day - 1
+            hour = self.timestamp.hour
+            reserved, frame_counter = 0x00, 0x00
+            checksum_flags = self.pack_type
 
         checksum = calculate_header_checksum(
-            flags=self.pack_type,
+            flags=checksum_flags,
             size_indicator=size_indicator,
             year=year,
             month=month,
             day=day,
             hour=hour,
-            reserved=0,
-            frame_counter=0
+            reserved=reserved,
+            frame_counter=frame_counter
         )
 
-        # Build header with calculated checksum
-        header = PackHeader(
-            flags=self.pack_type,
-            size_kb=self.size_kb,
-            timestamp=self.timestamp,
-            checksum=checksum
+        # Build header bytes directly (can't use PackHeader since we need raw
+        # timestamp bytes like 0x90 which aren't valid datetime values)
+        # Format: flags(1) + size(1) + year(1) + month(1) + day(1) + hour(1) + reserved(1) + frame(1) + checksum(2)
+        import struct
+        header_bytes = struct.pack(
+            ">BBBBBBBBH",
+            self.pack_type,
+            size_indicator,
+            year,
+            month,
+            day,
+            hour,
+            reserved,
+            frame_counter,
+            checksum
         )
 
         # Combine header and records
-        pack_data = header.to_bytes() + records_data_with_marker
+        pack_data = header_bytes + records_data_with_marker
 
         # Validate size
         max_size = self.size_kb * 1024
@@ -501,6 +542,9 @@ class PackBuilder:
             f"{max_size - len(pack_data)} bytes free"
         )
 
+        # Note: OPK files contain only actual data, NOT padded to full pack size.
+        # The pack header's size indicator tells the Psion the pack capacity,
+        # but the OPK file itself only includes the used bytes.
         return pack_data
 
     def _build_records_data(self) -> bytes:
@@ -512,11 +556,10 @@ class PackBuilder:
         """
         result = bytearray()
 
-        # Add standard MAIN header (required for pack recognition)
-        # This is what BLDPACK adds when no BOOT.BIN is provided.
-        # Format: [length=9] [type=0x81] [name="MAIN    "] [data_type=0x90]
-        # The 0x90 is the data record type marker for MAIN's (empty) data
-        result.extend(self._build_main_header())
+        # Optionally add standard MAIN header (for pack recognition)
+        # Set inject_main=False if you want to add your own MAIN record
+        if self.inject_main:
+            result.extend(self._build_main_header())
 
         for record in self._records:
             result.extend(record.to_bytes())
@@ -524,26 +567,40 @@ class PackBuilder:
 
     def _build_main_header(self) -> bytes:
         """
-        Build the standard MAIN header stub.
+        Build the standard MAIN header with appropriate data section.
 
-        This minimal header is required for the pack to be recognized
-        by the Psion OS. It's automatically added by the SDK's BLDPACK
-        when no BOOT.BIN file is provided.
+        This is required for the pack to be recognized by the Psion OS.
 
-        Format:
+        The format depends on the pack flags:
+        - DATAPAK_PAGED (0x46): Requires MAIN data section (empty long record)
+        - Other flags (0x56, etc.): Can have no MAIN data
+
+        This is based on analysis of JAPE packs - all packs with 0x46 flags
+        have MAIN data, while packs with 0x56/etc flags have no MAIN data.
+
+        Format (header):
             09      - Length (9 bytes follow)
             81      - Type (MAIN/file header)
             MAIN    - 8-byte padded name
             90      - Data record type marker
 
+        Format (empty data section, for DATAPAK_PAGED):
+            02 80 00 00  - Empty long record (terminates MAIN data)
+
         Returns:
-            The 11-byte MAIN header stub
+            The MAIN header bytes (11 bytes, or 15 bytes with data section)
         """
         header = bytearray()
         header.append(9)                    # Length: type(1) + name(8) = 9
         header.append(0x81)                 # Type: MAIN/data file header
         header.extend(b"MAIN    ")          # Name: "MAIN" padded to 8 bytes
         header.append(0x90)                 # Data record type marker
+
+        # For DATAPAK_PAGED (0x46) flags, add empty MAIN data record
+        # This is required based on analysis of JAPE packs
+        if self.pack_type == PackType.DATAPAK_PAGED:
+            header.extend(b"\x02\x80\x00\x00")  # Empty long record
+
         return bytes(header)
 
 

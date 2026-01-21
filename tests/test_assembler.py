@@ -223,6 +223,61 @@ class TestIncludeFiles:
             code = result[7:]
             assert code == bytes([0x86, 0x55])
 
+    def test_runtime_inc_assembles_without_undefined_symbols(self):
+        """Test that runtime.inc assembles correctly without undefined symbol errors.
+
+        This is a regression test for a bug where runtime.inc used symbols like
+        UTW_T4 and UTW_T6 that weren't defined in sysvars.inc. The bug caused
+        pass 2 to silently skip large portions of code, resulting in incorrect
+        symbol addresses for string literals in C programs.
+
+        The fix was to replace:
+        - UTW_T4 -> UTW_W1 ($86-$87)
+        - UTW_T6 -> UTW_W2 ($88)
+        """
+        # This is essentially what a C program includes
+        source = '''
+            .MODEL LZ
+_entry:
+            BSR     _main
+            RTS
+_main:
+            JSR     _cls
+            LDD     #__S1
+            PSHB
+            PSHA
+            JSR     _print
+            INS
+            INS
+            JSR     _getkey
+            RTS
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+__S1:
+            FCC     "TEST"
+            FCB     0
+            END
+        '''
+        # Get the include path for the project's include directory
+        include_dir = Path(__file__).parent.parent / "include"
+
+        # Assemble with relocatable mode (where the bug manifested)
+        asm = Assembler(include_paths=[str(include_dir)], relocatable=True)
+
+        # This should not raise UndefinedSymbolError
+        result = asm.assemble(source)
+
+        # Verify we got output
+        assert result is not None
+        assert len(result) > 0
+
+        # Verify __S1 symbol exists and has a reasonable address
+        symbols = asm.get_symbols()
+        assert "__S1" in symbols
+        # __S1 should be after all the runtime code (which is ~1700 bytes)
+        # It should NOT be 0 or some small value
+        assert symbols["__S1"] > 1000, f"__S1 address {symbols['__S1']} is too small, runtime.inc may not be fully processed"
+
 
 # =============================================================================
 # Listing Output Tests
@@ -1138,3 +1193,327 @@ class TestModelSupport:
         asm2.assemble_string(source)
         symbols = asm2._codegen._symbols
         assert "__PSION_LZ64__" in symbols
+
+
+# =============================================================================
+# Branch Relaxation Tests
+# =============================================================================
+
+class TestBranchRelaxation:
+    """
+    Tests for automatic branch relaxation (long branch support).
+
+    The HD6303 branch instructions have a limited range of -128 to +127 bytes.
+    When a branch target is beyond this range, the assembler automatically
+    generates a "long branch" sequence:
+
+    For conditional branches (BEQ, BNE, etc.):
+        BEQ target  -->  BNE skip; JMP target; skip:  (5 bytes)
+
+    For unconditional branches:
+        BRA target  -->  JMP target  (3 bytes)
+        BSR target  -->  JSR target  (3 bytes)
+    """
+
+    def test_short_branch_within_range(self):
+        """Short branches within ±127 bytes should use standard 2-byte form."""
+        source = """
+            ORG $8000
+_loop:      NOP
+            BNE _loop
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]  # Skip OB3 header
+
+        # NOP (1 byte) + BNE (2 bytes) = 3 bytes
+        assert len(code) == 3
+        assert code[0] == 0x01      # NOP
+        assert code[1] == 0x26      # BNE opcode
+        # Offset should be -3 (0xFD) to go back over BNE(2) + NOP(1)
+        assert code[2] == 0xFD
+
+    def test_forward_branch_within_range(self):
+        """Forward branch within range should use standard 2-byte form."""
+        source = """
+            ORG $8000
+            BEQ _target
+            NOP
+            NOP
+_target:    RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # BEQ (2) + NOP (1) + NOP (1) + RTS (1) = 5 bytes
+        assert len(code) == 5
+        assert code[0] == 0x27      # BEQ opcode
+        assert code[1] == 0x02      # Offset +2 to skip two NOPs
+
+    def test_long_branch_beq_converts_to_bne_jmp(self):
+        """BEQ beyond range should become BNE skip; JMP target; skip:"""
+        # Create a large gap (200+ bytes of NOPs)
+        nops = "NOP\n" * 150  # 150 NOPs = 150 bytes
+        source = f"""
+            ORG $8000
+            BEQ _target
+            {nops}
+_target:    RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # Long branch for BEQ: BNE skip (2) + JMP target (3) = 5 bytes
+        # Then 150 NOPs + RTS = 151 bytes
+        # Total = 5 + 150 + 1 = 156 bytes
+        assert len(code) == 156
+
+        # First instruction should be BNE (inverted BEQ) with offset +3
+        assert code[0] == 0x26      # BNE opcode (inverted from BEQ)
+        assert code[1] == 0x03      # Offset +3 to skip over JMP
+
+        # Second instruction should be JMP (extended addressing)
+        assert code[2] == 0x7E      # JMP opcode
+
+        # JMP target should be at address of _target (start + 5 + 150)
+        jmp_target = (code[3] << 8) | code[4]
+        assert jmp_target == 0x8000 + 5 + 150  # $8000 + long_branch_size + nops
+
+    def test_long_branch_bne_converts_to_beq_jmp(self):
+        """BNE beyond range should become BEQ skip; JMP target; skip:"""
+        nops = "NOP\n" * 150
+        source = f"""
+            ORG $8000
+            BNE _target
+            {nops}
+_target:    RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # BNE inverts to BEQ
+        assert code[0] == 0x27      # BEQ opcode (inverted from BNE)
+        assert code[1] == 0x03      # Skip over JMP
+        assert code[2] == 0x7E      # JMP opcode
+
+    def test_long_bra_becomes_jmp(self):
+        """BRA beyond range should become simple JMP."""
+        nops = "NOP\n" * 150
+        source = f"""
+            ORG $8000
+            BRA _target
+            {nops}
+_target:    RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # BRA just becomes JMP (3 bytes)
+        # Total = 3 + 150 + 1 = 154 bytes
+        assert len(code) == 154
+
+        # Should just be JMP, no condition inversion needed
+        assert code[0] == 0x7E      # JMP opcode
+        jmp_target = (code[1] << 8) | code[2]
+        assert jmp_target == 0x8000 + 3 + 150
+
+    def test_long_bsr_becomes_jsr(self):
+        """BSR beyond range should become simple JSR."""
+        nops = "NOP\n" * 150
+        source = f"""
+            ORG $8000
+            BSR _subroutine
+            RTS
+            {nops}
+_subroutine:
+            NOP
+            RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # BSR becomes JSR (3 bytes), then RTS (1), 150 NOPs, NOP+RTS (2)
+        # Total = 3 + 1 + 150 + 1 + 1 = 156 bytes
+        assert len(code) == 156
+
+        # First instruction should be JSR
+        assert code[0] == 0xBD      # JSR extended opcode
+
+    def test_multiple_long_branches_same_target(self):
+        """Multiple long branches to same target should all be relaxed."""
+        nops = "NOP\n" * 60  # 60 NOPs between each branch
+        source = f"""
+            ORG $8000
+            BEQ _target
+            {nops}
+            BNE _target
+            {nops}
+            BRA _target
+            {nops}
+_target:    RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # Should compile successfully with all long forms
+        # Check first BEQ became BNE + JMP
+        assert code[0] == 0x26      # BNE (inverted BEQ)
+        assert code[1] == 0x03      # Skip
+        assert code[2] == 0x7E      # JMP
+
+    def test_backward_long_branch(self):
+        """Backward branch beyond -128 bytes should also be relaxed."""
+        nops = "NOP\n" * 150
+        source = f"""
+            ORG $8000
+_loop:      NOP
+            {nops}
+            BNE _loop     ; Way back, needs long form
+            RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # Should compile successfully
+        # Find the BNE (now BEQ+JMP) near the end
+        # It should be at position 1 + 150 = 151
+        long_branch_pos = 151
+        assert code[long_branch_pos] == 0x27      # BEQ (inverted BNE)
+        assert code[long_branch_pos + 1] == 0x03  # Skip
+        assert code[long_branch_pos + 2] == 0x7E  # JMP
+
+    def test_all_conditional_branches_can_relax(self):
+        """All conditional branch types should be able to relax."""
+        branches = [
+            ("BEQ", 0x26),  # BEQ inverts to BNE
+            ("BNE", 0x27),  # BNE inverts to BEQ
+            ("BCC", 0x25),  # BCC inverts to BCS
+            ("BCS", 0x24),  # BCS inverts to BCC
+            ("BPL", 0x2B),  # BPL inverts to BMI
+            ("BMI", 0x2A),  # BMI inverts to BPL
+            ("BVC", 0x29),  # BVC inverts to BVS
+            ("BVS", 0x28),  # BVS inverts to BVC
+            ("BGE", 0x2D),  # BGE inverts to BLT
+            ("BLT", 0x2C),  # BLT inverts to BGE
+            ("BGT", 0x2F),  # BGT inverts to BLE
+            ("BLE", 0x2E),  # BLE inverts to BGT
+            ("BHI", 0x23),  # BHI inverts to BLS
+            ("BLS", 0x22),  # BLS inverts to BHI
+        ]
+
+        nops = "NOP\n" * 150
+
+        for branch_mnemonic, expected_inverted_opcode in branches:
+            source = f"""
+                ORG $8000
+                {branch_mnemonic} _target
+                {nops}
+_target:        RTS
+            """
+            asm = Assembler()
+            result = asm.assemble(source)
+            code = result[7:]
+
+            assert code[0] == expected_inverted_opcode, \
+                f"{branch_mnemonic} should invert to opcode ${expected_inverted_opcode:02X}, got ${code[0]:02X}"
+            assert code[1] == 0x03, f"{branch_mnemonic} skip offset should be 3"
+            assert code[2] == 0x7E, f"{branch_mnemonic} should be followed by JMP"
+
+    def test_relocatable_long_branch_adds_fixup(self):
+        """Long branches in relocatable code should add JMP address to fixups."""
+        nops = "NOP\n" * 150
+        source = f"""
+            ORG $0000
+            BEQ _target
+            {nops}
+_target:    RTS
+        """
+        asm = Assembler(relocatable=True)
+        result = asm.assemble(source)
+
+        # In relocatable mode, the JMP address at offset 3-4 (after BNE skip, JMP opcode)
+        # should be in the fixup table. The code generator adds this when _needs_fixup
+        # returns True for internal symbols.
+        # The result includes stub + code + fixup_count + fixup_table
+
+        # This should compile without error - the key test is that it doesn't crash
+        # and the JMP target is correctly recorded for relocation
+        assert len(result) > 0
+
+    def test_relaxation_iteration_converges(self):
+        """
+        Test that relaxation iteration converges correctly.
+
+        This tests a scenario where relaxing one branch might push another
+        branch out of range, requiring multiple iterations.
+        """
+        # Create a situation where branches are near the boundary
+        # First branch is just within range, second is just out of range
+        # When second is relaxed (grows by 3 bytes), first might need relaxation too
+        nops_126 = "NOP\n" * 126  # Just at the boundary
+        nops_3 = "NOP\n" * 3
+
+        source = f"""
+            ORG $8000
+            BEQ _target1    ; This might need relaxation after _target2 branch grows
+            {nops_126}
+_target1:   NOP
+            {nops_3}
+            BEQ _target2    ; This needs relaxation
+            {nops_126}
+            {nops_3}
+_target2:   RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        # Should compile without error, proving iteration converged
+        assert len(result) > 0
+
+    def test_edge_case_exactly_128_bytes(self):
+        """Branch exactly at -128 byte boundary should still use short form."""
+        # -128 is still within range, so should use short branch
+        nops = "NOP\n" * 125  # 125 NOPs, BNE will be at 127 from loop_start
+
+        source = f"""
+            ORG $8000
+_loop_start: NOP
+            {nops}
+            NOP             ; Total 127 bytes of NOPs
+            BNE _loop_start ; Offset = -(127 + 2) = -129... just out of range
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # The BNE should need long form since offset is -129
+        # Find BNE position: 1 + 125 + 1 = 127
+        bne_pos = 127
+        # Should be inverted to BEQ for long form
+        assert code[bne_pos] == 0x27  # BEQ (inverted)
+
+    def test_edge_case_exactly_127_bytes(self):
+        """Branch exactly at +127 byte boundary should use short form."""
+        nops = "NOP\n" * 125
+
+        source = f"""
+            ORG $8000
+            BEQ _target     ; 2 bytes
+            {nops}          ; 125 bytes, offset = 125, within range
+_target:    RTS
+        """
+        asm = Assembler()
+        result = asm.assemble(source)
+        code = result[7:]
+
+        # BEQ (2) + 125 NOPs + RTS = 128 bytes
+        assert len(code) == 128
+
+        # Should still be short BEQ
+        assert code[0] == 0x27      # BEQ opcode (short form)

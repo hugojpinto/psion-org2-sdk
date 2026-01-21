@@ -28,7 +28,7 @@ Copyright (c) 2025 Hugo José Pinto & Contributors
 Ported from JAPE by Jaap Scherphuis
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional, Callable, List, Tuple
 from enum import IntEnum
 

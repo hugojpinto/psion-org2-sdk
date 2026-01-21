@@ -155,6 +155,53 @@ void at(int pos, char *s);
  */
 int gcursor(void);
 
+/*
+ * udg_define - Define a User Defined Graphic character
+ *
+ * Defines a custom 5x8 pixel character that can be displayed
+ * using putchar(0) through putchar(7). The Psion Organiser II
+ * supports 8 UDGs (characters 0-7) which are stored in the
+ * HD44780 LCD controller's CGRAM (Character Generator RAM).
+ *
+ * Parameters:
+ *   char_num - Character number (0-7)
+ *   data     - Pointer to 8 bytes of bitmap data
+ *              Each byte defines one row (top to bottom)
+ *              Bits 0-4 are the pixels (bit 4 = left, bit 0 = right)
+ *
+ * Bitmap Format:
+ *   Each UDG is 5 pixels wide by 8 pixels tall.
+ *   Each of the 8 bytes represents one row, from top to bottom.
+ *   Within each byte, bits 4-0 represent pixels left-to-right.
+ *   Bits 7-5 are unused and should be 0.
+ *
+ *   Example pattern for a star:
+ *     Row 0: 0x04 = 00100 = ..X..
+ *     Row 1: 0x04 = 00100 = ..X..
+ *     Row 2: 0x1F = 11111 = XXXXX
+ *     Row 3: 0x0E = 01110 = .XXX.
+ *     Row 4: 0x0E = 01110 = .XXX.
+ *     Row 5: 0x15 = 10101 = X.X.X
+ *     Row 6: 0x04 = 00100 = ..X..
+ *     Row 7: 0x00 = 00000 = .....
+ *
+ * Implementation Notes:
+ *   This function disables interrupts (using SEI) while writing to the
+ *   LCD's CGRAM to prevent interrupt handlers from corrupting the writes.
+ *   On real hardware, the Psion OS may update the display in interrupt
+ *   handlers which could interleave with CGRAM writes and cause corruption.
+ *
+ * Example:
+ *   char smiley[8] = {0x00, 0x0A, 0x00, 0x11, 0x0E, 0x00, 0x00, 0x00};
+ *   udg_define(0, smiley);
+ *   putchar(0);  // Display the smiley
+ *
+ * Note: The OS may redefine UDGs for its own use (clock, icons, etc.)
+ * so you should define your UDGs after returning from any OS menu
+ * interaction that might have overwritten them.
+ */
+void udg_define(int char_num, char *data);
+
 /* =============================================================================
  * Display Mode Functions (LZ/LZ64 only)
  * =============================================================================
@@ -537,16 +584,30 @@ void exit(void);
  *
  * SYNTAX
  * ------
- *   external void procedureName();
+ *   external void procedureName();   // For procedures that return nothing
+ *   external int procedureName%();   // For procedures that return integers
+ *
+ * RETURN VALUES
+ * -------------
+ *   OPL procedure names determine their return type:
+ *     - PROC%: returns integer (use 'external int PROC%();')
+ *     - PROC:  returns float (NOT SUPPORTED - use void)
+ *     - PROC$: returns string (NOT SUPPORTED - use void)
+ *
+ *   Integer-returning procedures can have their value captured:
+ *     external int GETVAL%();
+ *     int x = GETVAL%();  // x receives the OPL return value
+ *
+ *   Note: The '%' suffix IS part of the procedure name in OPL.
  *
  * CONSTRAINTS
  * -----------
- *   - Return type MUST be void (OPL procedures don't return values to C)
- *   - Parameters MUST be empty (use global variables for data exchange)
+ *   - Return type: void or int (float/string not supported)
+ *   - Parameters: MUST be empty (use global variables for data exchange)
  *   - Procedure name MUST be <= 8 characters (Psion identifier limit)
  *
- * EXAMPLE
- * -------
+ * EXAMPLE - Void Procedure
+ * ------------------------
  *   // Declare external OPL procedures at file scope
  *   external void azMENU();
  *   external void azHELP();
@@ -563,6 +624,17 @@ void exit(void);
  *       azHELP();             // Can call multiple external procedures
  *   }
  *
+ * EXAMPLE - Integer-Returning Procedure
+ * -------------------------------------
+ *   // OPL procedure: RANDOM%: RETURN INT(RND*100)
+ *   external int RANDOM%();
+ *
+ *   void main() {
+ *       int r = RANDOM%();    // Get random number from OPL!
+ *       print("Random: ");
+ *       print_int(r);
+ *   }
+ *
  * HOW IT WORKS
  * ------------
  *   Under the hood, the compiler:
@@ -570,15 +642,21 @@ void exit(void);
  *   2. Transforms external calls into QCode injection sequences
  *   3. The OPL interpreter runs the procedure and returns control to C
  *   4. Stack is automatically preserved across the call
+ *   5. For int returns, captures the return value from OPL's language stack
  *
  * DATA EXCHANGE
  * -------------
- *   Since external procedures cannot take parameters or return values,
- *   use global variables for data exchange between C and OPL:
+ *   External procedures cannot take parameters. Use global variables
+ *   or OPL return values for data exchange between C and OPL:
  *
+ *   // Method 1: Use return value (preferred for simple data)
+ *   external int GETSCORE%();
+ *   int score = GETSCORE%();
+ *
+ *   // Method 2: Use global variables (for complex data exchange)
  *   int g_score;              // Global variable for data exchange
  *
- *   external void azSCORE();  // OPL procedure reads g_score
+ *   external void azSCORE();  // OPL procedure reads g_score via PEEKW
  *
  *   void main() {
  *       g_score = 42;         // Set before calling OPL
@@ -622,8 +700,8 @@ void _call_opl_setup(void);
  * call_opl - Call an OPL procedure from C code (legacy interface)
  *
  * NOTE: For new code, use the 'external' keyword instead:
- *   external void azMENU();
- *   azMENU();  // Much cleaner syntax!
+ *   external int GETVAL%();
+ *   int x = GETVAL%();  // Much cleaner syntax!
  *
  * This function calls an external OPL procedure by name. After the
  * procedure completes, execution resumes at the next statement.
@@ -631,6 +709,11 @@ void _call_opl_setup(void);
  *
  * Parameters:
  *   name - Name of OPL procedure to call (max 8 characters)
+ *          Include '%' suffix for integer-returning procedures
+ *
+ * Returns:
+ *   For integer procedures (name ends with '%'): the return value
+ *   For void/float procedures: 0 (default OPL return)
  *
  * REQUIREMENTS:
  *   - _call_opl_setup() MUST be called first in main(), BEFORE locals!
@@ -639,12 +722,14 @@ void _call_opl_setup(void);
  *
  * Example (legacy usage):
  *   void main() {
- *       _call_opl_setup();   // Required - MUST be first!
+ *       _call_opl_setup();           // Required - MUST be first!
  *       int score = 42;
- *       call_opl("azMENU");  // Manual invocation
- *       print_int(score);    // score is still 42!
+ *       call_opl("azMENU");          // Call void procedure
+ *       int val = call_opl("GET%");  // Call int-returning procedure
+ *       print_int(score);            // score is still 42!
+ *       print_int(val);              // val has OPL return value
  *   }
  */
-void call_opl(char *name);
+int call_opl(char *name);
 
 #endif /* _PSION_H */

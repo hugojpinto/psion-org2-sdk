@@ -47,7 +47,7 @@ from psion_sdk.comms.link import (
     MIN_PACKET_SIZE,
     _find_footer,
 )
-from psion_sdk.errors import CommsError, ConnectionError, ProtocolError, TransferError
+from psion_sdk.errors import ConnectionError, TransferError
 
 logger = logging.getLogger(__name__)
 

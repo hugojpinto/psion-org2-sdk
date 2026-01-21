@@ -36,9 +36,9 @@ Copyright (c) 2025-2026 Hugo José Pinto & Contributors
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Callable, Dict, Tuple
+from typing import List, Optional, Dict, Tuple
 
-from ..assembler.opcodes import OPCODE_TABLE, AddressingMode
+from psion_sdk.cpu import OPCODE_TABLE, AddressingMode
 
 
 # =============================================================================

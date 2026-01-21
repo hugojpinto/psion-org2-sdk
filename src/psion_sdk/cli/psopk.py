@@ -44,7 +44,7 @@ from typing import Optional
 import click
 
 from psion_sdk import __version__
-from psion_sdk.errors import PsionError, OPKError, OPKFormatError, PackSizeError
+from psion_sdk.errors import OPKError, OPKFormatError, PackSizeError
 from psion_sdk.opk import (
     PackBuilder,
     PackParser,
@@ -70,10 +70,13 @@ class PackTypeChoice(click.ParamType):
     name = "pack_type"
 
     # Mapping of names to PackType values
+    # Note: "datapak" uses DATAPAK_SIMPLE (0x4a) which works reliably with BOOT protocol
     TYPE_MAP = {
-        "datapak": PackType.DATAPAK,
+        "datapak": PackType.DATAPAK_SIMPLE,  # Default, works with BOOT protocol on real hardware
+        "datapak_paged": PackType.DATAPAK_PAGED,  # JAPE format (0x46), for rampaks
         "rampak": PackType.RAMPAK,
         "flashpak": PackType.FLASHPAK,
+        "datapak_linear": PackType.DATAPAK,  # Original linear addressing (0x56)
     }
 
     def convert(self, value: str, param: Optional[click.Parameter],
@@ -147,8 +150,8 @@ def main() -> None:
 @click.option(
     "-s", "--size",
     type=click.Choice(["8", "16", "32", "64", "128"]),
-    default="16",
-    help="Pack size in KB (default: 16)",
+    default="32",
+    help="Pack size in KB (default: 32)",
 )
 @click.option(
     "-t", "--type",

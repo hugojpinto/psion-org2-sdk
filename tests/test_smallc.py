@@ -1038,19 +1038,74 @@ class TestExternalKeyword:
     # Parser Tests - Error Cases
     # -------------------------------------------------------------------------
 
-    def test_external_non_void_return_error(self):
-        """External with non-void return type should raise error."""
-        source = "external int azMENU();"
-        with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
-            parse_source(source)
-        assert "void" in str(exc_info.value).lower()
+    def test_external_int_return_allowed(self):
+        """External with int return type should be allowed (for integer-returning OPL procs).
 
-    def test_external_with_parameters_error(self):
-        """External with parameters should raise error."""
-        source = "external void azMENU(int x);"
+        Note: In OPL, integer-returning procedures are named with % suffix (e.g., GETVAL%).
+        However, % is not valid in C identifiers. Users should either:
+        - Use a C-compatible name (will be passed to OPL as-is)
+        - Use the legacy call_opl("GETVAL%") syntax for names with special characters
+        """
+        source = "external int GETVAL();"
+        ast = parse_source(source)
+        func = ast.declarations[0]
+        assert func.is_external
+        assert func.name == "GETVAL"
+        # return_type should be int
+        assert func.return_type.base_type.name == "INT"
+
+    def test_external_char_return_allowed(self):
+        """External with char return type should be allowed (treated as 8-bit int)."""
+        source = "external char GETC();"
+        ast = parse_source(source)
+        func = ast.declarations[0]
+        assert func.is_external
+        assert func.name == "GETC"
+        # return_type should be char
+        assert func.return_type.base_type.name == "CHAR"
+
+    def test_external_with_int_parameter(self):
+        """External with integer parameter should be allowed."""
+        source = "external void SETVAL(int x);"
+        ast = parse_source(source)
+        func = ast.declarations[0]
+        assert func.is_external
+        assert func.name == "SETVAL"
+        assert len(func.parameters) == 1
+        assert func.parameters[0].name == "x"
+        assert func.parameters[0].param_type.base_type.name == "INT"
+
+    def test_external_with_multiple_parameters(self):
+        """External with multiple parameters should be allowed (up to 4)."""
+        source = "external int ADDNUM(int a, int b);"
+        ast = parse_source(source)
+        func = ast.declarations[0]
+        assert func.is_external
+        assert func.name == "ADDNUM"
+        assert len(func.parameters) == 2
+        assert func.parameters[0].name == "a"
+        assert func.parameters[1].name == "b"
+
+    def test_external_with_max_parameters(self):
+        """External with 4 parameters (maximum) should be allowed."""
+        source = "external int CALC(int a, int b, int c, int d);"
+        ast = parse_source(source)
+        func = ast.declarations[0]
+        assert len(func.parameters) == 4
+
+    def test_external_with_too_many_parameters_error(self):
+        """External with more than 4 parameters should raise error."""
+        source = "external void FUNC(int a, int b, int c, int d, int e);"
         with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
             parse_source(source)
-        assert "parameter" in str(exc_info.value).lower()
+        assert "4" in str(exc_info.value)  # Should mention the limit
+
+    def test_external_with_pointer_parameter_error(self):
+        """External with pointer parameter should raise error."""
+        source = "external void FUNC(int *p);"
+        with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
+            parse_source(source)
+        assert "pointer" in str(exc_info.value).lower()
 
     def test_external_name_too_long_error(self):
         """External with name > 8 chars should raise error."""
@@ -1065,16 +1120,15 @@ class TestExternalKeyword:
         with pytest.raises((CSyntaxError, SmallCError)):
             parse_source(source)
 
-    def test_external_char_return_error(self):
-        """External with char return type should raise error."""
-        source = "external char azMENU();"
-        with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
-            parse_source(source)
-        assert "void" in str(exc_info.value).lower()
-
     def test_external_pointer_return_error(self):
-        """External with pointer return type should raise error."""
-        source = "external void *azMENU();"
+        """External with pointer return type should raise error.
+
+        Pointers are not valid external return types since OPL procedures
+        cannot return pointers to C code.
+        """
+        source = "external int *azMENU();"
+        # This should fail - pointer returns not allowed
+        # The parser may fail at the '*' or later, depending on implementation
         with pytest.raises((CSyntaxError, SmallCError)):
             parse_source(source)
 
@@ -1204,6 +1258,49 @@ class TestExternalKeyword:
                              and '_call_opl_setup' not in line
                              and 'JSR' in line)
         assert call_opl_count == 2
+
+    def test_external_call_with_parameters_generates_call_opl_param(self):
+        """External function call with parameters should use _call_opl_param."""
+        source = """
+        external int ADDNUM(int a, int b);
+
+        void main() {
+            int result;
+            result = ADDNUM(10, 20);
+        }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should call _call_opl_param (with parameters), not _call_opl
+        assert "_call_opl_param" in asm
+        # Should push parameter count (2)
+        assert "LDD     #2" in asm or "LDD\t#2" in asm
+        # Should push parameter values
+        assert "LDD     #10" in asm or "LDD\t#10" in asm
+        assert "LDD     #20" in asm or "LDD\t#20" in asm
+        # Should have the procedure name string with % suffix
+        assert "ADDNUM%" in asm
+
+    def test_external_call_char_param_with_parameters(self):
+        """External char-returning call with parameters should use _call_opl_str_param."""
+        source = """
+        external char GETC(int x);
+
+        void main() {
+            char c;
+            c = GETC(5);
+        }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should call _call_opl_str_param for char return with params
+        assert "_call_opl_str_param" in asm
+        # Should have the procedure name string with $ suffix
+        assert "GETC$" in asm
 
     def test_external_call_preserves_locals(self):
         """External call should work with local variables."""

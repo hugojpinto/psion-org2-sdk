@@ -406,28 +406,61 @@ class CParser:
 
         return None
 
+    # =========================================================================
+    # Maximum parameters allowed for external OPL procedure declarations.
+    # This limit ensures the QCode buffer fits in the allocated cell memory.
+    # Each integer parameter adds 3 bytes to the buffer ($22 HH LL).
+    # With 4 params: 4*3=12 + 2(count) + 10(name) + 7(restore) = 31 bytes.
+    # =========================================================================
+    MAX_EXTERNAL_PARAMS = 4
+
     def _parse_external_declaration(self) -> FunctionNode:
         """
         Parse an external OPL procedure declaration.
 
         Syntax:
-            external void procedureName();
+            external void procedureName();              // No parameters
+            external void procedureName(int x);         // One integer parameter
+            external int procedureName(int a, int b);   // Multiple parameters
 
         External declarations allow Small-C code to call OPL procedures that
         exist in the Psion's installed OPL programs. At runtime, the compiler
         generates QCode injection sequences to invoke the OPL interpreter.
 
+        Return Types:
+        - void: For OPL procedures that don't return useful values
+        - int: For OPL procedures that return integers (name ends with %)
+        - char: For OPL procedures that return strings (first char returned)
+
+        OPL procedure naming determines return type:
+        - PROC%: returns integer (use 'external int PROC();')
+        - PROC:  returns float (use 'external void', value not accessible)
+        - PROC$: returns string (use 'external char PROC();')
+
+        Parameter Constraints:
+        - Only integer parameters are supported (int, char promoted to int)
+        - Maximum 4 parameters (buffer size limitation)
+        - Parameters are passed via QCode opcodes that push onto language stack
+
+        How Parameters Work:
+        - C code evaluates each parameter expression to a 16-bit value
+        - Values are pushed onto the C stack, then encoded into QCode buffer
+        - QCode buffer contains $22 HH LL sequences for each parameter
+        - OPL interpreter pushes parameters onto language stack before QCO_PROC
+        - OPL procedure receives parameters just like any OPL procedure call
+
         Constraints:
-        - Return type MUST be void (OPL procedures don't return values to C)
-        - Parameters MUST be empty (OPL calling convention is incompatible)
+        - Return type: void, int, or char only (float not directly supported)
         - Procedure name MUST be <= 8 characters (Psion filesystem limit)
         - No function body (this is a declaration, not a definition)
 
         The generated code will:
-        1. Build a QCode buffer containing the procedure call
-        2. Unwind the C stack to the USR entry point
-        3. Execute the QCode (which calls the OPL procedure)
-        4. Resume C execution after the call
+        1. Evaluate parameter expressions (values in D register)
+        2. Build a QCode buffer containing parameter pushes + procedure call
+        3. Unwind the C stack to the USR entry point
+        4. Execute the QCode (which calls the OPL procedure)
+        5. Resume C execution after the call
+        6. For int/char returns, D register contains the OPL return value
 
         Reference: dev_docs/PROCEDURE_CALL_RESEARCH.md
 
@@ -440,27 +473,36 @@ class CParser:
         location = self._peek().location
 
         # =====================================================================
-        # Parse and validate return type - MUST be void
+        # Parse and validate return type - void, int, or char only
         # =====================================================================
-        # OPL procedures don't return values to C code. The USR() function
-        # returns a fixed value (0) which is discarded. Any data exchange
-        # between C and OPL must happen through global variables.
+        # OPL procedures can return values to C code via the language stack.
+        # Integer return values (from PROC% procedures) are captured and
+        # returned in D register. Float and string returns are not supported.
         type_info = self._parse_type_specifier()
         if type_info is None:
             raise CSyntaxError(
-                "external declaration requires 'void' return type",
+                "external declaration requires a return type",
                 self._peek().location,
-                hint="external void procedureName();",
+                hint="external void procedureName(); or external int procedureName();",
             )
 
-        base_type, is_unsigned, _, _ = type_info
+        base_type, is_unsigned, ptr_depth, _ = type_info
 
-        # Validate that the return type is void
-        if base_type != BaseType.VOID:
+        # Validate that the return type is void, int, or char (no pointers)
+        if base_type == BaseType.VOID:
+            return_type = TYPE_VOID
+        elif base_type == BaseType.INT and ptr_depth == 0:
+            # Allow both int and unsigned int for external returns
+            return_type = TYPE_UINT if is_unsigned else TYPE_INT
+        elif base_type == BaseType.CHAR and ptr_depth == 0:
+            # Allow char (treated as 8-bit int) for return value
+            return_type = TYPE_UCHAR if is_unsigned else TYPE_CHAR
+        else:
             raise CSyntaxError(
-                f"external procedures must have void return type, not '{base_type.name.lower()}'",
+                f"external procedures can only return void or int, not '{base_type.name.lower()}'",
                 location,
-                hint="OPL procedures cannot return values to C code; use 'external void'",
+                hint="OPL only supports integer return values to C code; "
+                     "use 'external void' or 'external int'",
             )
 
         # =====================================================================
@@ -471,34 +513,64 @@ class CParser:
 
         # Validate name length (Psion filesystem limit)
         # OPL procedure names are stored as 8-character filenames
-        if len(name) > 8:
+        # The C return type determines the OPL name suffix:
+        #   external char GETVAL()  -> calls GETVAL$ in OPL (string)
+        #   external int GETVAL()   -> calls GETVAL% in OPL (integer)
+        #   external void GETVAL()  -> calls GETVAL in OPL (no suffix)
+        opl_name = name
+        if return_type.base_type == BaseType.CHAR:
+            opl_name = name + "$"
+        elif return_type.base_type == BaseType.INT:
+            opl_name = name + "%"
+        # void has no suffix
+        if len(opl_name) > 8:
             raise CSyntaxError(
-                f"external procedure name '{name}' exceeds 8 character limit",
+                f"external procedure name '{name}' (OPL: '{opl_name}') exceeds 8 character limit",
                 name_token.location,
                 hint="Psion procedure names are limited to 8 characters",
             )
 
         # =====================================================================
-        # Parse parameter list - MUST be empty
+        # Parse parameter list - supports integer parameters
         # =====================================================================
-        # OPL and C have incompatible calling conventions. OPL procedures
-        # receive parameters through global variables, not the stack.
-        # We require empty parentheses for syntactic consistency.
+        # External OPL procedures can receive parameters via the QCode buffer.
+        # We build $22 HH LL (push word) opcodes for each integer parameter.
+        # Parameters are pushed in reverse order before QCO_PROC ($7D).
         self._expect(CTokenType.LPAREN, "'('")
-
-        # Check for non-empty parameter list
-        if not self._check(CTokenType.RPAREN):
-            # Allow explicit void: external void foo(void);
-            if self._check(CTokenType.VOID) and self._peek(1).type == CTokenType.RPAREN:
-                self._advance()  # consume void
-            else:
-                raise CSyntaxError(
-                    "external procedures cannot have parameters",
-                    self._peek().location,
-                    hint="OPL uses global variables for data exchange, not parameters",
-                )
-
+        parameters = self._parse_parameter_list()
         self._expect(CTokenType.RPAREN, "')'")
+
+        # =====================================================================
+        # Validate parameters for external procedures
+        # =====================================================================
+        # OPL procedure parameters are limited:
+        # - Only integer types supported (int, char - no pointers, no arrays)
+        # - Maximum 4 parameters (buffer size constraint)
+        # - Each parameter is passed as a 16-bit value via QCode $22 opcode
+        if len(parameters) > self.MAX_EXTERNAL_PARAMS:
+            raise CSyntaxError(
+                f"external procedures support at most {self.MAX_EXTERNAL_PARAMS} parameters, "
+                f"got {len(parameters)}",
+                location,
+                hint="OPL QCode buffer size limits the number of parameters",
+            )
+
+        for param in parameters:
+            # Check that parameter type is a simple integer type (int or char)
+            # Pointers and arrays are not supported for external parameters
+            if param.param_type.pointer_depth > 0:
+                raise CSyntaxError(
+                    f"external procedure parameter '{param.name}' cannot be a pointer",
+                    param.location,
+                    hint="Only integer types (int, char) are supported for external parameters",
+                )
+            if param.param_type.base_type not in (BaseType.INT, BaseType.CHAR):
+                raise CSyntaxError(
+                    f"external procedure parameter '{param.name}' must be int or char type",
+                    param.location,
+                    hint="OPL only accepts integer parameters via QCode; "
+                         "use int or char (char is promoted to int)",
+                )
 
         # =====================================================================
         # Expect semicolon - external declarations have no body
@@ -513,13 +585,17 @@ class CParser:
         # =====================================================================
         # The is_external flag tells the code generator to emit QCode
         # injection sequences instead of normal JSR instructions.
+        # The return_type is set based on what the user declared:
+        #   - void: return value ignored
+        #   - int:  D register contains OPL return value after call
+        # Parameters are stored so codegen can generate the appropriate calls.
         return FunctionNode(
             location=location,
             name=name,
-            return_type=TYPE_VOID,
-            parameters=[],
+            return_type=return_type,  # Use parsed return type (void or int)
+            parameters=parameters,    # Parameters for external call
             body=None,
-            is_forward_decl=False,  # Not a forward decl - it's an external decl
+            is_forward_decl=False,    # Not a forward decl - it's an external decl
             is_external=True,
         )
 

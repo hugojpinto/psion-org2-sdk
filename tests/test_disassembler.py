@@ -30,7 +30,7 @@ from psion_sdk.disassembler.qcode import (
     is_call_opl_buffer,
     QCODE_TABLE,
 )
-from psion_sdk.assembler.opcodes import AddressingMode
+from psion_sdk.cpu import AddressingMode
 
 
 # =============================================================================

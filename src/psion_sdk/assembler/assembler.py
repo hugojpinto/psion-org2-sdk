@@ -47,8 +47,7 @@ Options:
 from pathlib import Path
 from typing import Optional
 
-from psion_sdk.assembler.lexer import Lexer
-from psion_sdk.assembler.parser import Parser, parse_source
+from psion_sdk.assembler.parser import parse_source
 from psion_sdk.assembler.codegen import CodeGenerator
 from psion_sdk.errors import AssemblerError
 

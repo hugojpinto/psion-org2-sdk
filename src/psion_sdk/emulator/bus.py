@@ -39,7 +39,7 @@ Copyright (c) 2025 Hugo José Pinto & Contributors
 Ported from JAPE by Jaap Scherphuis
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:

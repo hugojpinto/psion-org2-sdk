@@ -34,7 +34,6 @@ import asyncio
 import json
 import sys
 import uuid
-import base64
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Callable, Awaitable
@@ -48,7 +47,6 @@ def _utcnow() -> datetime:
 # Import emulator components
 from psion_sdk import __version__
 from ..emulator import Emulator, EmulatorConfig
-from ..breakpoints import BreakEvent, BreakReason
 
 
 # =============================================================================
