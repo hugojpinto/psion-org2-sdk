@@ -1308,7 +1308,9 @@ _target:    RTS
             {nops}
 _target:    RTS
         """
-        asm = Assembler()
+        # Disable optimization - the NOPs after BRA would be removed as dead code
+        # by the optimizer, which would make the branch short again
+        asm = Assembler(optimize=False)
         result = asm.assemble(source)
         code = result[7:]
 
@@ -1333,7 +1335,9 @@ _subroutine:
             NOP
             RTS
         """
-        asm = Assembler()
+        # Disable optimization - the NOPs after RTS would be removed as dead code
+        # by the optimizer, which would make the subroutine call short again
+        asm = Assembler(optimize=False)
         result = asm.assemble(source)
         code = result[7:]
 
@@ -1357,7 +1361,9 @@ _subroutine:
             {nops}
 _target:    RTS
         """
-        asm = Assembler()
+        # Disable optimization - the NOPs after BRA would be removed as dead code
+        # by the optimizer, affecting the total distance calculation
+        asm = Assembler(optimize=False)
         result = asm.assemble(source)
         code = result[7:]
 

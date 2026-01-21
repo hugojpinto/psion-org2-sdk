@@ -14,24 +14,27 @@ Main Components
 - **Assembler**: Main assembler class that orchestrates the assembly process
 - **Lexer**: Tokenizes assembly source into tokens
 - **Parser**: Parses tokens into statements (instructions, directives, labels)
+- **PeepholeOptimizer**: Applies safe optimizations to instruction sequences
 - **CodeGenerator**: Generates object code from parsed statements
 - **ExpressionEvaluator**: Evaluates arithmetic expressions
 
 Assembly Process
 ----------------
-The assembler uses a two-pass algorithm:
+The assembler uses a three-stage pipeline:
 
-1. **Pass 1 (Symbol Collection)**:
-   - Scan all statements
-   - Calculate addresses for each instruction/data
-   - Build symbol table with label addresses
-   - Record forward references for later resolution
+1. **Parsing (Lexer + Parser)**:
+   - Tokenize source into lexical tokens
+   - Parse tokens into statements (instructions, directives, labels)
+   - Build abstract syntax tree (AST)
 
-2. **Pass 2 (Code Generation)**:
-   - Generate object code for each statement
-   - Resolve forward references using symbol table
-   - Calculate relative branch offsets
-   - Produce final binary output
+2. **Optimization (PeepholeOptimizer)** (optional, enabled by default):
+   - Apply safe peephole optimizations (e.g., LDAA #0 → CLRA)
+   - Eliminate redundant instruction sequences (e.g., PSHA/PULA pairs)
+   - Remove unreachable code after unconditional branches
+
+3. **Code Generation (CodeGenerator)** (two-pass):
+   - Pass 1: Symbol collection, address calculation, branch relaxation
+   - Pass 2: Generate object code, resolve forward references
 
 Example Usage
 -------------
@@ -61,6 +64,7 @@ Supported Features
 - Macros (MACRO/ENDM)
 - Conditional assembly (#IF, #IFDEF, #IFNDEF, #ELSE, #ENDIF)
 - Expressions with full operator support
+- Peephole optimization (optional, enabled by default)
 - Listing file generation
 - Symbol table output
 """
@@ -68,6 +72,11 @@ Supported Features
 from psion_sdk.assembler.assembler import Assembler, assemble, assemble_file
 from psion_sdk.assembler.lexer import Lexer, Token, TokenType
 from psion_sdk.assembler.parser import Parser, Statement, Instruction, Directive, LabelDef
+from psion_sdk.assembler.optimizer import (
+    PeepholeOptimizer,
+    OptimizationStats,
+    optimize_statements,
+)
 from psion_sdk.assembler.codegen import CodeGenerator
 from psion_sdk.cpu import (
     AddressingMode,
@@ -93,6 +102,10 @@ __all__ = [
     "Instruction",
     "Directive",
     "LabelDef",
+    # Optimizer
+    "PeepholeOptimizer",
+    "OptimizationStats",
+    "optimize_statements",
     # Code generator
     "CodeGenerator",
     # Opcodes

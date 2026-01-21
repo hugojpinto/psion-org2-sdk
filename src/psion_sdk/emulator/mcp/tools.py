@@ -42,6 +42,175 @@ def success_result(text: str) -> ToolResult:
     return ToolResult(content=text_content(text), is_error=False)
 
 
+# =============================================================================
+# Address/Value Parsing Utilities
+# =============================================================================
+# MCP clients may send numeric values in various formats:
+#   - Integer: 0x8100, 33024
+#   - String hex: "0x8100", "0X8100", "$8100"
+#   - String decimal: "33024"
+#
+# These utilities normalize values to Python integers with proper validation.
+# =============================================================================
+
+def parse_integer(
+    value: Any,
+    param_name: str,
+    min_val: int = 0,
+    max_val: int = 0xFFFF,
+    default: int = None
+) -> int:
+    """
+    Parse an integer value from various input formats.
+
+    Accepts:
+        - int: Used directly (e.g., 0x8100, 33024)
+        - str with "0x"/"0X" prefix: Hex string (e.g., "0x8100")
+        - str with "$" prefix: Assembly-style hex (e.g., "$8100")
+        - str decimal: Decimal string (e.g., "33024")
+        - None: Returns default if provided, raises otherwise
+
+    Args:
+        value: The input value to parse
+        param_name: Name of the parameter (for error messages)
+        min_val: Minimum allowed value (inclusive, default 0)
+        max_val: Maximum allowed value (inclusive, default 0xFFFF)
+        default: Default value if input is None (optional)
+
+    Returns:
+        The parsed integer value
+
+    Raises:
+        ValueError: If parsing fails or value is out of range
+
+    Examples:
+        >>> parse_integer(0x8100, "address")
+        33024
+        >>> parse_integer("0x8100", "address")
+        33024
+        >>> parse_integer("$8100", "address")
+        33024
+        >>> parse_integer("33024", "address")
+        33024
+        >>> parse_integer(None, "start", default=0)
+        0
+    """
+    # Handle None/missing values
+    if value is None:
+        if default is not None:
+            return default
+        raise ValueError(f"{param_name}: value required")
+
+    # Already an integer - use directly
+    if isinstance(value, int) and not isinstance(value, bool):
+        parsed = value
+    elif isinstance(value, str):
+        value = value.strip()
+        if not value:
+            if default is not None:
+                return default
+            raise ValueError(f"{param_name}: empty string")
+
+        try:
+            # Handle different string formats
+            if value.startswith(("0x", "0X")):
+                # Standard hex notation: "0x8100"
+                parsed = int(value, 16)
+            elif value.startswith("$"):
+                # Assembly-style hex notation: "$8100"
+                parsed = int(value[1:], 16)
+            else:
+                # Try decimal first, then hex as fallback
+                # This handles both "33024" and "8100" (if all hex digits)
+                try:
+                    parsed = int(value, 10)
+                except ValueError:
+                    # Try as hex without prefix (e.g., "8100", "FF")
+                    parsed = int(value, 16)
+        except ValueError as e:
+            raise ValueError(
+                f"{param_name}: cannot parse '{value}' as integer. "
+                f"Use decimal (33024) or hex (0x8100, $8100)"
+            ) from e
+    else:
+        raise ValueError(
+            f"{param_name}: expected integer or string, got {type(value).__name__}"
+        )
+
+    # Range validation
+    if not (min_val <= parsed <= max_val):
+        if max_val == 0xFF:
+            range_hint = "0-255 (0x00-0xFF)"
+        elif max_val == 0xFFFF:
+            range_hint = "0-65535 (0x0000-0xFFFF)"
+        else:
+            range_hint = f"{min_val}-{max_val}"
+        raise ValueError(
+            f"{param_name}: value ${parsed:04X} ({parsed}) out of range. "
+            f"Must be {range_hint}"
+        )
+
+    return parsed
+
+
+def parse_address(value: Any, param_name: str = "address", default: int = None) -> int:
+    """
+    Parse a 16-bit memory address from various input formats.
+
+    Convenience wrapper around parse_integer for address parameters.
+    Addresses are 16-bit values (0x0000 to 0xFFFF).
+
+    Args:
+        value: The input value to parse
+        param_name: Name of the parameter (for error messages)
+        default: Default value if input is None (optional)
+
+    Returns:
+        The parsed address as an integer (0-65535)
+
+    Raises:
+        ValueError: If parsing fails or value is out of range
+
+    Examples:
+        >>> parse_address(0x8100)
+        33024
+        >>> parse_address("0x8100")
+        33024
+        >>> parse_address("$8100")
+        33024
+    """
+    return parse_integer(value, param_name, min_val=0, max_val=0xFFFF, default=default)
+
+
+def parse_byte(value: Any, param_name: str = "value", default: int = None) -> int:
+    """
+    Parse an 8-bit byte value from various input formats.
+
+    Convenience wrapper around parse_integer for byte parameters.
+    Bytes are 8-bit values (0x00 to 0xFF).
+
+    Args:
+        value: The input value to parse
+        param_name: Name of the parameter (for error messages)
+        default: Default value if input is None (optional)
+
+    Returns:
+        The parsed byte as an integer (0-255)
+
+    Raises:
+        ValueError: If parsing fails or value is out of range
+
+    Examples:
+        >>> parse_byte(0x42)
+        66
+        >>> parse_byte("0x42")
+        66
+        >>> parse_byte("66")
+        66
+    """
+    return parse_integer(value, param_name, min_val=0, max_val=0xFF, default=default)
+
+
 def get_session_or_error(
     manager: SessionManager,
     session_id: str
@@ -911,22 +1080,29 @@ async def read_memory(
 
     Args:
         manager: Session manager
-        args: {"session_id": str, "address": int, "count": int}
+        args: {
+            "session_id": str,
+            "address": int|str,  # Accepts hex strings like "0x8100" or "$8100"
+            "count": int
+        }
 
     Returns:
         ToolResult with memory contents
     """
     session_id = args.get("session_id", "")
-    address = args.get("address", 0)
     count = args.get("count", 1)
 
     session, error = get_session_or_error(manager, session_id)
     if error:
         return error
 
-    # Validate
-    if not 0 <= address <= 0xFFFF:
-        return error_result(f"Address ${address:04X} out of range")
+    # Parse and validate address (supports hex strings like "0x8100" or "$8100")
+    try:
+        address = parse_address(args.get("address"), "address")
+    except ValueError as e:
+        return error_result(str(e))
+
+    # Validate count
     if count < 1 or count > 256:
         return error_result("Count must be 1-256")
 
@@ -961,28 +1137,35 @@ async def write_memory(
 
     Args:
         manager: Session manager
-        args: {"session_id": str, "address": int, "data": List[int]}
+        args: {
+            "session_id": str,
+            "address": int|str,  # Accepts hex strings like "0x8100" or "$8100"
+            "data": List[int]    # Byte values 0-255
+        }
 
     Returns:
         ToolResult indicating success
     """
     session_id = args.get("session_id", "")
-    address = args.get("address", 0)
     data = args.get("data", [])
 
     session, error = get_session_or_error(manager, session_id)
     if error:
         return error
 
-    # Validate
-    if not 0 <= address <= 0xFFFF:
-        return error_result(f"Address ${address:04X} out of range")
+    # Parse and validate address (supports hex strings like "0x8100" or "$8100")
+    try:
+        address = parse_address(args.get("address"), "address")
+    except ValueError as e:
+        return error_result(str(e))
+
+    # Validate data
     if not data:
         return error_result("No data specified")
     if len(data) > 256:
         return error_result("Maximum 256 bytes at once")
 
-    # Validate all values
+    # Validate all byte values
     for i, b in enumerate(data):
         if not isinstance(b, int) or not 0 <= b <= 255:
             return error_result(f"Invalid byte at index {i}: {b}")
@@ -1010,10 +1193,12 @@ async def search_memory(
         manager: Session manager
         args: {
             "session_id": str,
-            "pattern": List[int],  # Bytes to search for (0-255 each)
-            "start": int,          # Start address (default 0)
-            "end": int,            # End address (default 0xFFFF)
-            "max_results": int     # Maximum matches to return (default 20)
+            "pattern": List[int],   # Bytes to search for (0-255 each)
+            "start": int|str,       # Start address (default 0)
+                                    # Accepts hex strings: "0x8100", "$8100"
+            "end": int|str,         # End address (default 0xFFFF)
+                                    # Accepts hex strings: "0x8200", "$8200"
+            "max_results": int      # Maximum matches to return (default 20)
         }
 
     Returns:
@@ -1021,15 +1206,21 @@ async def search_memory(
     """
     session_id = args.get("session_id", "")
     pattern = args.get("pattern", [])
-    start = args.get("start", 0)
-    end = args.get("end", 0xFFFF)
     max_results = args.get("max_results", 20)
 
     session, error = get_session_or_error(manager, session_id)
     if error:
         return error
 
-    # Validate
+    # Parse and validate start/end addresses
+    # These support hex strings like "0x8100" or "$8100"
+    try:
+        start = parse_address(args.get("start"), "start", default=0)
+        end = parse_address(args.get("end"), "end", default=0xFFFF)
+    except ValueError as e:
+        return error_result(str(e))
+
+    # Validate pattern
     if not pattern:
         return error_result("No pattern specified")
     if len(pattern) > 64:
@@ -1040,12 +1231,11 @@ async def search_memory(
         if not isinstance(b, int) or not 0 <= b <= 255:
             return error_result(f"Invalid byte at index {i}: {b}")
 
-    if not 0 <= start <= 0xFFFF:
-        return error_result(f"Start address ${start:04X} out of range")
-    if not 0 <= end <= 0xFFFF:
-        return error_result(f"End address ${end:04X} out of range")
+    # Validate address range
     if start > end:
-        return error_result("Start must be <= end")
+        return error_result(
+            f"Start address (${start:04X}) must be <= end address (${end:04X})"
+        )
 
     try:
         emu = session.emulator
@@ -1113,18 +1303,19 @@ async def set_breakpoint(
         manager: Session manager
         args: {
             "session_id": str,
-            "type": str,       # "pc" (default), "read", or "write"
-            "address": int,    # Memory address (required)
+            "type": str,           # "pc" (default), "read", or "write"
+            "address": int|str,    # Memory address (required)
+                                   # Accepts hex strings: "0x8100", "$8100"
 
             # Optional condition - break only fires when condition is also true:
             "when_register": str,  # a, b, d, x, sp, pc, flag_c, flag_v, flag_z, flag_n
             "when_op": str,        # ==, !=, <, <=, >, >=, &
-            "when_value": int
+            "when_value": int|str  # Accepts hex strings for value
         }
 
     Examples:
-        - Simple: {type: "pc", address: 0x8000}
-        - Conditional: {type: "pc", address: 0x8000, when_register: "a", when_op: "==", when_value: 0x42}
+        - Simple: {type: "pc", address: "0x8000"}
+        - Conditional: {type: "pc", address: "$8000", when_register: "a", when_op: "==", when_value: "0x42"}
           → Break at $8000 only when A == 0x42
 
     Returns:
@@ -1132,24 +1323,32 @@ async def set_breakpoint(
     """
     session_id = args.get("session_id", "")
     bp_type = args.get("type", "pc").lower()
-    address = args.get("address", -1)
 
     session, error = get_session_or_error(manager, session_id)
     if error:
         return error
 
-    # Validate address
-    if address < 0 or address > 0xFFFF:
-        return error_result(f"Address required (0-65535)")
+    # Parse and validate address (supports hex strings like "0x8100" or "$8100")
+    try:
+        address = parse_address(args.get("address"), "address")
+    except ValueError as e:
+        return error_result(str(e))
 
     # Build optional condition
+    # The when_value parameter also supports hex strings for consistency
     condition = None
     when_register = args.get("when_register")
     when_op = args.get("when_op")
-    when_value = args.get("when_value")
+    raw_when_value = args.get("when_value")
 
-    if when_register and when_op and when_value is not None:
-        condition = (when_register, when_op, when_value)
+    if when_register and when_op and raw_when_value is not None:
+        try:
+            # Parse when_value as 16-bit (for registers like x, sp, pc, d)
+            # 8-bit registers (a, b, flags) will be masked by the breakpoint handler
+            when_value = parse_address(raw_when_value, "when_value")
+            condition = (when_register, when_op, when_value)
+        except ValueError as e:
+            return error_result(str(e))
 
     try:
         emu = session.emulator
@@ -1188,23 +1387,26 @@ async def remove_breakpoint(
         manager: Session manager
         args: {
             "session_id": str,
-            "address": int,    # Memory address (required)
-            "type": str        # "all" (default), "pc", "read", or "write"
+            "address": int|str,    # Memory address (required)
+                                   # Accepts hex strings: "0x8100", "$8100"
+            "type": str            # "all" (default), "pc", "read", or "write"
         }
 
     Returns:
         ToolResult indicating what was removed
     """
     session_id = args.get("session_id", "")
-    address = args.get("address", -1)
     bp_type = args.get("type", "all").lower()
 
     session, error = get_session_or_error(manager, session_id)
     if error:
         return error
 
-    if address < 0 or address > 0xFFFF:
-        return error_result("Address required (0-65535)")
+    # Parse and validate address (supports hex strings like "0x8100" or "$8100")
+    try:
+        address = parse_address(args.get("address"), "address")
+    except ValueError as e:
+        return error_result(str(e))
 
     try:
         emu = session.emulator
@@ -1581,7 +1783,8 @@ async def disassemble(
         manager: Session manager
         args: {
             "session_id": str,
-            "address": int,       # Starting address to disassemble
+            "address": int|str,   # Starting address to disassemble
+                                  # Accepts hex strings: "0x8100", "$8100"
             "count": int,         # Number of instructions (default: 16)
             "show_bytes": bool    # Include raw bytes in output (default: True)
         }
@@ -1590,7 +1793,6 @@ async def disassemble(
         ToolResult with disassembly listing
     """
     session_id = args.get("session_id", "")
-    address = args.get("address", -1)
     count = args.get("count", 16)
     show_bytes = args.get("show_bytes", True)
 
@@ -1598,9 +1800,13 @@ async def disassemble(
     if error:
         return error
 
-    # Validate
-    if address < 0 or address > 0xFFFF:
-        return error_result("Address required (0-65535)")
+    # Parse and validate address (supports hex strings like "0x8100" or "$8100")
+    try:
+        address = parse_address(args.get("address"), "address")
+    except ValueError as e:
+        return error_result(str(e))
+
+    # Validate count
     if count < 1 or count > 100:
         return error_result("Count must be 1-100")
 
@@ -1670,7 +1876,8 @@ async def disassemble_qcode(
         manager: Session manager
         args: {
             "session_id": str,
-            "address": int,       # Starting address
+            "address": int|str,   # Starting address
+                                  # Accepts hex strings: "0x8100", "$8100"
             "count": int,         # Number of opcodes (default: 16)
             "call_opl_mode": bool # Special formatting for _call_opl buffers
         }
@@ -1679,7 +1886,6 @@ async def disassemble_qcode(
         ToolResult with QCode disassembly
     """
     session_id = args.get("session_id", "")
-    address = args.get("address", -1)
     count = args.get("count", 16)
     call_opl_mode = args.get("call_opl_mode", False)
 
@@ -1687,9 +1893,13 @@ async def disassemble_qcode(
     if error:
         return error
 
-    # Validate
-    if address < 0 or address > 0xFFFF:
-        return error_result("Address required (0-65535)")
+    # Parse and validate address (supports hex strings like "0x8100" or "$8100")
+    try:
+        address = parse_address(args.get("address"), "address")
+    except ValueError as e:
+        return error_result(str(e))
+
+    # Validate count
     if count < 1 or count > 100:
         return error_result("Count must be 1-100")
 
@@ -1752,9 +1962,10 @@ async def run_with_trace(
         manager: Session manager
         args: {
             "session_id": str,
-            "max_cycles": int,       # Max cycles to run (default: 100000)
-            "trace_depth": int,      # Instructions to keep in trace (default: 50)
-            "stop_address": int,     # Optional: stop when PC reaches this address
+            "max_cycles": int,        # Max cycles to run (default: 100000)
+            "trace_depth": int,       # Instructions to keep in trace (default: 50)
+            "stop_address": int|str,  # Optional: stop when PC reaches this address
+                                      # Accepts hex strings: "0x8100", "$8100"
             "include_registers": bool # Include full registers in trace (default: False)
         }
 
@@ -1764,12 +1975,20 @@ async def run_with_trace(
     session_id = args.get("session_id", "")
     max_cycles = args.get("max_cycles", 100_000)
     trace_depth = args.get("trace_depth", 50)
-    stop_address = args.get("stop_address", None)
+    raw_stop_address = args.get("stop_address", None)
     include_registers = args.get("include_registers", False)
 
     session, error = get_session_or_error(manager, session_id)
     if error:
         return error
+
+    # Parse optional stop_address (supports hex strings like "0x8100" or "$8100")
+    stop_address = None
+    if raw_stop_address is not None:
+        try:
+            stop_address = parse_address(raw_stop_address, "stop_address")
+        except ValueError as e:
+            return error_result(str(e))
 
     # Validate
     if trace_depth < 1 or trace_depth > 1000:
@@ -1893,12 +2112,13 @@ async def set_registers(
         manager: Session manager
         args: {
             "session_id": str,
-            "a": int,     # Optional: Set A register (0-255)
-            "b": int,     # Optional: Set B register (0-255)
-            "d": int,     # Optional: Set D register (0-65535), overrides a/b
-            "x": int,     # Optional: Set X register (0-65535)
-            "sp": int,    # Optional: Set SP register (0-65535)
-            "pc": int     # Optional: Set PC register (0-65535)
+            "a": int|str,     # Optional: Set A register (0-255)
+                              # Accepts hex strings: "0x42", "$42"
+            "b": int|str,     # Optional: Set B register (0-255)
+            "d": int|str,     # Optional: Set D register (0-65535), overrides a/b
+            "x": int|str,     # Optional: Set X register (0-65535)
+            "sp": int|str,    # Optional: Set SP register (0-65535)
+            "pc": int|str     # Optional: Set PC register (0-65535)
         }
 
     Returns:
@@ -1916,47 +2136,55 @@ async def set_registers(
         changes = []
 
         # Set D first (if specified) since it sets both A and B
+        # parse_address handles 16-bit values, parse_byte handles 8-bit
         if "d" in args:
-            d_val = args["d"]
-            if not 0 <= d_val <= 0xFFFF:
-                return error_result("D must be 0-65535")
+            try:
+                d_val = parse_address(args["d"], "d")
+            except ValueError as e:
+                return error_result(str(e))
             cpu.a = (d_val >> 8) & 0xFF
             cpu.b = d_val & 0xFF
             changes.append(f"D=${d_val:04X} (A=${cpu.a:02X}, B=${cpu.b:02X})")
 
-        # Set individual registers
+        # Set individual 8-bit registers
         if "a" in args and "d" not in args:
-            a_val = args["a"]
-            if not 0 <= a_val <= 0xFF:
-                return error_result("A must be 0-255")
+            try:
+                a_val = parse_byte(args["a"], "a")
+            except ValueError as e:
+                return error_result(str(e))
             cpu.a = a_val
             changes.append(f"A=${a_val:02X}")
 
         if "b" in args and "d" not in args:
-            b_val = args["b"]
-            if not 0 <= b_val <= 0xFF:
-                return error_result("B must be 0-255")
+            try:
+                b_val = parse_byte(args["b"], "b")
+            except ValueError as e:
+                return error_result(str(e))
             cpu.b = b_val
             changes.append(f"B=${b_val:02X}")
 
+        # Set 16-bit registers
         if "x" in args:
-            x_val = args["x"]
-            if not 0 <= x_val <= 0xFFFF:
-                return error_result("X must be 0-65535")
+            try:
+                x_val = parse_address(args["x"], "x")
+            except ValueError as e:
+                return error_result(str(e))
             cpu.x = x_val
             changes.append(f"X=${x_val:04X}")
 
         if "sp" in args:
-            sp_val = args["sp"]
-            if not 0 <= sp_val <= 0xFFFF:
-                return error_result("SP must be 0-65535")
+            try:
+                sp_val = parse_address(args["sp"], "sp")
+            except ValueError as e:
+                return error_result(str(e))
             cpu.sp = sp_val
             changes.append(f"SP=${sp_val:04X}")
 
         if "pc" in args:
-            pc_val = args["pc"]
-            if not 0 <= pc_val <= 0xFFFF:
-                return error_result("PC must be 0-65535")
+            try:
+                pc_val = parse_address(args["pc"], "pc")
+            except ValueError as e:
+                return error_result(str(e))
             cpu.pc = pc_val
             changes.append(f"PC=${pc_val:04X}")
 
@@ -1999,7 +2227,8 @@ async def run_until_address(
         manager: Session manager
         args: {
             "session_id": str,
-            "address": int,       # Target PC address
+            "address": int|str,   # Target PC address
+                                  # Accepts hex strings: "0x8100", "$8100"
             "max_cycles": int     # Max cycles before timeout (default: 1000000)
         }
 
@@ -2007,16 +2236,17 @@ async def run_until_address(
         ToolResult indicating if address was reached
     """
     session_id = args.get("session_id", "")
-    address = args.get("address", -1)
     max_cycles = args.get("max_cycles", 1_000_000)
 
     session, error = get_session_or_error(manager, session_id)
     if error:
         return error
 
-    # Validate
-    if address < 0 or address > 0xFFFF:
-        return error_result("Address required (0-65535)")
+    # Parse and validate address (supports hex strings like "0x8100" or "$8100")
+    try:
+        address = parse_address(args.get("address"), "address")
+    except ValueError as e:
+        return error_result(str(e))
 
     try:
         emu = session.emulator

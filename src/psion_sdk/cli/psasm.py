@@ -94,6 +94,13 @@ from psion_sdk.errors import PsionError
          "See dev_docs/TARGET_MODELS.md for details.",
 )
 @click.option(
+    "-O", "--optimize/--no-optimize",
+    default=True,
+    help="Enable/disable peephole optimization. Default: enabled. "
+         "Optimizations include: LDAA #0→CLRA, ADDA #1→INCA, removing "
+         "redundant push/pull pairs, etc.",
+)
+@click.option(
     "-v", "--verbose",
     is_flag=True,
     help="Verbose output",
@@ -110,6 +117,7 @@ def main(
     define: tuple[str, ...],
     relocatable: bool,
     model: Optional[str],
+    optimize: bool,
     verbose: bool,
 ) -> None:
     """
@@ -151,7 +159,8 @@ def main(
     asm = Assembler(
         verbose=verbose,
         relocatable=relocatable,
-        target_model=model.upper() if model else None
+        target_model=model.upper() if model else None,
+        optimize=optimize,
     )
 
     if verbose:
@@ -159,6 +168,10 @@ def main(
         click.echo(f"Target model: {target}")
         if relocatable:
             click.echo("Relocatable mode enabled: output will include self-relocating stub")
+        if optimize:
+            click.echo("Peephole optimization: enabled")
+        else:
+            click.echo("Peephole optimization: disabled")
 
     # Add include paths
     for inc_path in include:
@@ -240,6 +253,11 @@ def main(
                 table_size = 2 + (2 * fixup_count)
                 overhead = stub_size + table_size
                 click.echo(f"Relocation: {fixup_count} fixups, {overhead} bytes overhead")
+
+            # Print optimization stats if available
+            opt_stats = asm.get_optimization_stats()
+            if opt_stats and opt_stats.total_optimizations > 0:
+                click.echo(f"Optimizations: {opt_stats.total_optimizations} applied in {opt_stats.total_passes} pass(es)")
 
     except PsionError as e:
         click.echo(f"Error: {e}", err=True)

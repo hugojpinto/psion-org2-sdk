@@ -603,3 +603,276 @@ class TestMCPServer:
         })
 
         assert response is None
+
+
+# =============================================================================
+# Address/Value Parsing Tests
+# =============================================================================
+# These tests verify the flexible address parsing utilities that allow
+# MCP clients to pass addresses as integers or hex strings.
+# =============================================================================
+
+class TestAddressParsing:
+    """Test address and value parsing utilities."""
+
+    def test_parse_integer_int(self):
+        """Integer values pass through."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        assert parse_integer(0x8100, "addr") == 0x8100
+        assert parse_integer(33024, "addr") == 33024
+        assert parse_integer(0, "addr") == 0
+        assert parse_integer(65535, "addr") == 65535
+
+    def test_parse_integer_hex_string(self):
+        """Hex strings with 0x prefix are parsed."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        assert parse_integer("0x8100", "addr") == 0x8100
+        assert parse_integer("0X8100", "addr") == 0x8100
+        assert parse_integer("0x0", "addr") == 0
+        assert parse_integer("0xFFFF", "addr") == 0xFFFF
+        assert parse_integer("0xff", "addr") == 0xFF
+
+    def test_parse_integer_assembly_hex(self):
+        """Assembly-style hex strings with $ prefix are parsed."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        assert parse_integer("$8100", "addr") == 0x8100
+        assert parse_integer("$0", "addr") == 0
+        assert parse_integer("$FFFF", "addr") == 0xFFFF
+        assert parse_integer("$ff", "addr") == 0xFF
+
+    def test_parse_integer_decimal_string(self):
+        """Decimal strings are parsed."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        assert parse_integer("33024", "addr") == 33024
+        assert parse_integer("0", "addr") == 0
+        assert parse_integer("65535", "addr") == 65535
+
+    def test_parse_integer_with_whitespace(self):
+        """Whitespace is stripped from strings."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        assert parse_integer("  0x8100  ", "addr") == 0x8100
+        assert parse_integer(" $8100 ", "addr") == 0x8100
+        assert parse_integer(" 33024 ", "addr") == 33024
+
+    def test_parse_integer_default(self):
+        """Default value is returned for None."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        assert parse_integer(None, "addr", default=0) == 0
+        assert parse_integer(None, "addr", default=0xFFFF) == 0xFFFF
+
+    def test_parse_integer_none_no_default(self):
+        """ValueError for None without default."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        with pytest.raises(ValueError, match="value required"):
+            parse_integer(None, "addr")
+
+    def test_parse_integer_empty_string(self):
+        """Empty string uses default or raises."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        assert parse_integer("", "addr", default=0) == 0
+        with pytest.raises(ValueError, match="empty string"):
+            parse_integer("", "addr")
+
+    def test_parse_integer_out_of_range(self):
+        """Out of range values raise ValueError."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        with pytest.raises(ValueError, match="out of range"):
+            parse_integer(0x10000, "addr")
+        with pytest.raises(ValueError, match="out of range"):
+            parse_integer(-1, "addr")
+        with pytest.raises(ValueError, match="out of range"):
+            parse_integer("0x10000", "addr")
+
+    def test_parse_integer_invalid_string(self):
+        """Invalid strings raise ValueError."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        with pytest.raises(ValueError, match="cannot parse"):
+            parse_integer("not_a_number", "addr")
+        with pytest.raises(ValueError, match="cannot parse"):
+            parse_integer("$GHI", "addr")  # Invalid hex digits
+
+    def test_parse_integer_wrong_type(self):
+        """Wrong types raise ValueError."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        with pytest.raises(ValueError, match="expected integer or string"):
+            parse_integer([1, 2, 3], "addr")
+        with pytest.raises(ValueError, match="expected integer or string"):
+            parse_integer({"value": 100}, "addr")
+
+    def test_parse_integer_bool_rejected(self):
+        """Boolean values are rejected (not treated as int)."""
+        from psion_sdk.emulator.mcp.tools import parse_integer
+        # In Python, bool is a subclass of int, but we explicitly reject it
+        with pytest.raises(ValueError, match="expected integer or string"):
+            parse_integer(True, "addr")
+        with pytest.raises(ValueError, match="expected integer or string"):
+            parse_integer(False, "addr")
+
+    def test_parse_address(self):
+        """parse_address is a convenience wrapper."""
+        from psion_sdk.emulator.mcp.tools import parse_address
+        assert parse_address(0x8100) == 0x8100
+        assert parse_address("0x8100") == 0x8100
+        assert parse_address("$8100") == 0x8100
+        assert parse_address(None, default=0) == 0
+
+    def test_parse_byte(self):
+        """parse_byte handles 8-bit values."""
+        from psion_sdk.emulator.mcp.tools import parse_byte
+        assert parse_byte(0x42) == 0x42
+        assert parse_byte("0x42") == 0x42
+        assert parse_byte("$42") == 0x42
+        assert parse_byte("66") == 66
+
+    def test_parse_byte_out_of_range(self):
+        """parse_byte rejects values > 255."""
+        from psion_sdk.emulator.mcp.tools import parse_byte
+        with pytest.raises(ValueError, match="out of range"):
+            parse_byte(256)
+        with pytest.raises(ValueError, match="out of range"):
+            parse_byte("0x100")
+
+
+class TestSearchMemoryWithHexStrings:
+    """Test search_memory specifically with hex string inputs."""
+
+    @pytest.mark.asyncio
+    async def test_search_memory_hex_string_addresses(self, session_manager, temp_rom):
+        """search_memory accepts hex string addresses (fixes original bug)."""
+        session = session_manager.create_session(rom_path=temp_rom)
+
+        # Write a pattern to RAM (0x400 is in RAM)
+        session.emulator.write_bytes(0x400, bytes([0x41, 0x42, 0x43]))
+
+        # Search using hex string addresses - this was the original bug
+        result = await tools.search_memory(
+            session_manager,
+            {
+                "session_id": session.session_id,
+                "pattern": [0x41, 0x42, 0x43],
+                "start": "0x400",  # Hex string
+                "end": "0x500"     # Hex string
+            }
+        )
+
+        # Should succeed without "not supported between" error
+        assert result.is_error is False
+        assert "$0400" in result.content[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_search_memory_assembly_hex_addresses(self, session_manager, temp_rom):
+        """search_memory accepts assembly-style hex addresses."""
+        session = session_manager.create_session(rom_path=temp_rom)
+
+        # Write a pattern to RAM (0x500 is in RAM, 0x8100+ is ROM in test fixture)
+        session.emulator.write_bytes(0x500, bytes([0xDE, 0xAD]))
+
+        result = await tools.search_memory(
+            session_manager,
+            {
+                "session_id": session.session_id,
+                "pattern": [0xDE, 0xAD],
+                "start": "$500",   # Assembly-style hex
+                "end": "$600"
+            }
+        )
+
+        assert result.is_error is False
+        assert "Found" in result.content[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_search_memory_invalid_hex(self, session_manager, temp_rom):
+        """search_memory returns error for invalid hex strings."""
+        session = session_manager.create_session(rom_path=temp_rom)
+
+        result = await tools.search_memory(
+            session_manager,
+            {
+                "session_id": session.session_id,
+                "pattern": [0x41],
+                "start": "invalid_hex",
+                "end": "0x8200"
+            }
+        )
+
+        assert result.is_error is True
+        assert "cannot parse" in result.content[0]["text"]
+
+
+class TestReadMemoryWithHexStrings:
+    """Test read_memory with hex string addresses."""
+
+    @pytest.mark.asyncio
+    async def test_read_memory_hex_string(self, session_manager, temp_rom):
+        """read_memory accepts hex string addresses."""
+        session = session_manager.create_session(rom_path=temp_rom)
+        session.emulator.write_byte(0x500, 0x42)
+
+        result = await tools.read_memory(
+            session_manager,
+            {
+                "session_id": session.session_id,
+                "address": "0x500",  # Hex string
+                "count": 1
+            }
+        )
+
+        assert result.is_error is False
+        assert "42" in result.content[0]["text"]
+
+
+class TestBreakpointWithHexStrings:
+    """Test breakpoint functions with hex string addresses."""
+
+    @pytest.mark.asyncio
+    async def test_set_breakpoint_hex_string(self, session_manager, temp_rom):
+        """set_breakpoint accepts hex string addresses."""
+        session = session_manager.create_session(rom_path=temp_rom)
+
+        result = await tools.set_breakpoint(
+            session_manager,
+            {
+                "session_id": session.session_id,
+                "address": "0x8100",  # Hex string
+                "type": "pc"
+            }
+        )
+
+        assert result.is_error is False
+        assert "$8100" in result.content[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_set_breakpoint_with_hex_condition(self, session_manager, temp_rom):
+        """set_breakpoint accepts hex string for when_value."""
+        session = session_manager.create_session(rom_path=temp_rom)
+
+        result = await tools.set_breakpoint(
+            session_manager,
+            {
+                "session_id": session.session_id,
+                "address": "$8000",  # Assembly-style hex
+                "type": "pc",
+                "when_register": "a",
+                "when_op": "==",
+                "when_value": "0x42"  # Hex string for condition
+            }
+        )
+
+        assert result.is_error is False
+        assert "when a == 66" in result.content[0]["text"]  # 0x42 = 66 decimal
+
+    @pytest.mark.asyncio
+    async def test_remove_breakpoint_hex_string(self, session_manager, temp_rom):
+        """remove_breakpoint accepts hex string addresses."""
+        session = session_manager.create_session(rom_path=temp_rom)
+        session.emulator.add_breakpoint(0x8100)
+
+        result = await tools.remove_breakpoint(
+            session_manager,
+            {
+                "session_id": session.session_id,
+                "address": "0x8100"  # Hex string
+            }
+        )
+
+        assert result.is_error is False

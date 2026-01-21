@@ -407,10 +407,31 @@ class CParser:
         return None
 
     # =========================================================================
+    # PARAMETER LIMIT CONFIGURATION
+    # =========================================================================
     # Maximum parameters allowed for external OPL procedure declarations.
-    # This limit ensures the QCode buffer fits in the allocated cell memory.
-    # Each integer parameter adds 3 bytes to the buffer ($22 HH LL).
-    # With 4 params: 4*3=12 + 2(count) + 10(name) + 7(restore) = 31 bytes.
+    # OPL supports up to 16 parameters, but the QCode buffer size limits this.
+    #
+    # TO INCREASE THE LIMIT:
+    #   1. Change MAX_EXTERNAL_PARAMS below
+    #   2. Change _COL_MAX_PARAMS in include/runtime.inc to match
+    #   3. The runtime buffer will adjust automatically via EQUs
+    #
+    # BUFFER SIZE CALCULATION:
+    #   Each parameter requires 5 bytes in the QCode buffer:
+    #     - $22 HH LL  (3 bytes) - PUSHWORD to push the value
+    #     - $20 $00    (2 bytes) - PUSHBYTE type marker (0 = integer)
+    #
+    #   Fixed overhead: 19 bytes (count + proc_call + restore + SP + USR)
+    #
+    #   Formula: buffer_size = (max_params * 5) + 19
+    #
+    #   Examples:
+    #     4 params:  4*5 + 19 =  39 bytes (current, cell = 49 bytes)
+    #     8 params:  8*5 + 19 =  59 bytes (cell = 69 bytes)
+    #    16 params: 16*5 + 19 =  99 bytes (cell = 113 bytes)
+    #
+    # >>> CHANGE THIS VALUE TO INCREASE PARAMETER LIMIT <<<
     # =========================================================================
     MAX_EXTERNAL_PARAMS = 4
 
@@ -439,8 +460,9 @@ class CParser:
 
         Parameter Constraints:
         - Only integer parameters are supported (int, char promoted to int)
-        - Maximum 4 parameters (buffer size limitation)
+        - Maximum MAX_EXTERNAL_PARAMS parameters (see class constant above)
         - Parameters are passed via QCode opcodes that push onto language stack
+        - To increase the limit, see PARAMETER LIMIT CONFIGURATION above
 
         How Parameters Work:
         - C code evaluates each parameter expression to a 16-bit value
@@ -552,7 +574,8 @@ class CParser:
                 f"external procedures support at most {self.MAX_EXTERNAL_PARAMS} parameters, "
                 f"got {len(parameters)}",
                 location,
-                hint="OPL QCode buffer size limits the number of parameters",
+                hint=f"To increase the {self.MAX_EXTERNAL_PARAMS}-parameter limit (OPL supports up to 16), "
+                     "change MAX_EXTERNAL_PARAMS in parser.py and _COL_MAX_PARAMS in runtime.inc",
             )
 
         for param in parameters:

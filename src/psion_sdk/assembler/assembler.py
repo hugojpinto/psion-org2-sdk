@@ -3,8 +3,8 @@ HD6303 Assembler - Main Interface
 ==================================
 
 This module provides the main Assembler class, which is the primary interface
-for assembling HD6303 source code. It coordinates the lexer, parser, and
-code generator to produce Psion-compatible object code.
+for assembling HD6303 source code. It coordinates the lexer, parser, optimizer,
+and code generator to produce Psion-compatible object code.
 
 Example Usage
 -------------
@@ -41,6 +41,8 @@ Options:
     -s, --symbols FILE     Generate symbol file
     -I, --include PATH     Add include search path
     -D, --define SYM=VAL   Pre-define symbol
+    -O, --optimize         Enable peephole optimization (default: enabled)
+    --no-optimize          Disable peephole optimization
     -v, --verbose          Verbose output
 """
 
@@ -49,6 +51,7 @@ from typing import Optional
 
 from psion_sdk.assembler.parser import parse_source
 from psion_sdk.assembler.codegen import CodeGenerator
+from psion_sdk.assembler.optimizer import PeepholeOptimizer, OptimizationStats
 from psion_sdk.errors import AssemblerError
 
 
@@ -65,12 +68,14 @@ class Assembler:
     - Include files
     - Macros
     - Conditional assembly
+    - Peephole optimization (enabled by default)
     - Multiple output formats (OB3, listing, symbols)
     - Target model specification (CM, XP, LA, LZ, LZ64)
 
     Attributes:
         verbose: If True, print progress messages
         target_model: Target Psion model (CM, XP, LA, LZ, LZ64)
+        optimize: If True (default), apply peephole optimizations
     """
 
     # =========================================================================
@@ -117,7 +122,8 @@ class Assembler:
                  include_paths: list[str | Path] | None = None,
                  defines: dict[str, int] | None = None,
                  relocatable: bool = False,
-                 target_model: str | None = None):
+                 target_model: str | None = None,
+                 optimize: bool = True):
         """
         Initialize the assembler.
 
@@ -130,12 +136,18 @@ class Assembler:
             target_model: Target Psion model (CM, XP, LA, LZ, LZ64).
                          If None, defaults to XP. Can be overridden by .MODEL
                          directive in source code, but CLI flag takes precedence.
+            optimize: Enable peephole optimization (default: True). Applies safe
+                     optimizations like converting LDAA #0 to CLRA, eliminating
+                     redundant push/pull pairs, etc. Disable for debugging or
+                     when exact instruction sequences must be preserved.
         """
         self._verbose = verbose
         self._relocatable = relocatable
+        self._optimize = optimize
         self._include_paths: list[Path] = []
         self._defines: dict[str, int] = {}
         self._source_file: Optional[Path] = None
+        self._opt_stats: Optional[OptimizationStats] = None  # Last optimization stats
 
         # Target model handling:
         # - _initial_model: Model specified via constructor (from CLI)
@@ -325,6 +337,11 @@ class Assembler:
         """
         Assemble source code from a string.
 
+        The assembly pipeline is:
+        1. Parse source into statements (lexer -> parser)
+        2. Optimize statements if enabled (peephole optimizer)
+        3. Generate code (code generator)
+
         Args:
             source: Assembly source code
             filename: Virtual filename for error messages
@@ -343,6 +360,17 @@ class Assembler:
 
         if self._verbose:
             print(f"Parsed {len(statements)} statements")
+
+        # Optimize statements if enabled
+        if self._optimize:
+            optimizer = PeepholeOptimizer(enabled=True, verbose=self._verbose)
+            statements = optimizer.optimize(statements)
+            self._opt_stats = optimizer.stats
+
+            if self._verbose and self._opt_stats.total_optimizations > 0:
+                print(f"Applied {self._opt_stats.total_optimizations} optimizations")
+        else:
+            self._opt_stats = None
 
         # Generate code
         code = self._codegen.generate(statements)
@@ -432,6 +460,25 @@ class Assembler:
             True if generating self-relocating code
         """
         return self._relocatable
+
+    def is_optimizing(self) -> bool:
+        """
+        Check if optimization is enabled.
+
+        Returns:
+            True if peephole optimization is enabled
+        """
+        return self._optimize
+
+    def get_optimization_stats(self) -> Optional[OptimizationStats]:
+        """
+        Get statistics from the last optimization pass.
+
+        Returns:
+            OptimizationStats object with counts of each optimization type,
+            or None if no assembly has been performed or optimization is disabled.
+        """
+        return self._opt_stats
 
     def get_fixup_count(self) -> int:
         """
@@ -553,13 +600,14 @@ class Assembler:
 # Convenience Functions
 # =============================================================================
 
-def assemble(source: str, filename: str = "<input>") -> bytes:
+def assemble(source: str, filename: str = "<input>", optimize: bool = True) -> bytes:
     """
     Convenience function to assemble source code.
 
     Args:
         source: Assembly source code
         filename: Virtual filename for errors
+        optimize: Enable peephole optimization (default: True)
 
     Returns:
         Generated object code
@@ -567,16 +615,17 @@ def assemble(source: str, filename: str = "<input>") -> bytes:
     Raises:
         AssemblerError: If assembly fails
     """
-    asm = Assembler()
+    asm = Assembler(optimize=optimize)
     return asm.assemble_string(source, filename)
 
 
-def assemble_file(filepath: str | Path) -> bytes:
+def assemble_file(filepath: str | Path, optimize: bool = True) -> bytes:
     """
     Convenience function to assemble a file.
 
     Args:
         filepath: Path to source file
+        optimize: Enable peephole optimization (default: True)
 
     Returns:
         Generated object code
@@ -584,5 +633,5 @@ def assemble_file(filepath: str | Path) -> bytes:
     Raises:
         AssemblerError: If assembly fails
     """
-    asm = Assembler()
+    asm = Assembler(optimize=optimize)
     return asm.assemble_file(filepath)

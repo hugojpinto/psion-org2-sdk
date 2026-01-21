@@ -3078,26 +3078,67 @@ _call_opl_asm_build:
 ; The cell stores all data needed for external OPL procedure calls. It must
 ; survive stack unwinding and OPL execution.
 ;
-; EXTENDED in v2.0 to support parameterized external procedure calls.
-; With up to 4 parameters (max supported), the QCode buffer needs:
-;   - 4 params * 3 bytes ($22 HH LL) = 12 bytes
-;   - param count push: 2 bytes ($20 NN)
-;   - proc call: 10 bytes max ($7D len name[8])
-;   - restore addr: 3 bytes ($22 HH LL)
-;   - saved SP: 3 bytes ($22 HH LL)
-;   - USR opcode: 1 byte ($9F)
-;   Total: 31 bytes (rounded up to 36 for safety)
+; =============================================================================
+; PARAMETER LIMIT CONFIGURATION
+; =============================================================================
+; To increase the maximum number of external OPL parameters:
 ;
+;   1. Change _COL_MAX_PARAMS below (OPL supports up to 16)
+;   2. Update MAX_EXTERNAL_PARAMS in src/psion_sdk/smallc/parser.py to match
+;   3. The buffer size and cell layout will adjust automatically via EQUs
+;
+; BUFFER SIZE CALCULATION:
+;   Each parameter requires 5 bytes in the QCode buffer:
+;     - $22 HH LL  (3 bytes) - PUSHWORD to push the value
+;     - $20 $00    (2 bytes) - PUSHBYTE type marker (0 = integer)
+;
+;   Fixed overhead (19 bytes):
+;     - param count:  2 bytes ($20 NN)
+;     - proc call:   10 bytes ($7D len name[8] - max 8-char name)
+;     - restore addr: 3 bytes ($22 HH LL)
+;     - saved SP:     3 bytes ($22 HH LL)
+;     - USR opcode:   1 byte  ($9F)
+;
+;   Formula: buffer_size = (max_params * 5) + 19
+;
+;   Examples:
+;     4 params:  4*5 + 19 =  39 bytes -> use 40
+;     8 params:  8*5 + 19 =  59 bytes -> use 64
+;    16 params: 16*5 + 19 =  99 bytes -> use 100
+;
+; MEMORY IMPACT:
+;   Cell is allocated via AL$GRAB only when external calls are used.
+;   Current config (4 params): 49 bytes per cell
+;   With 16 params: would be 113 bytes per cell
+;   This is negligible on 32KB machines since only one cell is active at a time.
+;
+; =============================================================================
+
+; Maximum external OPL parameters supported (OPL allows up to 16)
+; >>> CHANGE THIS VALUE TO INCREASE PARAMETER LIMIT <<<
+_COL_MAX_PARAMS EQU     4
+
+; Bytes per parameter in QCode buffer (PUSHWORD + type marker)
+_COL_BYTES_PER_PARAM    EQU     5       ; $22 HH LL $20 $00
+
+; Fixed overhead in QCode buffer (count + proc + restore + SP + USR)
+_COL_BUF_OVERHEAD       EQU     19      ; See calculation above
+
+; Buffer size calculation (with padding for safety)
+; For 4 params: 4*5 + 19 = 39, rounded to 40
+_COL_BUF_SIZE   EQU     (_COL_MAX_PARAMS * _COL_BYTES_PER_PARAM) + _COL_BUF_OVERHEAD + 1
+
+; Cell field offsets (derived from above constants)
 _COL_NAME_PTR   EQU     0       ; Pointer to procedure name string (2B)
 _COL_SAVED_SP   EQU     2       ; Saved SP for stack restoration (2B)
 _COL_USR_SP     EQU     4       ; USR() entry SP for unwinding (2B)
 _COL_NAMELEN    EQU     6       ; Procedure name length 1-8 (1B)
 _COL_IDX        EQU     7       ; Buffer write index (1B)
-_COL_PARAM_CNT  EQU     8       ; Parameter count for param calls 0-4 (1B)
-_COL_BUF        EQU     9       ; Buffer for synthesized QCode (36B)
-_COL_RESUME     EQU     45      ; Resume address after OPL call (2B)
-_COL_FRAME_PTR  EQU     47      ; Saved frame pointer (caller's X) (2B)
-_COL_SIZE       EQU     49      ; Total cell size
+_COL_PARAM_CNT  EQU     8       ; Parameter count for param calls (1B)
+_COL_BUF        EQU     9       ; Buffer for synthesized QCode
+_COL_RESUME     EQU     _COL_BUF + _COL_BUF_SIZE        ; Resume address (2B)
+_COL_FRAME_PTR  EQU     _COL_RESUME + 2                 ; Saved frame pointer (2B)
+_COL_SIZE       EQU     _COL_FRAME_PTR + 2              ; Total cell size
 
 ; -----------------------------------------------------------------------------
 ; Compatibility Symbols (point to cell offsets for documentation)

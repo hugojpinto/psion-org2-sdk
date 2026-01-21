@@ -1094,11 +1094,34 @@ class TestExternalKeyword:
         assert len(func.parameters) == 4
 
     def test_external_with_too_many_parameters_error(self):
-        """External with more than 4 parameters should raise error."""
+        """External with more than MAX_EXTERNAL_PARAMS parameters should raise error with helpful message."""
         source = "external void FUNC(int a, int b, int c, int d, int e);"
         with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
             parse_source(source)
-        assert "4" in str(exc_info.value)  # Should mention the limit
+        error_msg = str(exc_info.value)
+        # Should mention the current limit
+        assert "4" in error_msg
+        # Should mention how many were provided
+        assert "5" in error_msg or "got 5" in error_msg
+        # Should hint at how to increase the limit
+        assert "MAX_EXTERNAL_PARAMS" in error_msg
+        assert "runtime.inc" in error_msg
+
+    def test_external_with_exactly_max_parameters_succeeds(self):
+        """External with exactly MAX_EXTERNAL_PARAMS (4) parameters should succeed."""
+        source = "external void FUNC(int a, int b, int c, int d);"
+        ast = parse_source(source)
+        assert len(ast.declarations) == 1
+        func = ast.declarations[0]
+        assert len(func.parameters) == 4
+
+    def test_external_with_one_over_max_parameters_fails(self):
+        """External with MAX_EXTERNAL_PARAMS + 1 parameters should fail."""
+        # This tests the boundary condition
+        source = "external void FUNC(int a, int b, int c, int d, int e);"
+        with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
+            parse_source(source)
+        assert "at most 4" in str(exc_info.value)
 
     def test_external_with_pointer_parameter_error(self):
         """External with pointer parameter should raise error."""
@@ -1755,3 +1778,109 @@ class TestFloatSupportConditional:
         gen = CodeGenerator(has_float_support=False)
         asm = gen.generate(ast)
         assert 'INCLUDE "fpruntime.inc"' not in asm
+
+
+# =============================================================================
+# 8-bit Boolean Test Optimization Tests
+# =============================================================================
+
+class TestBooleanTestOptimization:
+    """Tests for 8-bit boolean test optimization (TSTB vs SUBD #0)."""
+
+    def test_char_variable_uses_tstb(self):
+        """Char variable in if condition should use TSTB (1 byte) instead of SUBD #0 (3 bytes)."""
+        source = "void main() { char c; c = 65; if (c) { } }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+        # After loading char (LDAB + CLRA), boolean test should use TSTB
+        assert "TSTB" in asm
+        # Should NOT use SUBD #0 for the char boolean test
+        # (Note: The main boolean test for the if condition should be TSTB)
+        lines = asm.split('\n')
+        # Find the if condition comment and check next few lines
+        for i, line in enumerate(lines):
+            if "if condition" in line:
+                # Check lines after if condition
+                chunk = '\n'.join(lines[i:i+10])
+                assert "TSTB" in chunk, f"Expected TSTB in: {chunk}"
+                break
+
+    def test_int_variable_uses_subd(self):
+        """Int variable in if condition should use SUBD #0."""
+        source = "void main() { int n; n = 42; if (n) { } }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+        # After loading int (LDD), boolean test should use SUBD #0
+        lines = asm.split('\n')
+        for i, line in enumerate(lines):
+            if "if condition" in line:
+                chunk = '\n'.join(lines[i:i+10])
+                assert "SUBD" in chunk and "#0" in chunk, f"Expected SUBD #0 in: {chunk}"
+                # Should NOT use TSTB for int
+                break
+
+    def test_char_literal_uses_tstb(self):
+        """Char literal in if condition should use TSTB."""
+        source = "void main() { char c; c = 'A'; if (c) { } }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+        lines = asm.split('\n')
+        for i, line in enumerate(lines):
+            if "if condition" in line:
+                chunk = '\n'.join(lines[i:i+10])
+                assert "TSTB" in chunk, f"Expected TSTB in: {chunk}"
+                break
+
+    def test_char_in_while_uses_tstb(self):
+        """Char variable in while condition should use TSTB."""
+        source = "void main() { char c; c = 1; while (c) { c = 0; } }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+        lines = asm.split('\n')
+        for i, line in enumerate(lines):
+            if "while condition" in line:
+                chunk = '\n'.join(lines[i:i+10])
+                assert "TSTB" in chunk, f"Expected TSTB in: {chunk}"
+                break
+
+    def test_char_in_for_uses_tstb(self):
+        """Char variable in for condition should use TSTB."""
+        source = "void main() { char i; for (i = 5; i; i = i - 1) { } }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+        lines = asm.split('\n')
+        for i, line in enumerate(lines):
+            if "for condition" in line:
+                chunk = '\n'.join(lines[i:i+10])
+                assert "TSTB" in chunk, f"Expected TSTB in: {chunk}"
+                break
+
+    def test_binary_op_result_uses_subd(self):
+        """Binary operation result (always 16-bit) should use SUBD #0."""
+        source = "void main() { char a; char b; if (a + b) { } }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+        lines = asm.split('\n')
+        for i, line in enumerate(lines):
+            if "if condition" in line:
+                # After binary operation, result is in D (16-bit)
+                # The boolean test after the add should use SUBD #0
+                chunk = '\n'.join(lines[i:i+20])
+                # Binary ops produce 16-bit results, so SUBD #0 should be used
+                assert "SUBD" in chunk and "#0" in chunk, f"Expected SUBD #0 in: {chunk}"
+                break
+
+    def test_logical_not_char_uses_tstb(self):
+        """Logical NOT of char should use TSTB."""
+        source = "void main() { char c; c = 1; if (!c) { } }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+        # The !c expression should test c with TSTB
+        assert "TSTB" in asm

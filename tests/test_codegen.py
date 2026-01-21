@@ -32,8 +32,11 @@ def assemble(source: str) -> bytes:
     """
     Helper to assemble source code and return the raw code bytes.
     Strips the OB3 header for easier testing.
+
+    NOTE: Optimization is disabled for these tests because we're testing
+    the raw code generation of specific instructions, not optimized output.
     """
-    asm = Assembler()
+    asm = Assembler(optimize=False)
     result = asm.assemble(source)
     # Skip OB3 header: "ORG" (3) + length (2) + address (2) = 7 bytes
     if result[:3] == b"ORG":
@@ -44,7 +47,7 @@ def assemble(source: str) -> bytes:
 
 def assemble_raw(source: str) -> bytes:
     """Return the complete OB3 output including header."""
-    asm = Assembler()
+    asm = Assembler(optimize=False)
     return asm.assemble(source)
 
 

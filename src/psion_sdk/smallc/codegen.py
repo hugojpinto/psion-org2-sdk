@@ -272,6 +272,13 @@ class CodeGenerator(ASTVisitor):
         #   - Parameter count and types (for QCode buffer generation)
         self._external_funcs: dict[str, ExternalFuncInfo] = {}
 
+        # Expression size tracking for optimization
+        # Tracks the size (in bytes) of the last expression result:
+        # - 1 = char (value in B, A cleared to 0) - can use TSTB for boolean test
+        # - 2 = int (value in D) - must use SUBD #0 for boolean test
+        # This enables 8-bit boolean tests: TSTB (1 byte) vs SUBD #0 (3 bytes)
+        self._last_expr_size: int = 2
+
     def generate(self, program: ProgramNode) -> str:
         """
         Generate assembly code from AST.
@@ -287,6 +294,7 @@ class CodeGenerator(ASTVisitor):
         self._strings = []
         self._label_counter = 0
         self._external_funcs = {}
+        self._last_expr_size = 2  # Reset expression size tracking
 
         # Emit header (includes)
         self._emit_header()
@@ -384,6 +392,26 @@ class CodeGenerator(ASTVisitor):
     def _emit_load_sp(self) -> None:
         """Load stack pointer into X. On HD6303, TSX gives X=SP directly."""
         self._emit_instruction("TSX", "")
+
+    def _emit_boolean_test(self) -> None:
+        """Emit code to test if expression result is zero, setting Z flag.
+
+        This method optimizes boolean tests based on the size of the last
+        expression result:
+        - For char (1 byte): Uses TSTB (1 byte) since A is known to be 0
+        - For int (2 bytes): Uses SUBD #0 (3 bytes)
+
+        The optimization saves 2 bytes per boolean test for char expressions.
+        After this call, Z flag is set if expression was zero.
+        """
+        if self._last_expr_size == 1:
+            # Char expression: A is already 0, so D==0 iff B==0
+            # TSTB is 1 byte vs SUBD #0 which is 3 bytes
+            self._emit_instruction("TSTB", "")
+        else:
+            # Int expression: must test full D register
+            # Note: SUBD #0 leaves D unchanged (D-0=D) while setting Z flag
+            self._emit_instruction("SUBD", "#0")
 
     def _new_label(self, prefix: str = "L") -> str:
         """Generate a unique label."""
@@ -713,8 +741,8 @@ class CodeGenerator(ASTVisitor):
         self._generate_expression(stmt.condition)
 
         # Test condition (D == 0 means false)
-        # Note: SUBD #0 leaves D unchanged (D-0=D) while setting Z flag
-        self._emit_instruction("SUBD", "#0")
+        # Use helper for 8-bit optimization when condition is char
+        self._emit_boolean_test()
         self._emit_instruction("BEQ", else_label)
 
         # Then branch
@@ -747,8 +775,8 @@ class CodeGenerator(ASTVisitor):
         self._generate_expression(stmt.condition)
 
         # Test condition - use short forward branch + JMP for long distance
-        # Note: SUBD #0 leaves D unchanged (D-0=D) while setting Z flag
-        self._emit_instruction("SUBD", "#0")
+        # Use helper for 8-bit optimization when condition is char
+        self._emit_boolean_test()
         self._emit_instruction("BNE", body_label)  # Short forward jump
         self._emit_instruction("JMP", end_label)   # Long jump if condition false
 
@@ -783,8 +811,8 @@ class CodeGenerator(ASTVisitor):
         if stmt.condition:
             self._emit_comment("for condition")
             self._generate_expression(stmt.condition)
-            # Note: SUBD #0 leaves D unchanged (D-0=D) while setting Z flag
-            self._emit_instruction("SUBD", "#0")
+            # Use helper for 8-bit optimization when condition is char
+            self._emit_boolean_test()
             self._emit_instruction("BEQ", end_label)
 
         # Body
@@ -821,8 +849,8 @@ class CodeGenerator(ASTVisitor):
         self._generate_expression(stmt.condition)
 
         # Loop if true
-        # Note: SUBD #0 leaves D unchanged (D-0=D) while setting Z flag
-        self._emit_instruction("SUBD", "#0")
+        # Use helper for 8-bit optimization when condition is char
+        self._emit_boolean_test()
         self._emit_instruction("BNE", start_label)
 
         self._emit_label(end_label)
@@ -961,12 +989,14 @@ class CodeGenerator(ASTVisitor):
         """Generate code for number literal."""
         value = expr.value & 0xFFFF
         self._emit_instruction("LDD", f"#{value}")
+        self._last_expr_size = 2  # Number literals are int (16-bit)
 
     def _generate_char(self, expr: CharLiteral) -> None:
         """Generate code for character literal."""
         value = expr.value & 0xFF
         self._emit_instruction("LDAB", f"#{value}")
         self._emit_instruction("CLRA", "")
+        self._last_expr_size = 1  # Char: A=0, value in B
 
     def _generate_string(self, expr: StringLiteral) -> None:
         """Generate code for string literal (returns pointer).
@@ -977,6 +1007,7 @@ class CodeGenerator(ASTVisitor):
         label = self._new_label("_S")  # Double underscore prefix: __S1, __S2, etc.
         self._strings.append((label, expr.value))
         self._emit_instruction("LDD", f"#{label}")
+        self._last_expr_size = 2  # String pointers are 16-bit
 
     def _generate_identifier(self, expr: IdentifierExpression) -> None:
         """Generate code for variable reference.
@@ -999,21 +1030,26 @@ class CodeGenerator(ASTVisitor):
                 offset = info.offset
                 self._emit_instruction("XGDX", "")  # D = X (frame pointer)
                 self._emit_instruction("ADDD", f"#{offset}")  # D = X + offset
+            self._last_expr_size = 2  # Addresses are always 16-bit
         elif info.is_global:
             # Global scalar variable: direct addressing (load value)
             if info.sym_type.size == 1:
                 self._emit_instruction("LDAB", f"_{expr.name}")
                 self._emit_instruction("CLRA", "")
+                self._last_expr_size = 1  # Char: A=0, value in B
             else:
                 self._emit_instruction("LDD", f"_{expr.name}")
+                self._last_expr_size = 2  # Int: full D register
         else:
             # Local scalar variable: indexed from X (load value)
             offset = info.offset
             if info.sym_type.size == 1:
                 self._emit_instruction("LDAB", f"{offset},X")
                 self._emit_instruction("CLRA", "")
+                self._last_expr_size = 1  # Char: A=0, value in B
             else:
                 self._emit_instruction("LDD", f"{offset},X")
+                self._last_expr_size = 2  # Int: full D register
 
     def _generate_binary(self, expr: BinaryExpression) -> None:
         """Generate code for binary expression."""
@@ -1029,6 +1065,7 @@ class CodeGenerator(ASTVisitor):
                 self._generate_expression(expr.left)
                 # Compare directly with immediate value (CharLiteral.value is already int)
                 self._generate_comparison_immediate(op, expr.right.value)
+                self._last_expr_size = 2  # Comparisons produce 16-bit boolean
                 return
 
         # Logical operators handle their own operands (short-circuit evaluation)
@@ -1036,10 +1073,12 @@ class CodeGenerator(ASTVisitor):
         if op == BinaryOperator.LOGICAL_AND:
             self._generate_expression(expr.left)
             self._generate_logical_and(expr)
+            self._last_expr_size = 2  # Logical ops produce 16-bit boolean
             return
         elif op == BinaryOperator.LOGICAL_OR:
             self._generate_expression(expr.left)
             self._generate_logical_or(expr)
+            self._last_expr_size = 2  # Logical ops produce 16-bit boolean
             return
 
         # General case: push right operand, generate left, operate
@@ -1099,6 +1138,9 @@ class CodeGenerator(ASTVisitor):
         self._emit_instruction("INS", "")
         self._emit_instruction("INS", "")
 
+        # All binary operations produce 16-bit results in D
+        self._last_expr_size = 2
+
     def _generate_comparison(self, op: BinaryOperator) -> None:
         """Generate code for comparison operators."""
         true_label = self._new_label("true")
@@ -1156,15 +1198,15 @@ class CodeGenerator(ASTVisitor):
         false_label = self._new_label("land_f")
         end_label = self._new_label("land_e")
 
-        # Left operand already evaluated and pushed
-        # Check if false (short-circuit)
-        # Note: SUBD #0 leaves D unchanged (D-0=D) while setting Z flag
-        self._emit_instruction("SUBD", "#0")
+        # Left operand already evaluated
+        # Check if false (short-circuit) - use helper for 8-bit optimization
+        self._emit_boolean_test()
         self._emit_instruction("BEQ", false_label)
 
         # Evaluate right operand
         self._generate_expression(expr.right)
-        self._emit_instruction("SUBD", "#0")
+        # Use helper for 8-bit optimization when right operand is char
+        self._emit_boolean_test()
         self._emit_instruction("BEQ", false_label)
 
         # Both true
@@ -1182,14 +1224,14 @@ class CodeGenerator(ASTVisitor):
         end_label = self._new_label("lor_e")
 
         # Left operand already evaluated
-        # Check if true (short-circuit)
-        # Note: SUBD #0 leaves D unchanged (D-0=D) while setting Z flag
-        self._emit_instruction("SUBD", "#0")
+        # Check if true (short-circuit) - use helper for 8-bit optimization
+        self._emit_boolean_test()
         self._emit_instruction("BNE", true_label)
 
         # Evaluate right operand
         self._generate_expression(expr.right)
-        self._emit_instruction("SUBD", "#0")
+        # Use helper for 8-bit optimization when right operand is char
+        self._emit_boolean_test()
         self._emit_instruction("BNE", true_label)
 
         # Both false
@@ -1210,27 +1252,31 @@ class CodeGenerator(ASTVisitor):
             self._emit_instruction("COMA", "")
             self._emit_instruction("COMB", "")
             self._emit_instruction("ADDD", "#1")  # Two's complement
+            self._last_expr_size = 2  # Negate produces 16-bit result
 
         elif op == UnaryOperator.POSITIVE:
-            # No-op
+            # No-op - just evaluates operand, preserving its size
             self._generate_expression(expr.operand)
+            # Size is already set by the operand
 
         elif op == UnaryOperator.LOGICAL_NOT:
             self._generate_expression(expr.operand)
             end_label = self._new_label("not")
-            # Note: SUBD #0 leaves D unchanged (D-0=D) while setting Z flag
-            self._emit_instruction("SUBD", "#0")
+            # Use helper for 8-bit optimization when operand is char
+            self._emit_boolean_test()
             self._emit_instruction("BEQ", f"{end_label}_t")
             self._emit_instruction("LDD", "#0")
             self._emit_instruction("BRA", f"{end_label}")
             self._emit_label(f"{end_label}_t")
             self._emit_instruction("LDD", "#1")
             self._emit_label(end_label)
+            self._last_expr_size = 2  # Logical NOT produces 16-bit boolean
 
         elif op == UnaryOperator.BITWISE_NOT:
             self._generate_expression(expr.operand)
             self._emit_instruction("COMA", "")
             self._emit_instruction("COMB", "")
+            self._last_expr_size = 2  # Bitwise NOT produces 16-bit result
 
         elif op == UnaryOperator.ADDRESS_OF:
             # Get address of variable
@@ -1244,18 +1290,22 @@ class CodeGenerator(ASTVisitor):
                     self._emit_instruction("TAB", "")
                     self._emit_instruction("LDAA", "#0")
                     self._emit_instruction("ADDD", f"#{info.offset}")
+            self._last_expr_size = 2  # Addresses are always 16-bit
 
         elif op == UnaryOperator.DEREFERENCE:
             self._generate_expression(expr.operand)
             # D contains pointer, load value
             self._emit_instruction("XGDX", "")  # D <-> X
             self._emit_instruction("LDD", "0,X")
+            self._last_expr_size = 2  # Dereference loads 16-bit value
 
         elif op in (UnaryOperator.PRE_INCREMENT, UnaryOperator.PRE_DECREMENT):
             self._generate_increment(expr.operand, op == UnaryOperator.PRE_INCREMENT, True)
+            self._last_expr_size = 2  # Increment/decrement produces 16-bit
 
         elif op in (UnaryOperator.POST_INCREMENT, UnaryOperator.POST_DECREMENT):
             self._generate_increment(expr.operand, op == UnaryOperator.POST_INCREMENT, False)
+            self._last_expr_size = 2  # Increment/decrement produces 16-bit
 
     def _generate_increment(self, operand: Expression, is_increment: bool, is_pre: bool) -> None:
         """Generate code for ++/-- operators."""
@@ -1334,6 +1384,17 @@ class CodeGenerator(ASTVisitor):
 
         # Store the result
         self._generate_store(expr.target)
+
+        # Assignment leaves the assigned value in D
+        # Size depends on target type
+        if isinstance(expr.target, IdentifierExpression):
+            info = self._lookup(expr.target.name)
+            if info and info.sym_type.size == 1:
+                self._last_expr_size = 1  # Char assignment
+            else:
+                self._last_expr_size = 2  # Int/ptr assignment
+        else:
+            self._last_expr_size = 2  # Array/pointer deref - assume 16-bit
 
     def _generate_store(self, target: Expression) -> None:
         """Generate code to store D register to target."""
@@ -1508,6 +1569,7 @@ class CodeGenerator(ASTVisitor):
             #   - For int: the integer return value (converted from BCD float)
             #   - For void: garbage (caller should ignore)
             # Execution resumes here after OPL procedure completes
+            self._last_expr_size = 2  # External calls return 16-bit values
             return
 
         # =====================================================================
@@ -1527,6 +1589,9 @@ class CodeGenerator(ASTVisitor):
         for _ in range(arg_bytes):
             self._emit_instruction("INS", "")
 
+        # Function calls return 16-bit values in D
+        self._last_expr_size = 2
+
     def _generate_subscript(self, expr: ArraySubscript) -> None:
         """Generate code for array subscript (load value)."""
         self._generate_subscript_address(expr)
@@ -1535,8 +1600,10 @@ class CodeGenerator(ASTVisitor):
         if element_size == 1:
             self._emit_instruction("LDAB", "0,X")  # Load single byte
             self._emit_instruction("CLRA", "")     # Zero-extend to 16-bit
+            self._last_expr_size = 1  # Char: A=0, value in B
         else:
             self._emit_instruction("LDD", "0,X")   # Load 16-bit value
+            self._last_expr_size = 2  # Int/ptr: full D register
 
     def _generate_subscript_address(self, expr: ArraySubscript) -> None:
         """Generate address of array element into X register."""
@@ -1582,8 +1649,8 @@ class CodeGenerator(ASTVisitor):
 
         # Evaluate condition
         self._generate_expression(expr.condition)
-        # Note: SUBD #0 leaves D unchanged (D-0=D) while setting Z flag
-        self._emit_instruction("SUBD", "#0")
+        # Use helper for 8-bit optimization when condition is char
+        self._emit_boolean_test()
         self._emit_instruction("BEQ", else_label)
 
         # Then expression
@@ -1595,6 +1662,9 @@ class CodeGenerator(ASTVisitor):
         self._generate_expression(expr.else_expr)
 
         self._emit_label(end_label)
+        # Note: _last_expr_size is set by whichever branch was taken
+        # Conservatively assume 16-bit (both branches should produce same type)
+        self._last_expr_size = 2
 
     def _generate_cast(self, expr: CastExpression) -> None:
         """Generate code for type cast."""
@@ -1604,7 +1674,9 @@ class CodeGenerator(ASTVisitor):
         if expr.target_type.base_type == BaseType.CHAR:
             # Truncate to 8 bits (already in B)
             self._emit_instruction("CLRA", "")
-        # int to char is automatic (just use low byte)
+            self._last_expr_size = 1  # Cast to char: A=0, value in B
+        else:
+            self._last_expr_size = 2  # Cast to int/ptr: full D register
 
     def _generate_sizeof(self, expr: SizeofExpression) -> None:
         """Generate code for sizeof expression."""
@@ -1615,3 +1687,4 @@ class CodeGenerator(ASTVisitor):
             size = 2  # Default to int size
 
         self._emit_instruction("LDD", f"#{size}")
+        self._last_expr_size = 2  # sizeof returns 16-bit int
