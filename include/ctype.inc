@@ -59,61 +59,11 @@ CHAR_7          EQU     $37             ; '7' = 55
 CHAR_8          EQU     $38             ; '8' = 56
 CHAR_9          EQU     $39             ; '9' = 57
 
-; --- Uppercase Letters ---
-CHAR_A          EQU     $41             ; 'A' = 65
-CHAR_B          EQU     $42             ; 'B' = 66
-CHAR_C          EQU     $43             ; 'C' = 67
-CHAR_D          EQU     $44             ; 'D' = 68
-CHAR_E          EQU     $45             ; 'E' = 69
-CHAR_F          EQU     $46             ; 'F' = 70
-CHAR_G          EQU     $47             ; 'G' = 71
-CHAR_H          EQU     $48             ; 'H' = 72
-CHAR_I          EQU     $49             ; 'I' = 73
-CHAR_J          EQU     $4A             ; 'J' = 74
-CHAR_K          EQU     $4B             ; 'K' = 75
-CHAR_L          EQU     $4C             ; 'L' = 76
-CHAR_M          EQU     $4D             ; 'M' = 77
-CHAR_N          EQU     $4E             ; 'N' = 78
-CHAR_O          EQU     $4F             ; 'O' = 79
-CHAR_P          EQU     $50             ; 'P' = 80
-CHAR_Q          EQU     $51             ; 'Q' = 81
-CHAR_R          EQU     $52             ; 'R' = 82
-CHAR_S          EQU     $53             ; 'S' = 83
-CHAR_T          EQU     $54             ; 'T' = 84
-CHAR_U          EQU     $55             ; 'U' = 85
-CHAR_V          EQU     $56             ; 'V' = 86
-CHAR_W          EQU     $57             ; 'W' = 87
-CHAR_X          EQU     $58             ; 'X' = 88
-CHAR_Y          EQU     $59             ; 'Y' = 89
-CHAR_Z          EQU     $5A             ; 'Z' = 90
-
-; --- Lowercase Letters ---
-CHAR_a          EQU     $61             ; 'a' = 97
-CHAR_b          EQU     $62             ; 'b' = 98
-CHAR_c          EQU     $63             ; 'c' = 99
-CHAR_d          EQU     $64             ; 'd' = 100
-CHAR_e          EQU     $65             ; 'e' = 101
-CHAR_f          EQU     $66             ; 'f' = 102
-CHAR_g          EQU     $67             ; 'g' = 103
-CHAR_h          EQU     $68             ; 'h' = 104
-CHAR_i          EQU     $69             ; 'i' = 105
-CHAR_j          EQU     $6A             ; 'j' = 106
-CHAR_k          EQU     $6B             ; 'k' = 107
-CHAR_l          EQU     $6C             ; 'l' = 108
-CHAR_m          EQU     $6D             ; 'm' = 109
-CHAR_n          EQU     $6E             ; 'n' = 110
-CHAR_o          EQU     $6F             ; 'o' = 111
-CHAR_p          EQU     $70             ; 'p' = 112
-CHAR_q          EQU     $71             ; 'q' = 113
-CHAR_r          EQU     $72             ; 'r' = 114
-CHAR_s          EQU     $73             ; 's' = 115
-CHAR_t          EQU     $74             ; 't' = 116
-CHAR_u          EQU     $75             ; 'u' = 117
-CHAR_v          EQU     $76             ; 'v' = 118
-CHAR_w          EQU     $77             ; 'w' = 119
-CHAR_x          EQU     $78             ; 'x' = 120
-CHAR_y          EQU     $79             ; 'y' = 121
-CHAR_z          EQU     $7A             ; 'z' = 122
+; --- Letter Constants ---
+; NOTE: Individual letter constants (CHAR_A, CHAR_B, etc.) are NOT provided
+; because the assembler is case-insensitive, causing CHAR_A and CHAR_a to
+; collide. Use character literals instead: 'A', 'B', 'a', 'b', etc.
+; For range checks, use UPPER_FIRST/UPPER_LAST and LOWER_FIRST/LOWER_LAST.
 
 ; --- Whitespace Characters ---
 CHAR_SPACE      EQU     $20             ; Space = 32
@@ -633,7 +583,7 @@ MACRO HEX_TO_CHAR
     CMPA    #10
     BLO     .htc_digit\@
     ; A >= 10: 'A' + (A - 10)
-    ADDA    #(CHAR_A - 10)
+    ADDA    #(UPPER_FIRST - 10)     ; UPPER_FIRST='A', avoids CHAR_A/CHAR_a collision
     BRA     .htc_done\@
 .htc_digit\@:
     ; A < 10: '0' + A

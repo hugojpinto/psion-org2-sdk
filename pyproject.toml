@@ -106,7 +106,10 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -m 'not testkit'"
+markers = [
+    "testkit: integration tests using the testkit framework (slower, requires ROM files)",
+]
 
 # =============================================================================
 # Mypy Type Checking Configuration

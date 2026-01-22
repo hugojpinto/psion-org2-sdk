@@ -355,8 +355,9 @@ class Assembler:
         if self._verbose:
             print(f"Assembling from string...")
 
-        # Parse source
-        statements = parse_source(source, filename)
+        # Parse source (include_paths needed for macro pre-processing)
+        include_paths_str = [str(p) for p in self._include_paths]
+        statements = parse_source(source, filename, include_paths=include_paths_str)
 
         if self._verbose:
             print(f"Parsed {len(statements)} statements")

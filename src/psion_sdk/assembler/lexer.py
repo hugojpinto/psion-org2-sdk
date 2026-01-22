@@ -573,12 +573,22 @@ class Lexer:
 
     def _scan_macro_param(self, start_line: int, start_column: int) -> Token:
         """
-        Scan a macro parameter reference (\\name).
+        Scan a macro parameter reference (\\name) or unique label suffix (\\@).
 
         Macro parameters are prefixed with backslash and reference
         the formal parameters defined in a MACRO directive.
+
+        The special form \\@ is used for generating unique labels within
+        macros. During macro expansion, \\@ is replaced with a unique
+        numeric suffix to prevent label conflicts when a macro is used
+        multiple times.
         """
         self._advance()  # consume backslash
+
+        # Check for \@ (unique label suffix)
+        if self._peek() == "@":
+            self._advance()  # consume @
+            return self._make_token(TokenType.MACRO_PARAM, "@", start_line, start_column)
 
         # Collect parameter name
         chars = []

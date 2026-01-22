@@ -271,18 +271,24 @@ class Parser:
         statements = parser.parse()
     """
 
-    def __init__(self, tokens: list[Token], filename: str = "<input>"):
+    def __init__(
+        self,
+        tokens: list[Token],
+        filename: str = "<input>",
+        macros: dict[str, "MacroDef"] | None = None
+    ):
         """
         Initialize the parser.
 
         Args:
             tokens: List of tokens from lexer
             filename: Source filename for error reporting
+            macros: Pre-loaded macro definitions (from included files)
         """
         self._tokens = tokens
         self._filename = filename
         self._pos = 0
-        self._macros: dict[str, MacroDef] = {}
+        self._macros: dict[str, MacroDef] = macros.copy() if macros else {}
 
     def parse(self) -> list[Statement]:
         """
@@ -476,6 +482,9 @@ class Parser:
         Try to parse a label definition.
 
         Returns LabelDef if found, None otherwise.
+
+        Handles labels with \\@ suffix for unique labels in macros:
+        - `.label\\@:` -> identifier + macro_param + colon
         """
         if not self._check(TokenType.IDENTIFIER):
             return None
@@ -488,6 +497,23 @@ class Parser:
             return LabelDef(
                 location=name_token.location,
                 name=name_token.value,
+                is_local=is_local
+            )
+
+        # Check for label\@: pattern (identifier + macro_param + colon)
+        if (self._peek(1).type == TokenType.MACRO_PARAM and
+                self._peek(2).type == TokenType.COLON):
+            name_token = self._advance()  # identifier
+            macro_param = self._advance()  # macro_param (should be "@")
+            self._advance()  # consume colon
+
+            # Build the full label name with \@ placeholder
+            # The \@ will be replaced during macro expansion
+            full_name = name_token.value + "\\" + str(macro_param.value)
+            is_local = name_token.value.startswith((".", "@"))
+            return LabelDef(
+                location=name_token.location,
+                name=full_name,
                 is_local=is_local
             )
 
@@ -1036,18 +1062,159 @@ class Parser:
 # Convenience Functions
 # =============================================================================
 
-def parse_source(source: str, filename: str = "<input>") -> list[Statement]:
+def parse_source(
+    source: str,
+    filename: str = "<input>",
+    include_paths: list[str] | None = None
+) -> list[Statement]:
     """
     Convenience function to parse assembly source.
+
+    This function pre-processes include files to collect macro definitions
+    before parsing the main file. This ensures macros defined in included
+    files are available when parsing the main source.
 
     Args:
         source: Assembly source text
         filename: Source filename for error messages
+        include_paths: List of directories to search for include files
 
     Returns:
         List of parsed statements
     """
+    from pathlib import Path
+
+    # Collect macros from include files first
+    macros = _collect_macros_from_includes(
+        source, filename, include_paths or [], set()
+    )
+
+    # Now parse the main source with all macros available
     lexer = Lexer(source, filename)
     tokens = list(lexer.tokenize())
-    parser = Parser(tokens, filename)
+    parser = Parser(tokens, filename, macros=macros)
     return parser.parse()
+
+
+def _collect_macros_from_includes(
+    source: str,
+    filename: str,
+    include_paths: list[str],
+    processed: set[str]
+) -> dict[str, MacroDef]:
+    """
+    Recursively collect macro definitions from include files.
+
+    This pre-processes the source to find INCLUDE directives and
+    extracts macro definitions from included files. This is necessary
+    because macros must be known during parsing of the main file.
+
+    Args:
+        source: Source code to scan
+        filename: Source filename for path resolution
+        include_paths: Directories to search for includes
+        processed: Set of already processed files (for circular detection)
+
+    Returns:
+        Dictionary of macro name -> MacroDef
+    """
+    from pathlib import Path
+
+    macros: dict[str, MacroDef] = {}
+
+    # Quick scan for INCLUDE directives
+    # We do a simple token-based scan, not a full parse
+    lexer = Lexer(source, filename)
+    tokens = list(lexer.tokenize())
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        # Look for INCLUDE directive
+        if tok.type == TokenType.IDENTIFIER and tok.value.upper() == "INCLUDE":
+            # Next token should be the filename
+            if i + 1 < len(tokens) and tokens[i + 1].type == TokenType.STRING:
+                include_name = tokens[i + 1].value
+
+                # Resolve include path
+                include_path = _resolve_include(
+                    include_name, filename, include_paths
+                )
+
+                if include_path and str(include_path) not in processed:
+                    processed.add(str(include_path))
+
+                    # Recursively collect macros from included file
+                    try:
+                        include_source = include_path.read_text()
+                        child_macros = _collect_macros_from_includes(
+                            include_source,
+                            str(include_path),
+                            include_paths,
+                            processed
+                        )
+                        macros.update(child_macros)
+
+                        # Also parse this file for its own macro definitions
+                        child_lexer = Lexer(include_source, str(include_path))
+                        child_tokens = list(child_lexer.tokenize())
+                        child_parser = Parser(
+                            child_tokens, str(include_path), macros=macros
+                        )
+                        child_statements = child_parser.parse()
+
+                        # Extract macro definitions
+                        for stmt in child_statements:
+                            if isinstance(stmt, MacroDef):
+                                macros[stmt.name] = stmt
+
+                    except Exception:
+                        pass  # Ignore errors during pre-processing
+
+        # Also look for MACRO definitions in the current file
+        if tok.type == TokenType.IDENTIFIER and tok.value.upper() == "MACRO":
+            # Parse this macro definition
+            # We need to find MACRO name, params, body, ENDM
+            if i + 1 < len(tokens) and tokens[i + 1].type == TokenType.IDENTIFIER:
+                macro_name = tokens[i + 1].value.upper()
+
+                # Find the end of this macro (ENDM)
+                j = i + 2
+                body_start = j
+                while j < len(tokens):
+                    if (tokens[j].type == TokenType.IDENTIFIER and
+                            tokens[j].value.upper() == "ENDM"):
+                        break
+                    j += 1
+
+                # Skip past this macro in our scan
+                i = j
+
+        i += 1
+
+    return macros
+
+
+def _resolve_include(
+    filename: str,
+    current_file: str,
+    include_paths: list[str]
+) -> "Path | None":
+    """Resolve an include filename to a full path."""
+    from pathlib import Path
+
+    # Try relative to current file
+    if current_file != "<input>":
+        current_dir = Path(current_file).parent
+        candidate = current_dir / filename
+        if candidate.exists():
+            return candidate
+
+    # Try include paths
+    for path_str in include_paths:
+        candidate = Path(path_str) / filename
+        if candidate.exists():
+            return candidate
+
+    return None

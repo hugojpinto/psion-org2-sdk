@@ -11,18 +11,26 @@
 ;   the provided macros in ctype.inc and stdio.inc.
 ;
 ; BUILD:
-;   psbuild -m LZ stdlib_asm_test.asm -o ASMTEST.opk
+;   psbuild -r -m LZ stdlib_asm_test.asm -o ASMTEST.opk
 ;
 ; Author: Hugo José Pinto & Contributors
 ; Part of the Psion Organiser II SDK
 ; =============================================================================
 
-        INCLUDE "psion.inc"         ; Core definitions
-        INCLUDE "runtime.inc"       ; C runtime (provides string functions)
-        INCLUDE "stdio.inc"         ; Extended string functions with macros
-        INCLUDE "ctype.inc"         ; Character classification macros
+; -----------------------------------------------------------------------------
+; NOTE: For relocatable code (-r flag), do NOT use ORG directive.
+; The relocation system expects addresses to be offsets from 0.
+; Entry point must be first, followed by runtime includes that contain code.
+; -----------------------------------------------------------------------------
 
-        ORG     $2100
+; Entry point - jump over the runtime library code
+        JMP     start
+
+; Include files with code (macros are fine anywhere)
+        INCLUDE "psion.inc"         ; Core definitions (macros + constants only)
+        INCLUDE "runtime.inc"       ; C runtime (contains actual code)
+        INCLUDE "stdio.inc"         ; Extended string functions (contains code)
+        INCLUDE "ctype.inc"         ; Character classification (macros only)
 
 ; =============================================================================
 ; Entry Point
@@ -56,12 +64,12 @@ test_constants:
         LDAA    #CHAR_0
         CMPA    #$30
         BNE     const_fail
-        ; Test that CHAR_A = $41 (65)
-        LDAA    #CHAR_A
+        ; Test that UPPER_FIRST = $41 ('A')
+        LDAA    #UPPER_FIRST
         CMPA    #$41
         BNE     const_fail
-        ; Test that CHAR_a = $61 (97)
-        LDAA    #CHAR_a
+        ; Test that LOWER_FIRST = $61 ('a')
+        LDAA    #LOWER_FIRST
         CMPA    #$61
         BNE     const_fail
         ; Test CASE_OFFSET = 32
@@ -79,7 +87,7 @@ const_fail:
 ; TEST 2: TO_UPPER macro
 ; -----------------------------------------------------------------------------
 test_toupper:
-        CURSOR  1, 0                ; Row 1, col 0
+        AT      1, 0                ; Row 1, col 0
 
         LDX     #toupper_msg
         LDAB    #9
@@ -120,7 +128,7 @@ toupper_fail:
 ; TEST 3: TO_LOWER macro
 ; -----------------------------------------------------------------------------
 test_tolower:
-        CURSOR  2, 0                ; Row 2, col 0
+        AT      2, 0                ; Row 2, col 0
 
         LDX     #tolower_msg
         LDAB    #9
@@ -155,7 +163,7 @@ tolower_fail:
 ; TEST 4: CHAR_TO_DIGIT and DIGIT_TO_CHAR
 ; -----------------------------------------------------------------------------
 test_digit_conv:
-        CURSOR  3, 0                ; Row 3, col 0
+        AT      3, 0                ; Row 3, col 0
 
         LDX     #digit_msg
         LDAB    #11
@@ -229,7 +237,7 @@ hex_fail:
 ; TEST 6: STRRCHR macro (from stdio.inc)
 ; -----------------------------------------------------------------------------
 test_strrchr_asm:
-        CURSOR  1, 0
+        AT      1, 0
 
         LDX     #strrchr_msg
         LDAB    #7
@@ -238,12 +246,13 @@ test_strrchr_asm:
 
         ; Test: Find last '/' in "/a/b/c"
         STRRCHR path_str, '/'
-        ; D should point to the last '/'
-        CPD     #0
+        ; D should point to the last '/' (or NULL if not found)
+        ; HD6303 has no CPD, so use XGDX then CPX
+        XGDX                        ; X = result pointer
+        CPX     #0
         BEQ     strrchr_fail
 
         ; Check that next char is 'c'
-        XGDX                        ; X = result pointer
         LDAA    1,X                 ; A = char after '/'
         CMPA    #'c'
         BNE     strrchr_fail
@@ -258,7 +267,7 @@ strrchr_fail:
 ; TEST 7: STRSTR macro (from stdio.inc)
 ; -----------------------------------------------------------------------------
 test_strstr_asm:
-        CURSOR  2, 0
+        AT      2, 0
 
         LDX     #strstr_msg
         LDAB    #6
@@ -267,11 +276,12 @@ test_strstr_asm:
 
         ; Test: Find "World" in "Hello World"
         STRSTR hello_str, world_str
-        CPD     #0
+        ; HD6303 has no CPD, so use XGDX then CPX
+        XGDX                        ; X = result pointer
+        CPX     #0
         BEQ     strstr_fail
 
         ; Check that it points to 'W'
-        XGDX
         LDAA    0,X
         CMPA    #'W'
         BNE     strstr_fail
@@ -286,7 +296,7 @@ strstr_fail:
 ; SUMMARY
 ; -----------------------------------------------------------------------------
 test_summary:
-        CURSOR  3, 0
+        AT      3, 0
 
         LDX     #summary_msg
         LDAB    #2

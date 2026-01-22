@@ -131,19 +131,6 @@ MACRO PAUSE, ticks
 ENDM
 
 ; -----------------------------------------------------------------------------
-; CURSOR - Position cursor on display
-; Usage: CURSOR 0, 5    ; Row 0, column 5
-; Input: Row (0-1), Column (0-15)
-; Position = row * 16 + col
-; -----------------------------------------------------------------------------
-MACRO CURSOR, row, col
-    LDAA    #(\row*16+\col)     ; Position in A register
-    CLRB                        ; Status in B (cursor off)
-    SWI
-    FCB     DP_STAT
-ENDM
-
-; -----------------------------------------------------------------------------
 ; CLRSCR - Clear screen using DP_EMIT with $0C control character
 ; Usage: CLRSCR
 ; -----------------------------------------------------------------------------

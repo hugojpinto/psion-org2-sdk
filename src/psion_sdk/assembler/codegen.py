@@ -323,6 +323,13 @@ class CodeGenerator:
         if self._target not in self.VALID_TARGETS:
             self._target = self.DEFAULT_TARGET
 
+        # Macro support
+        # -------------
+        # _macros: Dictionary of macro name -> MacroDef object
+        # _macro_invocation_count: Counter for generating unique labels (\@)
+        self._macros: dict[str, MacroDef] = {}
+        self._macro_invocation_count: int = 0
+
     # =========================================================================
     # Public Interface
     # =========================================================================
@@ -413,6 +420,9 @@ class CodeGenerator:
             self._pc = 0
             self._current_global_label = None
             self._processed_includes.clear()
+            # Reset macro state for fresh iteration
+            self._macros.clear()
+            self._macro_invocation_count = 0
 
             # Restore predefined symbols from before the iteration loop
             for name, sym in predefined_symbols.items():
@@ -442,6 +452,8 @@ class CodeGenerator:
             )
 
         # Pass 2: Generate code
+        # Reset macro invocation counter to match pass 1
+        self._macro_invocation_count = 0
         self._pass2(statements)
 
         if self._errors.has_errors():
@@ -733,13 +745,12 @@ class CodeGenerator:
             self._pass1_conditional(stmt)
 
         elif isinstance(stmt, MacroDef):
-            # Macro definitions don't generate code in pass 1
-            pass
+            # Store macro definition for later expansion
+            self._macros[stmt.name.upper()] = stmt
 
         elif isinstance(stmt, MacroCall):
-            # Macro calls would be expanded here
-            # For now, just estimate size based on macro definition
-            pass
+            # Expand macro in pass 1 to collect symbols and calculate size
+            self._expand_macro_pass1(stmt)
 
     def _check_branch_relaxation(self) -> bool:
         """
@@ -1646,15 +1657,208 @@ class CodeGenerator:
             for stmt in cond.else_body:
                 self._pass2_statement(stmt)
 
-    def _expand_macro(self, call: MacroCall) -> None:
-        """Expand a macro invocation."""
-        # Find macro definition
-        if call.name not in self._symbols:
+    def _expand_macro_pass1(self, call: MacroCall) -> None:
+        """Expand a macro invocation in pass 1 to collect symbols and calculate size."""
+        macro_name = call.name.upper()
+        if macro_name not in self._macros:
             raise UndefinedSymbolError(call.name, call.location)
 
-        # Macro expansion would substitute parameters and process body
-        # For now, this is a placeholder
-        pass
+        macro_def = self._macros[macro_name]
+
+        # Build parameter -> argument mapping
+        param_map = self._build_param_map(macro_def, call)
+
+        # Get unique suffix for this invocation
+        unique_suffix = f"_{self._macro_invocation_count:03d}"
+        self._macro_invocation_count += 1
+
+        # Expand and process each statement in the macro body
+        for stmt in macro_def.body:
+            expanded = self._substitute_macro_tokens(stmt, param_map, unique_suffix)
+            self._pass1_statement(expanded)
+
+    def _expand_macro(self, call: MacroCall) -> None:
+        """Expand a macro invocation in pass 2."""
+        macro_name = call.name.upper()
+        if macro_name not in self._macros:
+            raise UndefinedSymbolError(call.name, call.location)
+
+        macro_def = self._macros[macro_name]
+
+        # Build parameter -> argument mapping
+        param_map = self._build_param_map(macro_def, call)
+
+        # Get unique suffix for this invocation (must match pass 1)
+        unique_suffix = f"_{self._macro_invocation_count:03d}"
+        self._macro_invocation_count += 1
+
+        # Expand and process each statement in the macro body
+        for stmt in macro_def.body:
+            expanded = self._substitute_macro_tokens(stmt, param_map, unique_suffix)
+            self._pass2_statement(expanded)
+
+    def _build_param_map(self, macro_def: MacroDef, call: MacroCall) -> dict[str, list[Token]]:
+        """Build a mapping from parameter names to argument token lists."""
+        param_map: dict[str, list[Token]] = {}
+        for i, param_name in enumerate(macro_def.parameters):
+            if i < len(call.arguments):
+                param_map[param_name.upper()] = call.arguments[i]
+            else:
+                # Missing argument - use empty token list
+                param_map[param_name.upper()] = []
+        return param_map
+
+    def _substitute_macro_tokens(
+        self,
+        stmt: Statement,
+        param_map: dict[str, list[Token]],
+        unique_suffix: str
+    ) -> Statement:
+        """
+        Create a copy of a statement with macro parameters substituted.
+
+        This handles:
+        - \\param tokens replaced with argument values
+        - \\@ tokens replaced with unique_suffix in label names
+        - Label names containing \\@ get the suffix appended
+        """
+        import copy
+
+        if isinstance(stmt, LabelDef):
+            # Substitute \@ in label names
+            new_name = self._substitute_label_name(stmt.name, unique_suffix)
+            return LabelDef(
+                location=stmt.location,
+                name=new_name,
+                is_local=stmt.is_local
+            )
+
+        elif isinstance(stmt, Instruction):
+            # Substitute in operand tokens
+            new_operand = None
+            if stmt.operand:
+                new_tokens = self._substitute_tokens(stmt.operand.tokens, param_map, unique_suffix)
+                new_mask = None
+                if stmt.operand.mask_tokens:
+                    new_mask = self._substitute_tokens(stmt.operand.mask_tokens, param_map, unique_suffix)
+                new_operand = Operand(
+                    mode=stmt.operand.mode,
+                    tokens=new_tokens,
+                    is_force_extended=stmt.operand.is_force_extended,
+                    is_force_direct=stmt.operand.is_force_direct,
+                    mask_tokens=new_mask
+                )
+            return Instruction(
+                location=stmt.location,
+                mnemonic=stmt.mnemonic,
+                operand=new_operand
+            )
+
+        elif isinstance(stmt, Directive):
+            # Substitute in directive arguments
+            new_args = []
+            for arg_tokens in stmt.arguments:
+                new_args.append(self._substitute_tokens(arg_tokens, param_map, unique_suffix))
+            return Directive(
+                location=stmt.location,
+                name=stmt.name,
+                arguments=new_args,
+                label=stmt.label
+            )
+
+        elif isinstance(stmt, ConditionalBlock):
+            # Recursively substitute in conditional bodies
+            new_if_body = [
+                self._substitute_macro_tokens(s, param_map, unique_suffix)
+                for s in stmt.if_body
+            ]
+            new_else_body = [
+                self._substitute_macro_tokens(s, param_map, unique_suffix)
+                for s in stmt.else_body
+            ]
+            return ConditionalBlock(
+                location=stmt.location,
+                condition_type=stmt.condition_type,
+                condition_tokens=self._substitute_tokens(stmt.condition_tokens, param_map, unique_suffix),
+                if_body=new_if_body,
+                else_body=new_else_body
+            )
+
+        else:
+            # Return unchanged for other statement types
+            return stmt
+
+    def _substitute_tokens(
+        self,
+        tokens: list[Token],
+        param_map: dict[str, list[Token]],
+        unique_suffix: str
+    ) -> list[Token]:
+        """
+        Substitute macro parameters in a token list.
+
+        - MACRO_PARAM tokens with param name: replaced with argument tokens
+        - MACRO_PARAM tokens with "@": combined with preceding identifier + suffix
+        - IDENTIFIER followed by MACRO_PARAM "@": combined into single identifier with suffix
+        """
+        result: list[Token] = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+
+            if tok.type == TokenType.IDENTIFIER:
+                # Check if followed by MACRO_PARAM "@" (label\@ pattern)
+                if (i + 1 < len(tokens) and
+                        tokens[i + 1].type == TokenType.MACRO_PARAM and
+                        str(tokens[i + 1].value).upper() == "@"):
+                    # Combine identifier with unique suffix
+                    combined_name = tok.value + unique_suffix
+                    result.append(Token(
+                        type=TokenType.IDENTIFIER,
+                        value=combined_name,
+                        line=tok.line,
+                        column=tok.column,
+                        filename=tok.filename
+                    ))
+                    i += 2  # Skip both identifier and macro_param
+                    continue
+                else:
+                    result.append(tok)
+
+            elif tok.type == TokenType.MACRO_PARAM:
+                param_name = tok.value.upper() if isinstance(tok.value, str) else str(tok.value)
+                if param_name == "@":
+                    # Standalone \@ (shouldn't normally happen, but handle it)
+                    # This would be \@ not preceded by an identifier
+                    result.append(Token(
+                        type=TokenType.IDENTIFIER,
+                        value=unique_suffix,
+                        line=tok.line,
+                        column=tok.column,
+                        filename=tok.filename
+                    ))
+                elif param_name in param_map:
+                    # Named parameter - replace with argument tokens
+                    result.extend(param_map[param_name])
+                else:
+                    # Unknown parameter - keep as is (will cause error later)
+                    result.append(tok)
+            else:
+                result.append(tok)
+
+            i += 1
+
+        return result
+
+    def _substitute_label_name(self, name: str, unique_suffix: str) -> str:
+        """
+        Substitute \\@ in a label name with the unique suffix.
+
+        The parser stores labels with \\@ suffix as `name\\@` where
+        \\@ is the literal string. We replace it with the unique suffix.
+        """
+        # Replace \@ with the unique suffix
+        return name.replace("\\@", unique_suffix)
 
     # =========================================================================
     # Include File Processing

@@ -1754,17 +1754,14 @@ ENDM
 ; Usage: AT row, col
 ; Input: row (0-1 or 0-3), col (0-15 or 0-19)
 ; Output: None
+; Note: Uses DISP_COLS (set by assembler based on target model)
+;       Position formula: row * DISP_COLS + col
 ; -----------------------------------------------------------------------------
 MACRO AT, row, col
-    LDD     #\col
+    LDD     #(\row * DISP_COLS + \col)
     PSHB
     PSHA
-    LDD     #\row
-    PSHB
-    PSHA
-    JSR     _at
-    INS
-    INS
+    JSR     _cursor
     INS
     INS
 ENDM
