@@ -4,6 +4,7 @@ A complete cross-development toolchain for the Psion Organiser II, featuring a S
 
 ## Features
 
+- **psbuild** - Unified build tool (C/asm → OPK in one command)
 - **pscc** - Small-C compiler targeting HD6303
 - **psasm** - HD6303 macro assembler with self-relocating code support
 - **psopk** - OPK pack file builder
@@ -42,20 +43,26 @@ void main() {
 }
 ```
 
-### 2. Build and Package
+### 2. Build with psbuild
 
 ```bash
-# Compile C to assembly
-pscc -I include hello.c -o hello.asm
-
-# Assemble to OB3 object file
-psasm -r -I include hello.asm -o HELLO.ob3
-
-# Create OPK pack file
-psopk create -o HELLO.opk HELLO.ob3
+# Build directly from C to OPK (one command)
+psbuild hello.c -o HELLO.opk
 ```
 
-> **Important:** The `-I include` flag is required for both `pscc` and `psasm`. It tells the tools where to find the SDK's header files (`psion.h`, `runtime.inc`, etc.). The `-r` flag generates self-relocating code, which is required for C programs.
+That's it! `psbuild` automatically:
+- Finds the SDK include directory
+- Compiles C → assembly → object code → pack file
+- Enables relocatable code (required for C programs)
+
+For more control, you can use the individual tools:
+
+```bash
+# Manual pipeline: pscc → psasm → psopk
+pscc -I include hello.c -o hello.asm
+psasm -r -I include hello.asm -o HELLO.ob3
+psopk create -o HELLO.opk HELLO.ob3
+```
 
 ### Transfer to Device
 
@@ -85,6 +92,25 @@ print(emu.display_text)
 ```
 
 ## CLI Tools
+
+### psbuild - Unified Build Tool (Recommended)
+
+```bash
+psbuild hello.c -o HELLO.opk           # Build C program to OPK
+psbuild hello.asm -o HELLO.opk         # Build assembly program to OPK
+psbuild -m LZ hello.c -o HELLO.opk     # Target 4-line display
+psbuild -v hello.c                     # Verbose output (shows each stage)
+psbuild -k hello.c                     # Keep intermediate files (.asm, .ob3)
+psbuild --version                      # Show version
+```
+
+**Key flags:**
+- `-m MODEL` - Target model: CM, XP, LZ, LZ64, PORTABLE
+- `-v` - Verbose output showing each build stage
+- `-k` - Keep intermediate files for debugging
+- `-r` - Enable relocatable code for assembly (always on for C)
+
+The SDK include directory is found automatically. For C sources, `-r` (relocatable) is always enabled.
 
 ### pscc - Small-C Compiler
 

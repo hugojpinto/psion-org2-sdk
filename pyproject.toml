@@ -64,17 +64,19 @@ dev = [
 # =============================================================================
 # These define the command-line tools that will be installed with the package:
 #   psasm    - HD6303 assembler (assembly source -> object code)
+#   psbuild  - Unified build tool (C/asm source -> pack image in one command)
 #   pscc     - Small-C compiler (C source -> assembly code)
-#   psopk    - OPK builder (object code -> pack image)
-#   pslink   - Transfer tool (pack image -> Psion device via serial)
 #   psdisasm - Disassembler (binary -> assembly listing)
+#   pslink   - Transfer tool (pack image -> Psion device via serial)
+#   psopk    - OPK builder (object code -> pack image)
 # =============================================================================
 [project.scripts]
 psasm = "psion_sdk.cli.psasm:main"
+psbuild = "psion_sdk.cli.psbuild:main"
 pscc = "psion_sdk.cli.pscc:main"
-psopk = "psion_sdk.cli.psopk:main"
-pslink = "psion_sdk.cli.pslink:main"
 psdisasm = "psion_sdk.cli.psdisasm:main"
+pslink = "psion_sdk.cli.pslink:main"
+psopk = "psion_sdk.cli.psopk:main"
 
 [project.urls]
 Homepage = "https://github.com/psion-sdk/psion-sdk"
