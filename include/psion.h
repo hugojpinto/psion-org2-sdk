@@ -480,6 +480,69 @@ int strcmp(char *a, char *b);
  */
 char *strcat(char *dest, char *src);
 
+/*
+ * strchr - Locate character in string
+ *
+ * Returns a pointer to the first occurrence of character c in string s.
+ * The null terminator is considered part of the string, so strchr(s, 0)
+ * returns a pointer to the terminating null.
+ *
+ * Parameters:
+ *   s - String to search
+ *   c - Character to find
+ *
+ * Returns:
+ *   Pointer to first occurrence of c, or NULL (0) if not found
+ *
+ * Example:
+ *   char *p = strchr("Hello", 'l');  // p points to first 'l'
+ *   if (strchr(line, ':')) { ... }   // Check if ':' exists
+ */
+char *strchr(char *s, int c);
+
+/*
+ * strncpy - Copy string with length limit
+ *
+ * Copies at most n characters from src to dest. If src is shorter than n,
+ * the remainder of dest is filled with null characters. WARNING: If src
+ * is n or more characters long, dest will NOT be null-terminated.
+ *
+ * Parameters:
+ *   dest - Destination buffer (must hold at least n bytes)
+ *   src  - Source string
+ *   n    - Maximum characters to copy
+ *
+ * Returns:
+ *   Pointer to dest
+ *
+ * Example:
+ *   char buf[10];
+ *   strncpy(buf, user_input, 9);
+ *   buf[9] = '\0';  // Ensure null termination for safety
+ */
+char *strncpy(char *dest, char *src, int n);
+
+/*
+ * strncmp - Compare strings with length limit
+ *
+ * Compares at most n characters of two strings. Comparison stops when:
+ * - A difference is found
+ * - A null terminator is reached in either string
+ * - n characters have been compared
+ *
+ * Parameters:
+ *   s1 - First string
+ *   s2 - Second string
+ *   n  - Maximum characters to compare
+ *
+ * Returns:
+ *   0 if equal (up to n chars), <0 if s1<s2, >0 if s1>s2
+ *
+ * Example:
+ *   if (strncmp(cmd, "HELP", 4) == 0) { ... }
+ */
+int strncmp(char *s1, char *s2, int n);
+
 /* =============================================================================
  * Memory Functions
  * =============================================================================
@@ -552,6 +615,63 @@ void *memset(void *dest, int c, int n);
  *   0 if equal, <0 if a<b, >0 if a>b
  */
 int memcmp(void *a, void *b, int n);
+
+/* =============================================================================
+ * Number Conversion Functions
+ * =============================================================================
+ */
+
+/*
+ * atoi - Convert string to integer
+ *
+ * Parses the C string s interpreting its content as an integral number.
+ * Leading whitespace (space, tab) is skipped. An optional sign (+/-)
+ * may precede the digits. Parsing stops at the first non-digit character.
+ *
+ * Parameters:
+ *   s - Pointer to null-terminated string
+ *
+ * Returns:
+ *   Integer value of the string, or 0 if no valid conversion
+ *
+ * Examples:
+ *   atoi("123")    -> 123
+ *   atoi("-456")   -> -456
+ *   atoi("  +78")  -> 78
+ *   atoi("12abc")  -> 12 (stops at 'a')
+ *   atoi("xyz")    -> 0  (no digits found)
+ *
+ * Note: Does not detect overflow. Values outside -32768 to 32767
+ * will wrap around silently.
+ */
+int atoi(char *s);
+
+/*
+ * itoa - Convert integer to string
+ *
+ * Converts a 16-bit signed integer to a null-terminated decimal string
+ * and stores it in the provided buffer.
+ *
+ * Parameters:
+ *   n - Integer value to convert (-32768 to 32767)
+ *   s - Buffer to store result
+ *
+ * Returns:
+ *   Pointer to s
+ *
+ * Buffer size: The buffer must be at least 7 bytes to hold the largest
+ * possible value ("-32768" plus null terminator).
+ *
+ * Examples:
+ *   char buf[8];
+ *   itoa(123, buf);   // buf = "123"
+ *   itoa(-456, buf);  // buf = "-456"
+ *   itoa(0, buf);     // buf = "0"
+ *
+ * Note: Unlike some implementations, this itoa only supports base 10.
+ * For hexadecimal output, use print_hex() or sprintf().
+ */
+char *itoa(int n, char *s);
 
 /* =============================================================================
  * Utility Functions

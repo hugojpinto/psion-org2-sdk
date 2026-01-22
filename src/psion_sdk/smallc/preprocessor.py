@@ -665,6 +665,19 @@ class Preprocessor:
         """
         return "float.h" in self._included_files
 
+    def has_stdio_support(self) -> bool:
+        """
+        Return True if the source code uses extended stdio functions.
+
+        This checks if stdio.h was included during preprocessing.
+        Used by codegen to conditionally include stdio.inc which provides
+        strrchr, strstr, strncat, and sprintf functions.
+
+        Returns:
+            True if stdio.h was included, False otherwise.
+        """
+        return "stdio.h" in self._included_files
+
     def get_included_files(self) -> set[str]:
         """
         Return the set of included file basenames.

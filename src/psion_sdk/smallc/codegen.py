@@ -257,7 +257,8 @@ class CodeGenerator(ASTVisitor):
         "LZ64": (4, 20),
     }
 
-    def __init__(self, target_model: str = "XP", has_float_support: bool = False):
+    def __init__(self, target_model: str = "XP", has_float_support: bool = False,
+                 has_stdio_support: bool = False):
         """
         Initialize the code generator.
 
@@ -266,12 +267,17 @@ class CodeGenerator(ASTVisitor):
                          Defaults to XP for broad compatibility with 2-line models.
             has_float_support: Whether to include floating point runtime support.
                               True if float.h was included, False otherwise.
+            has_stdio_support: Whether to include extended stdio functions.
+                              True if stdio.h was included, False otherwise.
         """
         # Target model for generated code
         self._target_model = target_model.upper() if target_model else "XP"
 
         # Whether to include floating point support (fpruntime.inc)
         self._has_float_support = has_float_support
+
+        # Whether to include stdio support (stdio.inc)
+        self._has_stdio_support = has_stdio_support
 
         # Assembly output lines
         self._output: list[str] = []
@@ -399,6 +405,8 @@ class CodeGenerator(ASTVisitor):
         self._emit("; -----------------------------------------------------------------------------")
         self._emit("        INCLUDE \"psion.inc\"")
         self._emit("        INCLUDE \"runtime.inc\"")
+        if self._has_stdio_support:
+            self._emit("        INCLUDE \"stdio.inc\"       ; Extended string functions (strrchr, strstr, sprintf, etc.)")
         if self._has_float_support:
             self._emit("        INCLUDE \"float.inc\"       ; FP constants and macros")
             self._emit("        INCLUDE \"fpruntime.inc\"  ; Floating point support")
@@ -799,12 +807,34 @@ class CodeGenerator(ASTVisitor):
         if op in self._LOGICAL_OPS:
             return TYPE_INT
 
-        # For pointers, use existing 16-bit path (no 8-bit pointer arithmetic)
+        # For pointer arithmetic, preserve the pointer type
+        # ptr + int or int + ptr returns the pointer type
+        # ptr - ptr returns int (difference)
         if left_type.is_pointer or right_type.is_pointer:
+            if op == BinaryOperator.ADD:
+                # ptr + int or int + ptr: result is pointer type
+                if left_type.is_pointer:
+                    return left_type
+                else:
+                    return right_type
+            elif op == BinaryOperator.SUBTRACT:
+                # ptr - int: result is pointer type
+                # ptr - ptr: result is int (difference)
+                if left_type.is_pointer and not right_type.is_pointer:
+                    return left_type
+            # Other operations on pointers return int
             return TYPE_INT
 
-        # For arrays (which decay to pointers), use 16-bit path
+        # For arrays (which decay to pointers), preserve the decayed pointer type
         if left_type.array_size > 0 or right_type.array_size > 0:
+            if op == BinaryOperator.ADD:
+                if left_type.array_size > 0:
+                    return left_type.decay()  # Array decays to pointer
+                else:
+                    return right_type.decay()
+            elif op == BinaryOperator.SUBTRACT:
+                if left_type.array_size > 0 and right_type.array_size == 0:
+                    return left_type.decay()
             return TYPE_INT
 
         # Determine operand types
@@ -2260,8 +2290,23 @@ class CodeGenerator(ASTVisitor):
             self._generate_expression(expr.operand)
             # D contains pointer, load value
             self._emit_instruction("XGDX", "")  # D <-> X
-            self._emit_instruction("LDD", "0,X")
-            self._last_expr_size = 2  # Dereference loads 16-bit value
+            # Get pointed-to type to determine load size
+            ptr_type = self._get_expression_type(expr.operand)
+            if ptr_type.is_pointer and ptr_type.pointer_depth > 0:
+                pointed_to_type = ptr_type.dereference()
+                if pointed_to_type.base_type == BaseType.CHAR and pointed_to_type.pointer_depth == 0:
+                    # Char pointer: load single byte
+                    self._emit_instruction("LDAB", "0,X")
+                    self._emit_instruction("CLRA", "")
+                    self._last_expr_size = 1
+                else:
+                    # Int, pointer, or other: load 16-bit
+                    self._emit_instruction("LDD", "0,X")
+                    self._last_expr_size = 2
+            else:
+                # Not a pointer (error case) - use 16-bit as fallback
+                self._emit_instruction("LDD", "0,X")
+                self._last_expr_size = 2
 
         elif op in (UnaryOperator.PRE_INCREMENT, UnaryOperator.PRE_DECREMENT):
             self._generate_increment(expr.operand, op == UnaryOperator.PRE_INCREMENT, True)
@@ -2610,15 +2655,27 @@ class CodeGenerator(ASTVisitor):
         if isinstance(expr.array, IdentifierExpression):
             info = self._lookup(expr.array.name)
             if info.is_global:
-                self._emit_instruction("LDX", f"#_{expr.array.name}")
+                # Global: could be array or pointer
+                if info.sym_type.is_array:
+                    # Global array: load address constant
+                    self._emit_instruction("LDX", f"#_{expr.array.name}")
+                else:
+                    # Global pointer: load pointer VALUE
+                    self._emit_instruction("LDX", f"_{expr.array.name}")
             else:
-                # Local array: address is frame + offset
-                # Compensate for any bytes pushed during argument generation
-                adjusted_offset = info.offset + self._arg_push_depth
-                self._emit_instruction("TSX", "")
-                self._emit_instruction("XGDX", "")
-                self._emit_instruction("ADDD", f"#{adjusted_offset}")
-                self._emit_instruction("XGDX", "")
+                # Local: could be array or pointer
+                if info.sym_type.is_array:
+                    # Local array: compute address as frame + offset
+                    adjusted_offset = info.offset + self._arg_push_depth
+                    self._emit_instruction("TSX", "")
+                    self._emit_instruction("XGDX", "")
+                    self._emit_instruction("ADDD", f"#{adjusted_offset}")
+                    self._emit_instruction("XGDX", "")
+                else:
+                    # Local pointer: load pointer VALUE from stack
+                    adjusted_offset = info.offset + self._arg_push_depth
+                    self._emit_instruction("TSX", "")
+                    self._emit_instruction("LDX", f"{adjusted_offset},X")
         else:
             # Pointer expression
             self._generate_expression(expr.array)

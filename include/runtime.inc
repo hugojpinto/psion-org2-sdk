@@ -1148,6 +1148,1269 @@ _memcmp_ret:
         PULX
         RTS
 
+; =============================================================================
+; STANDARD LIBRARY EXPANSION - Phase 2 Core Functions
+; =============================================================================
+; These functions were added as part of the Standard Library Expansion
+; (see specs/12-standard-library-expansion.md).
+;
+; Functions in this section:
+;   - _atoi    : Convert string to integer
+;   - _itoa    : Convert integer to string buffer
+;   - _strchr  : Find character in string
+;   - _strncpy : Bounded string copy
+;   - _strncmp : Bounded string compare
+;
+; All functions follow the Small-C calling convention:
+;   - Arguments on stack (right-to-left push order)
+;   - Return value in D register
+;   - Caller cleans up stack
+;   - X register preserved across calls (via PSHX/PULX)
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; _atoi - Convert ASCII string to integer
+; -----------------------------------------------------------------------------
+; Parses a null-terminated string and converts it to a 16-bit signed integer.
+; Leading whitespace (space, tab) is skipped. An optional sign (+/-) may
+; precede the digits. Parsing stops at the first non-digit character.
+;
+; Input:  Stack: s (pointer to null-terminated string)
+;         After PSHX+TSX: string pointer at 4,X
+; Output: D = integer value (0 if no valid digits found)
+;
+; Algorithm:
+;   1. Skip leading whitespace (space, tab)
+;   2. Check for optional sign (+/-)
+;   3. Accumulate digits: result = result * 10 + digit
+;   4. Apply sign if negative
+;
+; Multiplication by 10 optimization:
+;   Uses x*10 = x*8 + x*2 = (x<<3) + (x<<1) instead of calling __mul16.
+;   This is much faster for the common case of decimal parsing.
+;
+; Examples:
+;   "123"   -> 123
+;   "-456"  -> -456
+;   "  +78" -> 78
+;   "12abc" -> 12 (stops at 'a')
+;   "xyz"   -> 0  (no digits)
+;
+; Code size: ~85 bytes
+; -----------------------------------------------------------------------------
+_atoi:
+        PSHX                    ; Save caller's frame pointer
+        TSX
+        LDX     4,X             ; X = string pointer
+
+        ; --- Skip whitespace ---
+_atoi_ws:
+        LDAB    0,X
+        CMPB    #' '
+        BEQ     _atoi_ws_next
+        CMPB    #$09            ; Tab
+        BNE     _atoi_chk_sign
+_atoi_ws_next:
+        INX
+        BRA     _atoi_ws
+
+        ; --- Check sign ---
+_atoi_chk_sign:
+        CLR     _atoi_neg
+        LDAB    0,X
+        CMPB    #'-'
+        BNE     _atoi_chk_plus
+        COM     _atoi_neg       ; Mark negative
+        INX
+        BRA     _atoi_begin
+_atoi_chk_plus:
+        CMPB    #'+'
+        BNE     _atoi_begin
+        INX
+
+        ; --- Initialize result = 0 ---
+_atoi_begin:
+        LDD     #0
+        STD     _atoi_result
+
+        ; --- Main digit loop ---
+_atoi_dloop:
+        LDAB    0,X             ; Get character
+        SUBB    #'0'            ; Convert to digit (0-9)
+        BMI     _atoi_finish    ; < '0' -> done
+        CMPB    #9
+        BHI     _atoi_finish    ; > '9' -> done
+
+        ; Save digit, multiply result by 10, add digit
+        STAB    _atoi_digit     ; Save digit temporarily
+
+        ; result = result * 10
+        ; Using x*10 = (x*4 + x)*2 = (x<<2 + x)<<1
+        ; Or x*10 = x*8 + x*2 = (x<<3) + (x<<1)
+        LDD     _atoi_result
+        ASLD                    ; D = result * 2
+        STD     _atoi_tmp       ; Save result*2
+        ASLD                    ; D = result * 4
+        ASLD                    ; D = result * 8
+        ADDD    _atoi_tmp       ; D = result*10
+
+        ; Add digit to D
+        ADDB    _atoi_digit     ; Add digit to low byte
+        ADCA    #0              ; Propagate carry to high byte
+
+        STD     _atoi_result    ; Store new result
+
+        INX                     ; Advance to next character
+        BRA     _atoi_dloop
+
+        ; --- Apply sign and return ---
+_atoi_finish:
+        LDD     _atoi_result
+        TST     _atoi_neg       ; Check if negative
+        BEQ     _atoi_ret       ; If not negative, return as-is
+        ; Negate: D = -D = ~D + 1
+        COMA
+        COMB
+        ADDD    #1
+_atoi_ret:
+        PULX                    ; Restore caller's frame pointer
+        RTS
+
+; --- Local storage for _atoi ---
+_atoi_neg:      RMB     1       ; Sign flag: 0=positive, $FF=negative
+_atoi_result:   RMB     2       ; Accumulated result
+_atoi_tmp:      RMB     2       ; Temporary for multiplication
+_atoi_digit:    RMB     1       ; Current digit value
+
+; -----------------------------------------------------------------------------
+; _itoa - Convert integer to null-terminated string
+; -----------------------------------------------------------------------------
+; Converts a 16-bit signed integer to a decimal string representation.
+; The string is stored in the provided buffer with a null terminator.
+;
+; Input:  Stack: n (16-bit signed integer), s (pointer to buffer)
+;         After PSHX+TSX: n at 4,X, s at 6,X
+; Output: D = pointer to buffer (s)
+;
+; Buffer size: Caller must provide at least 7 bytes for the buffer:
+;   - Sign: 1 byte (optional '-')
+;   - Digits: up to 5 bytes (-32768 to 32767)
+;   - Null terminator: 1 byte
+;
+; Algorithm:
+;   1. Handle sign (if negative, negate and remember to add '-')
+;   2. Extract digits by repeated division by 10 (generates in reverse)
+;   3. Reverse the digit string in place
+;   4. Add sign if needed
+;
+; Examples:
+;   itoa(123, buf)   -> "123"
+;   itoa(-456, buf)  -> "-456"
+;   itoa(0, buf)     -> "0"
+;   itoa(32767, buf) -> "32767"
+;
+; Code size: ~95 bytes
+; -----------------------------------------------------------------------------
+_itoa:
+        PSHX                    ; Save caller's frame pointer
+        TSX
+
+        ; Get parameters
+        LDD     4,X             ; D = n (the integer)
+        LDX     6,X             ; X = s (buffer pointer)
+        STX     _itoa_buf       ; Save buffer start for return value
+        STX     _itoa_ptr       ; Working pointer
+
+        ; Check if negative
+        CLR     _itoa_neg
+        TSTA                    ; Check sign bit (high bit of A)
+        BPL     _itoa_pos       ; If positive, skip negation
+        COM     _itoa_neg       ; Set negative flag
+        ; Negate D: D = -D
+        COMA
+        COMB
+        ADDD    #1
+
+_itoa_pos:
+        ; D = absolute value of n
+        ; Now extract digits by dividing by 10 repeatedly
+        ; Store digits in reverse order, then reverse at end
+
+        ; Special case: if n == 0, just store "0"
+        STD     _itoa_val       ; Save value
+        TSTB
+        BNE     _itoa_digit_loop
+        TSTA
+        BNE     _itoa_digit_loop
+        ; Value is 0
+        LDX     _itoa_ptr
+        LDAB    #'0'
+        STAB    0,X
+        INX
+        STX     _itoa_ptr
+        BRA     _itoa_add_sign
+
+_itoa_digit_loop:
+        ; While val > 0: digit = val % 10; val = val / 10
+        LDD     _itoa_val
+        TSTA
+        BNE     _itoa_do_div
+        TSTB
+        BEQ     _itoa_add_sign  ; val == 0, done extracting digits
+
+_itoa_do_div:
+        ; Divide D by 10, get quotient and remainder
+        ; We'll use __udiv16 which leaves remainder in __div16_rem
+        LDX     #10
+        JSR     __udiv16        ; D = D / 10, __div16_rem = D % 10
+        STD     _itoa_val       ; Save quotient as new value
+
+        ; Get remainder (the digit)
+        LDD     __div16_rem
+        ADDB    #'0'            ; Convert 0-9 to '0'-'9'
+
+        ; Store digit at current position
+        LDX     _itoa_ptr
+        STAB    0,X
+        INX
+        STX     _itoa_ptr
+
+        BRA     _itoa_digit_loop
+
+_itoa_add_sign:
+        ; Add minus sign if negative
+        TST     _itoa_neg
+        BEQ     _itoa_terminate
+        LDX     _itoa_ptr
+        LDAB    #'-'
+        STAB    0,X
+        INX
+        STX     _itoa_ptr
+
+_itoa_terminate:
+        ; Add null terminator
+        LDX     _itoa_ptr
+        CLR     0,X
+
+        ; Now reverse the string in place
+        ; Start pointer = _itoa_buf
+        ; End pointer = _itoa_ptr - 1 (last char before null)
+        LDX     _itoa_ptr
+        DEX                     ; X points to last char
+        STX     _itoa_end
+
+        LDX     _itoa_buf       ; X points to first char
+        ; Reverse while start < end
+
+_itoa_rev_loop:
+        CPX     _itoa_end       ; Compare start with end
+        BHS     _itoa_done      ; If start >= end, done reversing
+
+        ; Swap characters at start (X) and end (_itoa_end)
+        LDAB    0,X             ; B = char at start
+        PSHX                    ; Save start pointer
+        LDX     _itoa_end
+        LDAA    0,X             ; A = char at end
+        STAB    0,X             ; Store start char at end
+        PULX                    ; Restore start pointer
+        STAA    0,X             ; Store end char at start
+
+        ; Move pointers inward
+        INX                     ; start++
+        PSHX
+        LDX     _itoa_end
+        DEX                     ; end--
+        STX     _itoa_end
+        PULX
+
+        BRA     _itoa_rev_loop
+
+_itoa_done:
+        ; Return buffer pointer
+        LDD     _itoa_buf
+        PULX                    ; Restore caller's frame pointer
+        RTS
+
+; --- Local storage for _itoa ---
+_itoa_neg:      RMB     1       ; Sign flag
+_itoa_val:      RMB     2       ; Current value being converted
+_itoa_buf:      RMB     2       ; Buffer start pointer (for return)
+_itoa_ptr:      RMB     2       ; Current write position
+_itoa_end:      RMB     2       ; End pointer for reversal
+
+; -----------------------------------------------------------------------------
+; _strchr - Find first occurrence of character in string
+; -----------------------------------------------------------------------------
+; Searches the string s for the first occurrence of character c.
+; The null terminator is considered part of the string, so strchr(s, 0)
+; returns a pointer to the terminating null.
+;
+; Input:  Stack: s (pointer to string), c (character to find)
+;         After PSHX+TSX: s at 4,X, c at 6,X (low byte at 7,X)
+; Output: D = pointer to first occurrence of c, or 0 (NULL) if not found
+;
+; Examples:
+;   strchr("Hello", 'l') -> pointer to first 'l'
+;   strchr("Hello", 'x') -> 0 (NULL)
+;   strchr("Hello", 0)   -> pointer to null terminator
+;
+; Code size: ~30 bytes
+; -----------------------------------------------------------------------------
+_strchr:
+        PSHX                    ; Save caller's frame pointer
+        TSX
+        LDX     4,X             ; X = string pointer
+        TSX
+        LDAB    7,X             ; B = character to find (low byte of c argument)
+
+        ; Restore X to point to string
+        LDX     4,X             ; X = string pointer again
+
+_strchr_loop:
+        LDAA    0,X             ; A = current character in string
+        CBA                     ; Compare A with B (current char with search char)
+        BEQ     _strchr_found   ; Found the character
+
+        ; Check if we've reached null terminator (and didn't find char)
+        TSTA
+        BEQ     _strchr_not_found  ; Reached end without finding
+
+        INX                     ; Advance to next character
+        BRA     _strchr_loop
+
+_strchr_found:
+        ; Return pointer to found character
+        XGDX                    ; D = X (pointer to found char)
+        PULX                    ; Restore caller's frame pointer
+        RTS
+
+_strchr_not_found:
+        ; Return NULL (0)
+        LDD     #0
+        PULX                    ; Restore caller's frame pointer
+        RTS
+
+; -----------------------------------------------------------------------------
+; _strncpy - Copy string with length limit
+; -----------------------------------------------------------------------------
+; Copies at most n characters from src to dest. If src is shorter than n,
+; the remainder of dest is filled with null characters. If src is n or more
+; characters long, dest will NOT be null-terminated.
+;
+; WARNING: Unlike strcpy, strncpy may NOT null-terminate dest if src >= n chars.
+; Always ensure dest has space for n characters.
+;
+; Input:  Stack: dest (pointer), src (pointer), n (count)
+;         After PSHX+TSX: dest at 4,X, src at 6,X, n at 8,X
+; Output: D = dest pointer
+;
+; Behavior:
+;   - Copy up to n characters from src to dest
+;   - If null found in src before n chars, pad dest with nulls up to n
+;   - If n chars copied without finding null, dest is NOT null-terminated
+;
+; Examples:
+;   strncpy(buf, "Hi", 5)   -> buf = "Hi\0\0\0" (padded with nulls)
+;   strncpy(buf, "Hello", 3) -> buf = "Hel" (NOT null-terminated!)
+;
+; Code size: ~60 bytes
+; -----------------------------------------------------------------------------
+_strncpy:
+        PSHX                    ; Save caller's frame pointer
+        TSX
+
+        ; Save dest for return value
+        LDD     4,X             ; dest
+        STD     _strncpy_ret    ; Save for return
+
+        ; Copy parameters to working storage
+        LDD     4,X             ; dest
+        STD     _strncpy_dst
+        LDD     6,X             ; src
+        STD     _strncpy_src
+        LDD     8,X             ; n
+        STD     _strncpy_n
+
+_strncpy_copy:
+        ; Check if n == 0
+        LDD     _strncpy_n
+        TSTB
+        BNE     _strncpy_do_copy
+        TSTA
+        BEQ     _strncpy_done   ; n == 0, done
+
+_strncpy_do_copy:
+        ; Decrement n
+        SUBD    #1
+        STD     _strncpy_n
+
+        ; Get character from src
+        LDX     _strncpy_src
+        LDAB    0,X             ; B = *src
+
+        ; Store to dest
+        LDX     _strncpy_dst
+        STAB    0,X             ; *dest = B
+
+        ; Advance pointers
+        LDX     _strncpy_src
+        INX
+        STX     _strncpy_src
+        LDX     _strncpy_dst
+        INX
+        STX     _strncpy_dst
+
+        ; Check if we just copied a null
+        TSTB
+        BEQ     _strncpy_pad    ; If null, switch to padding mode
+        BRA     _strncpy_copy   ; Continue copying
+
+_strncpy_pad:
+        ; Pad remainder with nulls
+        LDD     _strncpy_n
+        TSTB
+        BNE     _strncpy_do_pad
+        TSTA
+        BEQ     _strncpy_done   ; n == 0, done padding
+
+_strncpy_do_pad:
+        ; Decrement n
+        LDD     _strncpy_n
+        SUBD    #1
+        STD     _strncpy_n
+
+        ; Store null to dest
+        LDX     _strncpy_dst
+        CLR     0,X
+        INX
+        STX     _strncpy_dst
+
+        BRA     _strncpy_pad
+
+_strncpy_done:
+        ; Return original dest
+        LDD     _strncpy_ret
+        PULX                    ; Restore caller's frame pointer
+        RTS
+
+; --- Local storage for _strncpy ---
+_strncpy_ret:   RMB     2       ; Return value (original dest)
+_strncpy_dst:   RMB     2       ; Working dest pointer
+_strncpy_src:   RMB     2       ; Working src pointer
+_strncpy_n:     RMB     2       ; Remaining count
+
+; -----------------------------------------------------------------------------
+; _strncmp - Compare strings with length limit
+; -----------------------------------------------------------------------------
+; Compares at most n characters of two strings. Comparison stops when:
+;   - A difference is found
+;   - A null terminator is reached in either string
+;   - n characters have been compared
+;
+; Input:  Stack: s1 (pointer), s2 (pointer), n (count)
+;         After PSHX+TSX: s1 at 4,X, s2 at 6,X, n at 8,X
+; Output: D = 0 if equal, <0 if s1<s2, >0 if s1>s2
+;
+; The comparison is done using unsigned character values (standard C behavior).
+;
+; Examples:
+;   strncmp("abc", "abd", 3) -> negative (c < d)
+;   strncmp("abc", "abc", 3) -> 0 (equal)
+;   strncmp("abc", "ab", 3)  -> positive (c > null)
+;   strncmp("abcd", "abce", 2) -> 0 (only first 2 chars compared)
+;
+; Code size: ~55 bytes
+; -----------------------------------------------------------------------------
+_strncmp:
+        PSHX                    ; Save caller's frame pointer
+        TSX
+
+        ; Copy parameters to working storage
+        LDD     4,X             ; s1
+        STD     _strncmp_s1
+        LDD     6,X             ; s2
+        STD     _strncmp_s2
+        LDD     8,X             ; n
+        STD     _strncmp_n
+
+_strncmp_loop:
+        ; Check if n == 0
+        LDD     _strncmp_n
+        TSTB
+        BNE     _strncmp_cont
+        TSTA
+        BEQ     _strncmp_equal  ; n == 0, strings are equal so far
+
+_strncmp_cont:
+        ; Decrement n
+        SUBD    #1
+        STD     _strncmp_n
+
+        ; Get characters from both strings
+        LDX     _strncmp_s1
+        LDAA    0,X             ; A = *s1
+        INX
+        STX     _strncmp_s1
+
+        LDX     _strncmp_s2
+        LDAB    0,X             ; B = *s2
+        INX
+        STX     _strncmp_s2
+
+        ; Compare characters
+        SBA                     ; A = A - B (*s1 - *s2)
+        BNE     _strncmp_diff   ; If different, return the difference
+
+        ; Characters are equal - check if we reached null terminator
+        TSTB                    ; Test *s2 (which equals *s1)
+        BEQ     _strncmp_equal  ; Both strings ended
+
+        BRA     _strncmp_loop   ; Continue comparing
+
+_strncmp_equal:
+        LDD     #0
+        PULX                    ; Restore caller's frame pointer
+        RTS
+
+_strncmp_diff:
+        ; A contains the difference (s1[i] - s2[i])
+        ; Sign-extend A to D
+        TAB                     ; B = A
+        BPL     _strncmp_pos
+        LDAA    #$FF            ; Sign-extend negative
+        BRA     _strncmp_return
+_strncmp_pos:
+        CLRA                    ; Sign-extend positive
+_strncmp_return:
+        ; D = sign-extended difference
+        PULX                    ; Restore caller's frame pointer
+        RTS
+
+; --- Local storage for _strncmp ---
+_strncmp_s1:    RMB     2       ; Working s1 pointer
+_strncmp_s2:    RMB     2       ; Working s2 pointer
+_strncmp_n:     RMB     2       ; Remaining count
+
+; =============================================================================
+; End of Standard Library Expansion - Phase 2
+; =============================================================================
+
+; =============================================================================
+; ASSEMBLY CONVENIENCE MACROS
+; =============================================================================
+; These macros simplify calling runtime functions from assembly code.
+; They handle the stack setup and cleanup automatically.
+;
+; IMPORTANT: All macros leave the result in D register.
+;            Macros may clobber A, B, X, and flags.
+;
+; MACRO CATEGORIES:
+;   Display:    CLS, CURSOR, AT, PRINT, PRINT_INT, PRINT_UINT, PRINT_HEX, PUTCHAR
+;   Input:      GETKEY, TESTKEY, KBHIT, FLUSHKB
+;   Sound:      BEEP, ALARM, TONE
+;   Timing:     DELAY, GETTICKS
+;   Math:       ABS, MIN, MAX
+;   String:     STRLEN, STRCPY, STRCMP, STRCAT, STRCHR, STRNCPY, STRNCMP
+;   Memory:     MEMCPY, MEMSET, MEMCMP
+;   Conversion: ATOI, ITOA
+;   Graphics:   UDG_DEFINE
+;   System:     GETTIME
+;   LZ-only:    SETMODE, GETMODE, PUSHMODE, POPMODE
+; =============================================================================
+
+; =============================================================================
+; DISPLAY MACROS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; CLS - Clear screen
+; -----------------------------------------------------------------------------
+; Usage: CLS
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO CLS
+    JSR     _cls
+ENDM
+
+; -----------------------------------------------------------------------------
+; CURSOR - Position cursor
+; -----------------------------------------------------------------------------
+; Usage: CURSOR position
+; Input: position - 0-31 for 2-line, 0-79 for 4-line
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO CURSOR, position
+    LDD     #\position
+    PSHB
+    PSHA
+    JSR     _cursor
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; AT - Position cursor by row and column
+; -----------------------------------------------------------------------------
+; Usage: AT row, col
+; Input: row (0-1 or 0-3), col (0-15 or 0-19)
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO AT, row, col
+    LDD     #\col
+    PSHB
+    PSHA
+    LDD     #\row
+    PSHB
+    PSHA
+    JSR     _at
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; PRINT - Print null-terminated string
+; -----------------------------------------------------------------------------
+; Usage: PRINT string_addr
+; Input: string_addr - Address of null-terminated string
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO PRINT, string_addr
+    LDD     #\string_addr
+    PSHB
+    PSHA
+    JSR     _print
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; PRINT_INT - Print signed integer
+; -----------------------------------------------------------------------------
+; Usage: PRINT_INT value
+; Input: value - 16-bit signed integer (label or immediate)
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO PRINT_INT, value
+    LDD     \value
+    PSHB
+    PSHA
+    JSR     _print_int
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; PRINT_UINT - Print unsigned integer
+; -----------------------------------------------------------------------------
+; Usage: PRINT_UINT value
+; Input: value - 16-bit unsigned integer (label or immediate)
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO PRINT_UINT, value
+    LDD     \value
+    PSHB
+    PSHA
+    JSR     _print_uint
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; PRINT_HEX - Print integer as 4 hex digits
+; -----------------------------------------------------------------------------
+; Usage: PRINT_HEX value
+; Input: value - 16-bit value (label or immediate)
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO PRINT_HEX, value
+    LDD     \value
+    PSHB
+    PSHA
+    JSR     _print_hex
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; PUTCHAR - Output single character
+; -----------------------------------------------------------------------------
+; Usage: PUTCHAR char_value
+; Input: char_value - ASCII character value
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO PUTCHAR, char_value
+    LDD     #\char_value
+    PSHB
+    PSHA
+    JSR     _putchar
+    INS
+    INS
+ENDM
+
+; =============================================================================
+; INPUT MACROS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; GETKEY - Wait for and get keypress
+; -----------------------------------------------------------------------------
+; Usage: GETKEY
+; Output: D = key code (low byte)
+; -----------------------------------------------------------------------------
+MACRO GETKEY
+    JSR     _getkey
+ENDM
+
+; -----------------------------------------------------------------------------
+; TESTKEY - Test if key available (non-blocking with 50ms poll)
+; -----------------------------------------------------------------------------
+; Usage: TESTKEY
+; Output: D = key code if available, 0 if not
+; -----------------------------------------------------------------------------
+MACRO TESTKEY
+    JSR     _testkey
+ENDM
+
+; -----------------------------------------------------------------------------
+; KBHIT - Check if key is in buffer (non-blocking)
+; -----------------------------------------------------------------------------
+; Usage: KBHIT
+; Output: D = 1 if key available, 0 if not
+; -----------------------------------------------------------------------------
+MACRO KBHIT
+    JSR     _kbhit
+ENDM
+
+; -----------------------------------------------------------------------------
+; FLUSHKB - Flush keyboard buffer
+; -----------------------------------------------------------------------------
+; Usage: FLUSHKB
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO FLUSHKB
+    JSR     _flushkb
+ENDM
+
+; =============================================================================
+; SOUND MACROS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; BEEP - Sound a beep
+; -----------------------------------------------------------------------------
+; Usage: BEEP
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO BEEP
+    JSR     _beep
+ENDM
+
+; -----------------------------------------------------------------------------
+; ALARM - Sound alarm pattern
+; -----------------------------------------------------------------------------
+; Usage: ALARM
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO ALARM
+    JSR     _alarm
+ENDM
+
+; -----------------------------------------------------------------------------
+; TONE - Generate custom tone
+; -----------------------------------------------------------------------------
+; Usage: TONE pitch, duration
+; Input: pitch (higher = lower pitch), duration (1/32 sec units)
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO TONE, pitch, duration
+    LDD     #\duration
+    PSHB
+    PSHA
+    LDD     #\pitch
+    PSHB
+    PSHA
+    JSR     _tone
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; =============================================================================
+; TIMING MACROS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; DELAY - Wait for specified ticks (1 tick ≈ 1/32 second)
+; -----------------------------------------------------------------------------
+; Usage: DELAY ticks
+; Input: ticks - Number of 1/32 second ticks to wait
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO DELAY, ticks
+    LDD     #\ticks
+    PSHB
+    PSHA
+    JSR     _delay
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; GETTICKS - Get system tick counter
+; -----------------------------------------------------------------------------
+; Usage: GETTICKS
+; Output: D = current tick count
+; -----------------------------------------------------------------------------
+MACRO GETTICKS
+    JSR     _getticks
+ENDM
+
+; =============================================================================
+; MATH MACROS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; ABS - Absolute value
+; -----------------------------------------------------------------------------
+; Usage: ABS value
+; Input: value - 16-bit signed integer (label or immediate)
+; Output: D = |value|
+; -----------------------------------------------------------------------------
+MACRO ABS, value
+    LDD     \value
+    PSHB
+    PSHA
+    JSR     _abs
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; MIN - Minimum of two values
+; -----------------------------------------------------------------------------
+; Usage: MIN a, b
+; Input: a, b - 16-bit signed integers (labels or immediates)
+; Output: D = minimum of a and b
+; -----------------------------------------------------------------------------
+MACRO MIN, a, b
+    LDD     \b
+    PSHB
+    PSHA
+    LDD     \a
+    PSHB
+    PSHA
+    JSR     _min
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; MAX - Maximum of two values
+; -----------------------------------------------------------------------------
+; Usage: MAX a, b
+; Input: a, b - 16-bit signed integers (labels or immediates)
+; Output: D = maximum of a and b
+; -----------------------------------------------------------------------------
+MACRO MAX, a, b
+    LDD     \b
+    PSHB
+    PSHA
+    LDD     \a
+    PSHB
+    PSHA
+    JSR     _max
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; =============================================================================
+; STRING MACROS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; STRLEN - Get string length
+; -----------------------------------------------------------------------------
+; Usage: STRLEN string_addr
+; Input: string_addr - Address of null-terminated string
+; Output: D = length (not including null)
+; -----------------------------------------------------------------------------
+MACRO STRLEN, string_addr
+    LDD     #\string_addr
+    PSHB
+    PSHA
+    JSR     _strlen
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; STRCPY - Copy string
+; -----------------------------------------------------------------------------
+; Usage: STRCPY dest_addr, src_addr
+; Input: dest_addr, src_addr - String addresses
+; Output: D = dest_addr
+; -----------------------------------------------------------------------------
+MACRO STRCPY, dest_addr, src_addr
+    LDD     #\src_addr
+    PSHB
+    PSHA
+    LDD     #\dest_addr
+    PSHB
+    PSHA
+    JSR     _strcpy
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; STRCMP - Compare strings
+; -----------------------------------------------------------------------------
+; Usage: STRCMP s1_addr, s2_addr
+; Input: s1_addr, s2_addr - String addresses
+; Output: D = 0 if equal, <0 if s1<s2, >0 if s1>s2
+; -----------------------------------------------------------------------------
+MACRO STRCMP, s1_addr, s2_addr
+    LDD     #\s2_addr
+    PSHB
+    PSHA
+    LDD     #\s1_addr
+    PSHB
+    PSHA
+    JSR     _strcmp
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; STRCAT - Concatenate strings
+; -----------------------------------------------------------------------------
+; Usage: STRCAT dest_addr, src_addr
+; Input: dest_addr - Destination (must have room), src_addr - String to append
+; Output: D = dest_addr
+; -----------------------------------------------------------------------------
+MACRO STRCAT, dest_addr, src_addr
+    LDD     #\src_addr
+    PSHB
+    PSHA
+    LDD     #\dest_addr
+    PSHB
+    PSHA
+    JSR     _strcat
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; STRCHR - Find first occurrence of character in string
+; -----------------------------------------------------------------------------
+; Usage: STRCHR string_addr, char_value
+; Input: string_addr - String to search, char_value - Character to find
+; Output: D = Pointer to found character, or 0 if not found
+; -----------------------------------------------------------------------------
+MACRO STRCHR, string_addr, char_value
+    LDD     #\char_value
+    PSHB
+    PSHA
+    LDD     #\string_addr
+    PSHB
+    PSHA
+    JSR     _strchr
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; STRNCPY - Bounded string copy
+; -----------------------------------------------------------------------------
+; Usage: STRNCPY dest_addr, src_addr, max_chars
+; Input: dest_addr, src_addr, max_chars
+; Output: D = dest_addr
+; WARNING: If src >= max_chars, dest will NOT be null-terminated!
+; -----------------------------------------------------------------------------
+MACRO STRNCPY, dest_addr, src_addr, max_chars
+    LDD     #\max_chars
+    PSHB
+    PSHA
+    LDD     #\src_addr
+    PSHB
+    PSHA
+    LDD     #\dest_addr
+    PSHB
+    PSHA
+    JSR     _strncpy
+    INS
+    INS
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; STRNCMP - Bounded string comparison
+; -----------------------------------------------------------------------------
+; Usage: STRNCMP s1_addr, s2_addr, max_chars
+; Input: s1_addr, s2_addr, max_chars
+; Output: D = 0 if equal, <0 if s1<s2, >0 if s1>s2
+; -----------------------------------------------------------------------------
+MACRO STRNCMP, s1_addr, s2_addr, max_chars
+    LDD     #\max_chars
+    PSHB
+    PSHA
+    LDD     #\s2_addr
+    PSHB
+    PSHA
+    LDD     #\s1_addr
+    PSHB
+    PSHA
+    JSR     _strncmp
+    INS
+    INS
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; =============================================================================
+; MEMORY MACROS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; MEMCPY - Copy memory block
+; -----------------------------------------------------------------------------
+; Usage: MEMCPY dest_addr, src_addr, count
+; Input: dest_addr, src_addr, count (bytes)
+; Output: D = dest_addr
+; -----------------------------------------------------------------------------
+MACRO MEMCPY, dest_addr, src_addr, count
+    LDD     #\count
+    PSHB
+    PSHA
+    LDD     #\src_addr
+    PSHB
+    PSHA
+    LDD     #\dest_addr
+    PSHB
+    PSHA
+    JSR     _memcpy
+    INS
+    INS
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; MEMSET - Fill memory block
+; -----------------------------------------------------------------------------
+; Usage: MEMSET dest_addr, byte_value, count
+; Input: dest_addr, byte_value (0-255), count (bytes)
+; Output: D = dest_addr
+; -----------------------------------------------------------------------------
+MACRO MEMSET, dest_addr, byte_value, count
+    LDD     #\count
+    PSHB
+    PSHA
+    LDD     #\byte_value
+    PSHB
+    PSHA
+    LDD     #\dest_addr
+    PSHB
+    PSHA
+    JSR     _memset
+    INS
+    INS
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; MEMCMP - Compare memory blocks
+; -----------------------------------------------------------------------------
+; Usage: MEMCMP a_addr, b_addr, count
+; Input: a_addr, b_addr, count (bytes)
+; Output: D = 0 if equal, <0 if a<b, >0 if a>b
+; -----------------------------------------------------------------------------
+MACRO MEMCMP, a_addr, b_addr, count
+    LDD     #\count
+    PSHB
+    PSHA
+    LDD     #\b_addr
+    PSHB
+    PSHA
+    LDD     #\a_addr
+    PSHB
+    PSHA
+    JSR     _memcmp
+    INS
+    INS
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; =============================================================================
+; CONVERSION MACROS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; ATOI - Convert string to integer
+; -----------------------------------------------------------------------------
+; Usage: ATOI string_addr
+; Input: string_addr - Address of null-terminated string
+; Output: D = Parsed integer value (0 if no valid digits)
+; -----------------------------------------------------------------------------
+MACRO ATOI, string_addr
+    LDD     #\string_addr
+    PSHB
+    PSHA
+    JSR     _atoi
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; ITOA - Convert integer to string
+; -----------------------------------------------------------------------------
+; Usage: ITOA value, buffer_addr
+; Input: value (label), buffer_addr (min 7 bytes)
+; Output: D = Pointer to buffer
+; -----------------------------------------------------------------------------
+MACRO ITOA, value, buffer_addr
+    LDD     #\buffer_addr
+    PSHB
+    PSHA
+    LDD     \value
+    PSHB
+    PSHA
+    JSR     _itoa
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; =============================================================================
+; GRAPHICS MACROS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; UDG_DEFINE - Define User Defined Graphic character
+; -----------------------------------------------------------------------------
+; Usage: UDG_DEFINE char_num, data_addr
+; Input: char_num (0-7), data_addr (pointer to 8 bytes of bitmap data)
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO UDG_DEFINE, char_num, data_addr
+    LDD     #\data_addr
+    PSHB
+    PSHA
+    LDD     #\char_num
+    PSHB
+    PSHA
+    JSR     _udg_define
+    INS
+    INS
+    INS
+    INS
+ENDM
+
+; =============================================================================
+; SYSTEM MACROS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; GETTIME - Get current time from RTC
+; -----------------------------------------------------------------------------
+; Usage: GETTIME buffer_addr
+; Input: buffer_addr - Pointer to 6-byte buffer for YY MM DD HH MM SS (BCD)
+; Output: Time data written to buffer
+; -----------------------------------------------------------------------------
+MACRO GETTIME, buffer_addr
+    LDD     #\buffer_addr
+    PSHB
+    PSHA
+    JSR     _gettime
+    INS
+    INS
+ENDM
+
+; =============================================================================
+; LZ-ONLY DISPLAY MODE MACROS
+; =============================================================================
+; These macros are for LZ/LZ64 4-line display machines only.
+; On CM/XP (2-line), these may cause undefined behavior.
+
+; -----------------------------------------------------------------------------
+; SETMODE - Set display mode (LZ only)
+; -----------------------------------------------------------------------------
+; Usage: SETMODE mode
+; Input: mode - 0=2-line, 1=4-line
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO SETMODE, mode
+    LDD     #\mode
+    PSHB
+    PSHA
+    JSR     _setmode
+    INS
+    INS
+ENDM
+
+; -----------------------------------------------------------------------------
+; GETMODE - Get current display mode (LZ only)
+; -----------------------------------------------------------------------------
+; Usage: GETMODE
+; Output: D = mode (0=2-line, 1=4-line)
+; -----------------------------------------------------------------------------
+MACRO GETMODE
+    JSR     _getmode
+ENDM
+
+; -----------------------------------------------------------------------------
+; PUSHMODE - Save current display mode (LZ only)
+; -----------------------------------------------------------------------------
+; Usage: PUSHMODE
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO PUSHMODE
+    JSR     _pushmode
+ENDM
+
+; -----------------------------------------------------------------------------
+; POPMODE - Restore saved display mode (LZ only)
+; -----------------------------------------------------------------------------
+; Usage: POPMODE
+; Output: None
+; -----------------------------------------------------------------------------
+MACRO POPMODE
+    JSR     _popmode
+ENDM
+
+; =============================================================================
+; End of Assembly Convenience Macros
+; =============================================================================
+
 ; -----------------------------------------------------------------------------
 ; _print_uint - Print unsigned integer
 ; Input:  Stack: n (16-bit unsigned)

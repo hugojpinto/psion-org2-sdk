@@ -237,8 +237,21 @@ psion-org2-sdk/
 │   ├── runtime.inc    # Assembly runtime library
 │   └── syscalls.inc   # System call definitions
 ├── examples/          # Example programs
+├── docs/              # Documentation
 └── tests/             # Test suite
 ```
+
+## Documentation
+
+Comprehensive documentation is available in the `docs/` directory:
+
+| Document | Description |
+|----------|-------------|
+| [CLI Tools Manual](docs/cli-tools.md) | Complete reference for psbuild, pscc, psasm, psopk, pslink, psdisasm |
+| [Small-C Programming](docs/small-c-prog.md) | Small-C language guide, types, structs, external OPL calls |
+| [Assembly Programming](docs/asm-prog.md) | HD6303 assembly reference, instruction set, system calls |
+| [Core Library (stdlib)](docs/stdlib.md) | String functions, character classification (ctype.h) |
+| [Extended Library (stdio)](docs/stdio.md) | sprintf, strrchr, strstr, strncat |
 
 ## Example Programs
 
