@@ -28,32 +28,34 @@ pip install -e .
 
 ## Quick Start
 
-### Write a C Program
+### 1. Write a C Program
+
+Create a file called `hello.c`:
 
 ```c
-// hello.c
 #include <psion.h>
 
-int main() {
+void main() {
     cls();
     print("Hello, Psion!");
     getkey();
-    return 0;
 }
 ```
 
-### Build and Package
+### 2. Build and Package
 
 ```bash
 # Compile C to assembly
-pscc hello.c -o hello.asm -I include
+pscc -I include hello.c -o hello.asm
 
-# Assemble with self-relocation support
+# Assemble to OB3 object file
 psasm -r -I include hello.asm -o HELLO.ob3
 
 # Create OPK pack file
 psopk create -o HELLO.opk HELLO.ob3
 ```
+
+> **Important:** The `-I include` flag is required for both `pscc` and `psasm`. It tells the tools where to find the SDK's header files (`psion.h`, `runtime.inc`, etc.). The `-r` flag generates self-relocating code, which is required for C programs.
 
 ### Transfer to Device
 
@@ -87,11 +89,14 @@ print(emu.display_text)
 ### pscc - Small-C Compiler
 
 ```bash
-pscc hello.c -o hello.asm              # Basic compile
-pscc -m LZ hello.c -o hello.asm        # Target 4-line display
-pscc -I include hello.c -o hello.asm   # Add include path
-pscc --version                         # Show version
+pscc -I include hello.c -o hello.asm       # Compile C to assembly
+pscc -m LZ -I include hello.c -o hello.asm # Target 4-line display
+pscc --version                             # Show version
 ```
+
+**Key flags:**
+- `-I include` - **Required.** Path to SDK header files (psion.h)
+- `-m MODEL` - Target model: CM, XP, LZ, LZ64, PORTABLE
 
 **Supported C features:**
 - `int` (16-bit), `char` (8-bit) types
@@ -103,17 +108,17 @@ pscc --version                         # Show version
 ### psasm - HD6303 Assembler
 
 ```bash
-psasm hello.asm -o hello.ob3           # Basic assembly
-psasm -r hello.asm -o hello.ob3        # Self-relocating code
-psasm -m LZ hello.asm -o hello.ob3     # Target 4-line display
-psasm -l hello.lst hello.asm           # Generate listing
-psasm --version                        # Show version
+psasm -r -I include hello.asm -o hello.ob3    # Assemble C-generated code
+psasm -I include hello.asm -o hello.ob3       # Assemble hand-written assembly
+psasm -r -m LZ -I include hello.asm           # Target 4-line display
+psasm -l hello.lst -I include hello.asm       # Generate listing
+psasm --version                               # Show version
 ```
 
 **Key flags:**
+- `-I include` - **Required.** Path to SDK header files (runtime.inc, psion.inc, etc.)
 - `-r` - Generate self-relocating code (required for C programs)
 - `-m MODEL` - Target model: CM, XP, LZ, LZ64, PORTABLE
-- `-I PATH` - Add include search path
 
 ### psopk - OPK Pack Builder
 
