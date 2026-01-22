@@ -423,7 +423,10 @@ class CodeGenerator:
             self._pass1(statements)
 
             if self._errors.has_errors():
-                raise AssemblerError(f"Assembly failed with {self._errors.error_count()} errors")
+                raise AssemblerError(
+                    f"Assembly failed with {self._errors.error_count()} errors:\n\n"
+                    f"{self._errors.report()}"
+                )
 
             # Relaxation check: Find branches that are out of range
             newly_relaxed = self._check_branch_relaxation()
@@ -442,7 +445,10 @@ class CodeGenerator:
         self._pass2(statements)
 
         if self._errors.has_errors():
-            raise AssemblerError(f"Assembly failed with {self._errors.error_count()} errors")
+            raise AssemblerError(
+                f"Assembly failed with {self._errors.error_count()} errors:\n\n"
+                f"{self._errors.report()}"
+            )
 
         return self.build_ob3()
 
