@@ -408,7 +408,7 @@ class Assembler:
             self._codegen.set_include_paths(self._include_paths)
 
         # Read source
-        source = filepath.read_text()
+        source = filepath.read_text(encoding='utf-8')
 
         # Assemble
         return self.assemble_string(source, str(filepath))

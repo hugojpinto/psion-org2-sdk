@@ -369,12 +369,12 @@ def compile_c_to_asm(
     )
 
     # Read source and compile
-    source = source_file.read_text()
+    source = source_file.read_text(encoding='utf-8')
     compiler = SmallCCompiler(options)
     result = compiler.compile_source(source, str(source_file))
 
     # Write assembly output
-    output_asm.write_text(result.assembly)
+    output_asm.write_text(result.assembly, encoding='utf-8')
 
     if verbose:
         click.echo(f"      Generated {len(result.assembly)} bytes of assembly")
@@ -696,7 +696,7 @@ def main(
 
                 if source_type == "c" and temp_asm.exists():
                     keep_asm = output_dir / f"{proc_name.lower()}.asm"
-                    keep_asm.write_text(temp_asm.read_text())
+                    keep_asm.write_text(temp_asm.read_text(encoding='utf-8'), encoding='utf-8')
                     if verbose:
                         click.echo(f"Kept: {keep_asm}")
 

@@ -171,7 +171,7 @@ class SmallCCompiler:
         if not path.exists():
             raise FileNotFoundError(f"Source file not found: {filepath}")
 
-        source = path.read_text()
+        source = path.read_text(encoding='utf-8')
 
         # Add source directory to include paths
         source_dir = str(path.parent)
@@ -341,6 +341,6 @@ def compile_file(
     result = compiler.compile_file(filepath)
 
     if output_path:
-        Path(output_path).write_text(result.assembly)
+        Path(output_path).write_text(result.assembly, encoding='utf-8')
 
     return result.assembly

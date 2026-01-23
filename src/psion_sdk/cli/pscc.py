@@ -146,7 +146,7 @@ def main(
             click.echo(f"Target model: {model_str}")
             click.echo(f"Include paths: {', '.join(include_paths)}")
 
-        source = input_file.read_text()
+        source = input_file.read_text(encoding='utf-8')
 
         # Create compiler
         compiler = SmallCCompiler(options)
@@ -170,7 +170,7 @@ def main(
             return
 
         # Write output
-        output.write_text(result.assembly)
+        output.write_text(result.assembly, encoding='utf-8')
 
         if verbose:
             click.echo(f"Wrote {len(result.assembly)} bytes to {output}")

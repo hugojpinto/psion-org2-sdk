@@ -440,7 +440,7 @@ class Preprocessor:
 
         # Read and process the included file
         try:
-            include_source = include_path.read_text()
+            include_source = include_path.read_text(encoding='utf-8')
         except OSError as e:
             raise CIncludeError(
                 filename,

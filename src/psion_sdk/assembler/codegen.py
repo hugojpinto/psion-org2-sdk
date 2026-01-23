@@ -1890,7 +1890,7 @@ class CodeGenerator:
 
         # Read and parse include file
         try:
-            source = filepath.read_text()
+            source = filepath.read_text(encoding='utf-8')
             lexer = Lexer(source, str(filepath))
             tokens = list(lexer.tokenize())
             parser = Parser(tokens, str(filepath))
@@ -1927,7 +1927,7 @@ class CodeGenerator:
             return  # Error already reported in pass 1
 
         try:
-            source = filepath.read_text()
+            source = filepath.read_text(encoding='utf-8')
             lexer = Lexer(source, str(filepath))
             tokens = list(lexer.tokenize())
             parser = Parser(tokens, str(filepath))

@@ -226,7 +226,7 @@ class TestDiagnostics:
                     test_name = self._test_name or "unknown"
                     filename = f"{test_name}_{timestamp}.txt"
                     path = self._ctx.config.ensure_screenshot_dir() / filename
-                path.write_text(text)
+                path.write_text(text, encoding='utf-8')
                 return path
 
             # Save PNG

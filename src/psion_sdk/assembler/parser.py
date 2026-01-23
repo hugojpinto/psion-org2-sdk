@@ -1147,7 +1147,7 @@ def _collect_macros_from_includes(
 
                     # Recursively collect macros from included file
                     try:
-                        include_source = include_path.read_text()
+                        include_source = include_path.read_text(encoding='utf-8')
                         child_macros = _collect_macros_from_includes(
                             include_source,
                             str(include_path),

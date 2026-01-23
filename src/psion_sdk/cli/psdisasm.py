@@ -237,7 +237,7 @@ def main(
 
     if output:
         try:
-            output.write_text(result)
+            output.write_text(result, encoding='utf-8')
             if verbose:
                 click.echo(f"Output written to: {output}", err=True)
         except IOError as e:
