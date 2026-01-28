@@ -781,6 +781,117 @@ buf:     RMB    8
 
 ---
 
+## OPL Function Bridge
+
+These functions bridge common OPL operations to C, providing cursor control, keyboard modes, string input, timing, random numbers, and power management.
+
+### Display Control
+
+| Function | Description | Returns |
+|----------|-------------|---------|
+| `locate(col, row)` | Position cursor by column and row (0-based) | - |
+| `cursor_on()` | Show block cursor | - |
+| `cursor_off()` | Hide cursor | - |
+| `gcursor()` | Get current cursor position | Position (0-31 or 0-79) |
+
+```c
+#include <psion.h>
+
+void main() {
+    cls();
+    locate(5, 0);        /* Column 5, row 0 */
+    cursor_on();
+    print("Edit here");
+    cursor_off();
+}
+```
+
+### Keyboard Control
+
+| Function | Description | Returns |
+|----------|-------------|---------|
+| `kstat(mode)` | Set keyboard mode (1-4) | - |
+| `input_str(buf, maxlen)` | Read string from keyboard | Length or -1 |
+| `edit_str(buf, maxlen)` | Edit existing string | Length or -1 |
+
+**Keyboard modes:** 1=alpha upper, 2=alpha lower, 3=numeric upper, 4=numeric lower
+
+```c
+#include <psion.h>
+
+void main() {
+    char name[20];
+    int len;
+    cls();
+    print("Name: ");
+    cursor_on();
+    len = input_str(name, 19);
+    cursor_off();
+    if (len >= 0) {
+        cls();
+        print("Hello ");
+        print(name);
+    }
+    getkey();
+}
+```
+
+### Timing
+
+| Function | Description | Returns |
+|----------|-------------|---------|
+| `pause(ticks)` | Enhanced pause with key support | Key code or 0 |
+
+**Pause behavior by sign:**
+- `ticks > 0`: Wait exactly, ignore keys, return 0
+- `ticks < 0`: Wait up to |ticks|, return key or 0 on timeout
+- `ticks == 0`: Wait forever for key, return key code
+
+```c
+int key = pause(-100);  /* Wait up to 2 seconds */
+if (key) {
+    print("Key pressed!");
+}
+```
+
+### Random Numbers
+
+| Function | Description | Returns |
+|----------|-------------|---------|
+| `srand(seed)` | Seed PRNG with value | - |
+| `rand()` | Generate random integer | 16-bit value |
+| `randomize()` | Seed from system timer | - |
+
+```c
+#include <psion.h>
+
+void main() {
+    int r;
+    randomize();
+    r = rand() % 6 + 1;  /* Dice roll 1-6 */
+    print_int(r);
+    getkey();
+}
+```
+
+### System
+
+| Function | Description | Returns |
+|----------|-------------|---------|
+| `off()` | Power off device (resumes on wake) | - |
+
+### OPL Bridge ASM Macros
+
+| Macro | Arguments | Description |
+|-------|-----------|-------------|
+| `LOCATE` | col, row | Position cursor by column and row |
+| `CURSOR_ON` | - | Show block cursor |
+| `CURSOR_OFF` | - | Hide cursor |
+| `KSTAT` | mode | Set keyboard mode (1-4) |
+| `RANDOMIZE` | - | Seed PRNG from timer |
+
+---
+
 ## See Also
 
 - [small-c-prog.md](small-c-prog.md) - Small-C Programming Manual (comprehensive guide)

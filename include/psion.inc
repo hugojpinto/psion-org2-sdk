@@ -149,6 +149,98 @@ MACRO POWEROFF
     FCB     BT_SWOF
 ENDM
 
+; -----------------------------------------------------------------------------
+; LOCATE - Position cursor by column and row
+; Usage: LOCATE 5, 2     ; Move to column 5, row 2
+; Input: Column (0-based), Row (0-based)
+; Computes linear position and calls DP$STAT preserving cursor state
+; -----------------------------------------------------------------------------
+MACRO LOCATE, col, row
+#IFDEF __PSION_4LINE__
+    ; 4-line: position = row * 20 + col
+    LDAA    #\row
+    ; row * 20 = row * 16 + row * 4
+    ASLA
+    ASLA                    ; A = row * 4
+    TAB                     ; B = row * 4
+    LDAA    #\row
+    ASLA
+    ASLA
+    ASLA
+    ASLA                    ; A = row * 16
+    ABA                     ; A = row * 20
+    ADDA    #\col           ; A = row * 20 + col
+#ELSE
+    ; 2-line: position = row * 16 + col
+    LDAA    #\row
+    ASLA
+    ASLA
+    ASLA
+    ASLA                    ; A = row * 16
+    ADDA    #\col           ; A = row * 16 + col
+#ENDIF
+    LDAB    DPB_CUST        ; Preserve current cursor state
+    SWI
+    FCB     DP_STAT
+ENDM
+
+; -----------------------------------------------------------------------------
+; CURSOR_ON - Make cursor visible (block cursor)
+; Usage: CURSOR_ON
+; Shows block cursor at current position
+; -----------------------------------------------------------------------------
+MACRO CURSOR_ON
+    LDAA    DPB_CPOS        ; Current cursor position
+    LDAB    #$80            ; Bit 7 = visible, block cursor
+    SWI
+    FCB     DP_STAT
+ENDM
+
+; -----------------------------------------------------------------------------
+; CURSOR_OFF - Hide cursor
+; Usage: CURSOR_OFF
+; Hides cursor, position preserved
+; -----------------------------------------------------------------------------
+MACRO CURSOR_OFF
+    LDAA    DPB_CPOS        ; Current cursor position
+    CLRB                    ; Cursor off
+    SWI
+    FCB     DP_STAT
+ENDM
+
+; -----------------------------------------------------------------------------
+; KSTAT - Set keyboard status mode
+; Usage: KSTAT 2           ; Set to alpha lowercase
+; Modes: 1=alpha upper, 2=alpha lower, 3=numeric upper, 4=numeric lower
+; Input: Mode number (1-4)
+; -----------------------------------------------------------------------------
+MACRO KSTAT, mode
+#IF \mode == 1
+    LDAB    #$00            ; Alpha uppercase
+#ENDIF
+#IF \mode == 2
+    LDAB    #$20            ; Alpha lowercase
+#ENDIF
+#IF \mode == 3
+    LDAB    #$10            ; Numeric uppercase
+#ENDIF
+#IF \mode == 4
+    LDAB    #$30            ; Numeric lowercase
+#ENDIF
+    SWI
+    FCB     KB_STAT
+ENDM
+
+; -----------------------------------------------------------------------------
+; RANDOMIZE - Seed PRNG from system timer
+; Usage: RANDOMIZE
+; Seeds the _rand_seed variable from the system tick counter
+; Requires runtime.inc to be included for _getticks and _rand_seed
+; -----------------------------------------------------------------------------
+MACRO RANDOMIZE
+    JSR     _randomize
+ENDM
+
 ; =============================================================================
 ; Display Mode Macros (LZ/LZ64 only)
 ; =============================================================================

@@ -150,10 +150,45 @@ void at(int pos, char *s);
 /*
  * gcursor - Get current cursor position
  *
+ * Returns the linear cursor position from the DPB_CPOS system variable.
+ *
  * Returns:
- *   Current cursor position
+ *   Current cursor position (0-31 for 2x16, 0-79 for 4x20)
  */
 int gcursor(void);
+
+/*
+ * locate - Position cursor by column and row
+ *
+ * Moves the cursor to the specified column and row. This is a
+ * convenience wrapper that computes the linear position from
+ * (col, row) coordinates and calls cursor().
+ *
+ * Parameters:
+ *   col - Column (0-based, 0 to DISP_COLS-1)
+ *   row - Row (0-based, 0 to DISP_ROWS-1)
+ *
+ * Example:
+ *   locate(5, 2);        // Move to column 5, row 2
+ *   print("Here");       // Print at that position
+ */
+void locate(int col, int row);
+
+/*
+ * cursor_on - Show the cursor
+ *
+ * Makes the cursor visible at its current position as a block cursor.
+ * Uses DP$STAT with bit 7 set in the cursor state byte.
+ */
+void cursor_on(void);
+
+/*
+ * cursor_off - Hide the cursor
+ *
+ * Makes the cursor invisible. The cursor position is preserved.
+ * Uses DP$STAT with cursor state byte cleared.
+ */
+void cursor_off(void);
 
 /*
  * udg_define - Define a User Defined Graphic character
@@ -310,6 +345,83 @@ int kbhit(void);
  */
 void flushkb(void);
 
+/*
+ * kstat - Set keyboard status mode
+ *
+ * Sets the keyboard input mode, controlling whether keys produce
+ * uppercase or lowercase letters, and whether the keyboard is in
+ * alpha or numeric mode.
+ *
+ * Parameters:
+ *   mode - Keyboard mode:
+ *          1 = Alpha uppercase (default)
+ *          2 = Alpha lowercase
+ *          3 = Numeric uppercase
+ *          4 = Numeric lowercase
+ *
+ * Example:
+ *   kstat(2);           // Switch to lowercase input
+ *   char c = getkey();  // Next key will be lowercase
+ */
+void kstat(int mode);
+
+/*
+ * input_str - Read a string from keyboard input
+ *
+ * Reads characters from the keyboard into a buffer, displaying them
+ * on screen as typed. Handles backspace for editing. Input ends when
+ * the user presses EXE (enter) or is cancelled with ON/CLEAR.
+ *
+ * Parameters:
+ *   buf    - Buffer to store the input string
+ *   maxlen - Maximum number of characters to accept
+ *
+ * Returns:
+ *   Length of input string on success (0 or more)
+ *   -1 if cancelled by ON/CLEAR
+ *
+ * Notes:
+ *   - Buffer is always null-terminated on success
+ *   - Beeps when buffer is full and user tries to type more
+ *   - Handles backspace ($08) and delete ($7F) keys
+ *
+ * Example:
+ *   char buf[20];
+ *   int len;
+ *   cls();
+ *   print("Name: ");
+ *   len = input_str(buf, 19);
+ *   if (len >= 0) {
+ *       print(buf);
+ *   }
+ */
+int input_str(char *buf, int maxlen);
+
+/*
+ * edit_str - Edit an existing string
+ *
+ * Like input_str, but pre-fills the buffer with existing text.
+ * The user can edit the text using backspace and type new characters.
+ *
+ * Parameters:
+ *   buf    - Buffer containing initial string (will be modified)
+ *   maxlen - Maximum number of characters allowed
+ *
+ * Returns:
+ *   Length of edited string on success (0 or more)
+ *   -1 if cancelled by ON/CLEAR
+ *
+ * Notes:
+ *   - The initial content of buf is displayed before editing begins
+ *   - Cursor starts at end of existing text
+ *
+ * Example:
+ *   char buf[20];
+ *   strcpy(buf, "Hello");
+ *   int len = edit_str(buf, 19);
+ */
+int edit_str(char *buf, int maxlen);
+
 /* =============================================================================
  * Sound Functions
  * =============================================================================
@@ -355,6 +467,33 @@ void tone(int pitch, int duration);
  *   ticks - Number of ticks to wait (1 tick = 20ms)
  */
 void delay(int ticks);
+
+/*
+ * pause - Pause with optional key interrupt
+ *
+ * Enhanced pause with OPL PAUSE semantics. Behavior depends on the
+ * sign of the ticks parameter:
+ *
+ *   ticks > 0:  Wait for exactly ticks (1/50 sec each), ignore keys.
+ *               Returns 0.
+ *   ticks < 0:  Wait for up to |ticks|, but return early if a key
+ *               is pressed. Returns key code, or 0 if timed out.
+ *   ticks == 0: Wait forever until a key is pressed.
+ *               Returns the key code.
+ *
+ * Parameters:
+ *   ticks - Duration in 1/50 second units (see above for sign behavior)
+ *
+ * Returns:
+ *   Key code if interrupted by keypress, 0 if timed out
+ *
+ * Example:
+ *   int key;
+ *   key = pause(0);      // Wait forever for a key
+ *   key = pause(-100);   // Wait up to 2 seconds, return key or 0
+ *   pause(50);           // Wait exactly 1 second
+ */
+int pause(int ticks);
 
 /*
  * getticks - Get system tick counter
@@ -710,6 +849,63 @@ int min(int a, int b);
  *   Larger of a and b
  */
 int max(int a, int b);
+
+/*
+ * off - Power off the device
+ *
+ * Turns the Psion off. When the user turns it back on,
+ * execution resumes at the statement after off().
+ *
+ * Example:
+ *   print("Goodbye!");
+ *   off();
+ *   print("Welcome back!");
+ */
+void off(void);
+
+/*
+ * srand - Seed the random number generator
+ *
+ * Sets the seed for the pseudo-random number generator used by rand().
+ *
+ * Parameters:
+ *   seed - Initial seed value (any 16-bit integer)
+ *
+ * Example:
+ *   srand(12345);
+ *   int r = rand();
+ */
+void srand(int seed);
+
+/*
+ * rand - Generate a pseudo-random integer
+ *
+ * Returns a pseudo-random 16-bit integer using a linear congruential
+ * generator (LCG). Call srand() or randomize() first to seed.
+ *
+ * Algorithm: seed = seed * 25173 + 13849
+ *
+ * Returns:
+ *   Pseudo-random 16-bit integer
+ *
+ * Example:
+ *   randomize();
+ *   int r = rand();       // Random value
+ *   int die = r % 6 + 1;  // Roll 1-6
+ */
+int rand(void);
+
+/*
+ * randomize - Seed random number generator from system timer
+ *
+ * Seeds the PRNG with the current system tick counter, providing
+ * a different sequence each time the program runs.
+ *
+ * Example:
+ *   randomize();           // Seed from timer
+ *   int r = rand();        // Get random number
+ */
+void randomize(void);
 
 /*
  * exit - Exit program

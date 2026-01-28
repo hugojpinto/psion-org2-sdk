@@ -2613,15 +2613,12 @@ _settime:
 ; -----------------------------------------------------------------------------
 ; _gcursor - Get current cursor position
 ; Input:  None
-; Output: D = current cursor position
-; Note: The Psion doesn't have a direct "get cursor position" call
-; We track position internally or return 0 as placeholder
-; This is a limitation of the Psion display system
+; Output: D = current cursor position (0-31 for 2-line, 0-79 for 4-line)
+; Reads the DPB_CPOS system variable at $62
 ; -----------------------------------------------------------------------------
 _gcursor:
-        ; The Psion OS doesn't provide a direct cursor query
-        ; Return 0 as a placeholder
-        LDD     #0
+        LDAB    DPB_CPOS        ; Read cursor position from system variable
+        CLRA                    ; Clear high byte for 16-bit return
         RTS
 
 ; -----------------------------------------------------------------------------
@@ -2700,6 +2697,419 @@ _popmode:
         SWI
         FCB     $83         ; DP_MPOP
         RTS
+
+; =============================================================================
+; OPL Function Bridge - Additional Library Functions
+; =============================================================================
+; These functions bridge common OPL operations to C/ASM, providing
+; locate, cursor control, keyboard mode, input, pause, random, and off.
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; _locate - Position cursor by column and row
+; Input:  Stack: col (16-bit), row (16-bit)
+;         col at 4,X, row at 6,X (after PSHX+TSX)
+; Output: None
+; Computes position = row * DISP_COLS + col, then calls DP$STAT
+; Note: Uses compile-time DISP_COLS for column width
+; -----------------------------------------------------------------------------
+_locate:
+        PSHX                ; Save caller's frame pointer
+        TSX
+        ; Compute position = row * DISP_COLS + col
+        LDAB    7,X         ; row (low byte of second arg)
+        LDAA    5,X         ; col (low byte of first arg)
+        ; Multiply row by display width
+#IFDEF __PSION_4LINE__
+        ; 4-line display: width = 20 = 16 + 4
+        ; row * 20 = row * 16 + row * 4
+        PSHA                ; Save col
+        LDAA    7,X         ; Reload row
+        ; row * 4
+        ASLA
+        ASLA                ; A = row * 4
+        TAB                 ; B = row * 4
+        LDAA    7,X         ; Reload row
+        ; row * 16
+        ASLA
+        ASLA
+        ASLA
+        ASLA                ; A = row * 16
+        ABA                 ; A = row * 16 + row * 4 = row * 20
+        TAB                 ; B = row * 20
+        PULA                ; A = col
+        ABA                 ; A = col + row * 20
+#ELSE
+        ; 2-line display: width = 16
+        ; row * 16
+        ASLB
+        ASLB
+        ASLB
+        ASLB                ; B = row * 16
+        ABA                 ; A = col + row * 16
+#ENDIF
+        ; A = linear position, now call DP$STAT
+        LDAB    DPB_CUST    ; Preserve current cursor state
+        SWI
+        FCB     $14         ; DP_STAT: A = position, B = cursor state
+        PULX
+        RTS
+
+; -----------------------------------------------------------------------------
+; _cursor_on - Show the cursor (block cursor)
+; Input:  None
+; Output: None
+; Sets cursor visible by calling DP$STAT with bit 7 set in B
+; -----------------------------------------------------------------------------
+_cursor_on:
+        LDAA    DPB_CPOS    ; Current cursor position
+        LDAB    #$80        ; Bit 7 = visible, bit 0 = 0 (block cursor)
+        SWI
+        FCB     $14         ; DP_STAT
+        RTS
+
+; -----------------------------------------------------------------------------
+; _cursor_off - Hide the cursor
+; Input:  None
+; Output: None
+; Clears cursor visibility by calling DP$STAT with B = 0
+; -----------------------------------------------------------------------------
+_cursor_off:
+        LDAA    DPB_CPOS    ; Current cursor position
+        CLRB                ; B = 0 (cursor off)
+        SWI
+        FCB     $14         ; DP_STAT
+        RTS
+
+; -----------------------------------------------------------------------------
+; _kstat - Set keyboard status mode
+; Input:  Stack: mode (16-bit) — 1=alpha upper, 2=alpha lower,
+;                                3=numeric upper, 4=numeric lower
+; Output: None
+; Uses KB$STAT ($4A): B = keyboard state byte
+; Mode mapping: 1->$10, 2->$30, 3->$50, 4->$70
+; Bits: [6:4]=mode, [7]=shift indicator
+; Actually KB$STAT takes B = mode byte directly
+; OPL modes 1-4 map to KB$STAT state bytes
+; -----------------------------------------------------------------------------
+_kstat:
+        PSHX                ; Save caller's frame pointer
+        TSX
+        LDAB    5,X         ; mode (low byte)
+        ; Map OPL mode 1-4 to KB$STAT state byte
+        ; Mode 1 (alpha upper)  -> $00
+        ; Mode 2 (alpha lower)  -> $20
+        ; Mode 3 (numeric upper) -> $10
+        ; Mode 4 (numeric lower) -> $30
+        DECB                ; mode - 1 (0-based)
+        LDX     #_kstat_table
+        ABX
+        LDAB    0,X         ; Load mapped state byte
+        SWI
+        FCB     $4A         ; KB_STAT: B = state
+        PULX
+        RTS
+_kstat_table:
+        FCB     $00         ; Mode 1: alpha uppercase
+        FCB     $20         ; Mode 2: alpha lowercase
+        FCB     $10         ; Mode 3: numeric uppercase
+        FCB     $30         ; Mode 4: numeric lowercase
+
+; -----------------------------------------------------------------------------
+; _off - Power off the device
+; Input:  None
+; Output: None (returns when device is turned back on)
+; Uses BT$SWOF ($0C)
+; -----------------------------------------------------------------------------
+_off:
+        SWI
+        FCB     $0C         ; BT_SWOF: power off
+        RTS
+
+; -----------------------------------------------------------------------------
+; _pause - Enhanced pause with key interrupt support
+; Input:  Stack: ticks (16-bit, signed)
+;         ticks > 0: wait ticks, ignore keys, return 0
+;         ticks < 0: wait |ticks|, return key if pressed, 0 if timeout
+;         ticks == 0: wait forever for key, return key code
+; Output: D = key code or 0
+; -----------------------------------------------------------------------------
+_pause:
+        PSHX                ; Save caller's frame pointer
+        TSX
+        LDD     4,X         ; Get ticks argument
+        ; Test sign
+        BEQ     _pause_forever  ; ticks == 0: wait forever for key
+        BPL     _pause_timed    ; ticks > 0: simple timed wait
+        ; ticks < 0: negate and wait with key check
+        COMA                ; Negate D = -(ticks)
+        COMB
+        ADDD    #1          ; Two's complement negate
+        BRA     _pause_keywait
+
+_pause_forever:
+        ; Wait forever for a key
+        SWI
+        FCB     $48         ; KB_GETK: wait for key
+        CLRA                ; Clear high byte
+        PULX
+        RTS
+
+_pause_timed:
+        ; Simple wait, ignore keys
+        SWI
+        FCB     $6C         ; TM_WAIT: D = ticks to wait
+        LDD     #0          ; Return 0 (no key)
+        PULX
+        RTS
+
+_pause_keywait:
+        ; Wait up to D ticks, checking for keys
+        ; D = absolute tick count
+        ; Strategy: loop checking key buffer, decrementing tick counter
+        ; Use a polling approach: check key each tick period
+        STD     _pause_count    ; Save tick count
+_pause_kw_loop:
+        ; Check for keypress
+        SWI
+        FCB     $4B         ; KB_TEST: C=1 if key available
+        BCC     _pause_kw_nokey
+        ; Key available - read it
+        SWI
+        FCB     $48         ; KB_GETK: get key in B
+        CLRA                ; D = key code
+        PULX
+        RTS
+_pause_kw_nokey:
+        ; Wait 1 tick (approximately 1/50 second)
+        LDD     #1
+        SWI
+        FCB     $6C         ; TM_WAIT: wait 1 tick
+        ; Decrement counter
+        LDD     _pause_count
+        SUBD    #1
+        STD     _pause_count
+        BNE     _pause_kw_loop
+        ; Timed out
+        LDD     #0
+        PULX
+        RTS
+
+_pause_count:   RMB     2   ; Tick countdown for key-wait mode
+
+; -----------------------------------------------------------------------------
+; _srand - Seed the pseudo-random number generator
+; Input:  Stack: seed (16-bit)
+; Output: None
+; Stores seed in _rand_seed
+; -----------------------------------------------------------------------------
+_srand:
+        PSHX
+        TSX
+        LDD     4,X         ; Get seed value
+        STD     _rand_seed
+        PULX
+        RTS
+
+; -----------------------------------------------------------------------------
+; _rand - Generate pseudo-random 16-bit integer
+; Input:  None
+; Output: D = random value
+; Algorithm: Linear Congruential Generator
+;   seed = seed * 25173 + 13849
+;   (25173 = $625D, 13849 = $3619)
+; -----------------------------------------------------------------------------
+_rand:
+        LDD     _rand_seed  ; Load current seed
+        ; Multiply by 25173 ($625D) using __mul16
+        LDX     #25173
+        JSR     __mul16     ; D = seed * 25173
+        ADDD    #13849      ; D = seed * 25173 + 13849
+        STD     _rand_seed  ; Store new seed
+        RTS                 ; D = random value
+
+; -----------------------------------------------------------------------------
+; _randomize - Seed PRNG from system timer
+; Input:  None
+; Output: None
+; Uses getticks to get a timer-based seed, avoids zero
+; -----------------------------------------------------------------------------
+_randomize:
+        JSR     _getticks   ; D = current tick counter
+        ; Avoid zero seed (would produce constant sequence)
+        BNE     _randomize_store
+        LDD     #1          ; Use 1 if ticks is 0
+_randomize_store:
+        STD     _rand_seed
+        RTS
+
+; PRNG seed storage
+_rand_seed:     FDB     1   ; Default seed (non-zero)
+
+; -----------------------------------------------------------------------------
+; _input_str - Read a string from keyboard input
+; Input:  Stack: buf (pointer), maxlen (16-bit)
+;         buf at 4,X, maxlen at 6,X (after PSHX+TSX)
+; Output: D = string length on success, -1 if cancelled
+; Handles: typing, backspace, EXE to accept, ON/CLEAR to cancel
+; Key codes: EXE=$0D, ON/CLEAR=$01, BS=$08, DEL=$7F
+; -----------------------------------------------------------------------------
+_input_str:
+        PSHX                ; Save caller's frame pointer
+        TSX
+        LDX     4,X         ; Get buffer pointer
+        STX     _inp_buf    ; Store buffer base
+        STX     _inp_ptr    ; Current write position = start
+        TSX
+        LDD     6,X         ; Get maxlen
+        STD     _inp_max    ; Store max length
+        LDD     #0
+        STD     _inp_len    ; Current length = 0
+        BRA     _inp_loop
+
+; Common input loop shared by input_str and edit_str
+_inp_loop:
+        ; Wait for a key
+        SWI
+        FCB     $48         ; KB_GETK: key in B
+
+        ; Check for EXE (accept)
+        CMPB    #$0D        ; EXE/Enter
+        BEQ     _inp_accept
+
+        ; Check for ON/CLEAR (cancel)
+        CMPB    #$01        ; ON/CLEAR key code
+        BEQ     _inp_cancel
+
+        ; Check for backspace
+        CMPB    #$08        ; Backspace
+        BEQ     _inp_backspace
+        CMPB    #$7F        ; Delete key
+        BEQ     _inp_backspace
+
+        ; Regular character - check if buffer full
+        PSHB                ; Save key
+        LDD     _inp_len
+        SUBD    _inp_max    ; Compare: len - max (sets C if len < max)
+        BCC     _inp_full   ; Branch if len >= max (no borrow = full)
+
+        ; Store character in buffer
+        LDX     _inp_ptr
+        PULB                ; Restore key
+        STAB    0,X         ; Store in buffer
+        INX
+        STX     _inp_ptr    ; Advance pointer
+        ; Increment length
+        LDD     _inp_len
+        ADDD    #1
+        STD     _inp_len
+
+        ; Echo character to display
+        LDAA    0           ; Trick: reload B as A for DP_EMIT
+        ; Actually: B still has the character
+        TBA                 ; A = character
+        SWI
+        FCB     $10         ; DP_EMIT: display character in A
+        BRA     _inp_loop
+
+_inp_full:
+        ; Buffer full - beep and discard key
+        PULB                ; Discard saved key from stack
+        SWI
+        FCB     $0E         ; BZ_BELL: beep
+        BRA     _inp_loop
+
+_inp_backspace:
+        ; Delete last character
+        LDD     _inp_len
+        BEQ     _inp_loop   ; Nothing to delete, ignore
+
+        ; Decrement length
+        SUBD    #1
+        STD     _inp_len
+        ; Move pointer back
+        LDX     _inp_ptr
+        DEX
+        STX     _inp_ptr
+
+        ; Erase on display: emit BS, space, BS
+        LDAA    #$08        ; Backspace
+        SWI
+        FCB     $10         ; DP_EMIT
+        LDAA    #$20        ; Space (overwrite character)
+        SWI
+        FCB     $10         ; DP_EMIT
+        LDAA    #$08        ; Backspace again
+        SWI
+        FCB     $10         ; DP_EMIT
+        BRA     _inp_loop
+
+_inp_accept:
+        ; Null-terminate buffer
+        LDX     _inp_ptr
+        CLR     0,X         ; Store null terminator
+        ; Return length
+        LDD     _inp_len
+        PULX
+        RTS
+
+_inp_cancel:
+        ; Null-terminate buffer (in case caller wants partial input)
+        LDX     _inp_ptr
+        CLR     0,X
+        ; Return -1
+        LDD     #$FFFF      ; -1
+        PULX
+        RTS
+
+; Input function work variables
+_inp_buf:       RMB     2   ; Buffer base pointer
+_inp_ptr:       RMB     2   ; Current write pointer
+_inp_len:       RMB     2   ; Current string length
+_inp_max:       RMB     2   ; Maximum allowed length
+
+; -----------------------------------------------------------------------------
+; _edit_str - Edit an existing string
+; Input:  Stack: buf (pointer), maxlen (16-bit)
+;         buf at 4,X, maxlen at 6,X (after PSHX+TSX)
+; Output: D = string length on success, -1 if cancelled
+; Pre-displays buffer content and positions cursor at end
+; Then enters the same input loop as input_str
+; -----------------------------------------------------------------------------
+_edit_str:
+        PSHX                ; Save caller's frame pointer
+        TSX
+        LDX     4,X         ; Get buffer pointer
+        STX     _inp_buf    ; Store buffer base
+        TSX
+        LDD     6,X         ; Get maxlen
+        STD     _inp_max
+        ; Display existing content and count length
+        LDX     _inp_buf
+        LDD     #0
+        STD     _inp_len
+_edit_display:
+        LDAA    0,X         ; Get character at current position
+        BEQ     _edit_ready ; Null terminator = done displaying
+        ; Display character
+        SWI
+        FCB     $10         ; DP_EMIT: A = character
+        INX                 ; Advance position in string
+        PSHX                ; Save X (pointer)
+        LDD     _inp_len
+        ADDD    #1
+        STD     _inp_len
+        PULX                ; Restore X
+        BRA     _edit_display
+
+_edit_ready:
+        ; X now points to null terminator (end of string)
+        STX     _inp_ptr    ; Set write pointer to end of string
+        BRA     _inp_loop   ; Enter shared input loop
+
+; =============================================================================
+; End of OPL Function Bridge
+; =============================================================================
 
 ; =============================================================================
 ; OPL Procedure Call Support (QCode Injection)

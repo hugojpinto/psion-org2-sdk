@@ -1085,3 +1085,427 @@ class TestDocumentationExamples:
         """
         asm = compile_c_to_asm(source, compiler)
         assert asm is not None
+
+
+# =============================================================================
+# OPL Function Bridge - Compilation Tests
+# =============================================================================
+
+class TestOPLBridgeCompile:
+    """
+    Test that OPL function bridge functions compile correctly.
+
+    These functions are declared in psion.h and implemented in runtime.inc.
+    """
+
+    def test_locate_compiles(self, compiler):
+        """locate(col, row) should compile correctly."""
+        source = """
+        #include <psion.h>
+
+        void main() {
+            locate(5, 2);
+            print("Here");
+        }
+        """
+        asm = compile_c_to_asm(source, compiler)
+        assert asm is not None
+        assert "_locate" in asm
+
+    def test_cursor_on_off_compiles(self, compiler):
+        """cursor_on() and cursor_off() should compile correctly."""
+        source = """
+        #include <psion.h>
+
+        void main() {
+            cursor_on();
+            getkey();
+            cursor_off();
+        }
+        """
+        asm = compile_c_to_asm(source, compiler)
+        assert asm is not None
+        assert "_cursor_on" in asm
+        assert "_cursor_off" in asm
+
+    def test_kstat_compiles(self, compiler):
+        """kstat(mode) should compile correctly."""
+        source = """
+        #include <psion.h>
+
+        void main() {
+            kstat(2);
+            getkey();
+        }
+        """
+        asm = compile_c_to_asm(source, compiler)
+        assert asm is not None
+        assert "_kstat" in asm
+
+    def test_input_str_compiles(self, compiler):
+        """input_str(buf, maxlen) should compile correctly."""
+        source = """
+        #include <psion.h>
+
+        void main() {
+            char buf[20];
+            int len;
+            cls();
+            print("Name: ");
+            len = input_str(buf, 19);
+            if (len >= 0) {
+                print(buf);
+            }
+        }
+        """
+        asm = compile_c_to_asm(source, compiler)
+        assert asm is not None
+        assert "_input_str" in asm
+
+    def test_edit_str_compiles(self, compiler):
+        """edit_str(buf, maxlen) should compile correctly."""
+        source = """
+        #include <psion.h>
+
+        void main() {
+            char buf[20];
+            int len;
+            strcpy(buf, "Hello");
+            len = edit_str(buf, 19);
+        }
+        """
+        asm = compile_c_to_asm(source, compiler)
+        assert asm is not None
+        assert "_edit_str" in asm
+
+    def test_off_compiles(self, compiler):
+        """off() should compile correctly."""
+        source = """
+        #include <psion.h>
+
+        void main() {
+            print("Goodbye");
+            off();
+            print("Welcome back");
+        }
+        """
+        asm = compile_c_to_asm(source, compiler)
+        assert asm is not None
+        assert "_off" in asm
+
+    def test_pause_compiles(self, compiler):
+        """pause(ticks) should compile correctly."""
+        source = """
+        #include <psion.h>
+
+        void main() {
+            int key;
+            key = pause(0);
+            key = pause(-100);
+            pause(50);
+        }
+        """
+        asm = compile_c_to_asm(source, compiler)
+        assert asm is not None
+        assert "_pause" in asm
+
+    def test_rand_srand_compiles(self, compiler):
+        """srand(), rand(), randomize() should compile correctly."""
+        source = """
+        #include <psion.h>
+
+        void main() {
+            int r;
+            randomize();
+            r = rand();
+            srand(12345);
+            r = rand();
+        }
+        """
+        asm = compile_c_to_asm(source, compiler)
+        assert asm is not None
+        assert "_randomize" in asm
+        assert "_rand" in asm
+        assert "_srand" in asm
+
+    def test_gcursor_compiles(self, compiler):
+        """gcursor() should compile correctly."""
+        source = """
+        #include <psion.h>
+
+        void main() {
+            int pos;
+            pos = gcursor();
+        }
+        """
+        asm = compile_c_to_asm(source, compiler)
+        assert asm is not None
+        assert "_gcursor" in asm
+
+
+# =============================================================================
+# OPL Function Bridge - Assembly Tests
+# =============================================================================
+
+class TestOPLBridgeAssembly:
+    """
+    Test that OPL function bridge implementations assemble correctly.
+    """
+
+    def test_locate_assembles(self, assembler):
+        """_locate function should assemble without errors."""
+        source = """
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+
+            ORG $2100
+            LDD #2
+            PSHB
+            PSHA
+            LDD #5
+            PSHB
+            PSHA
+            JSR _locate
+            INS
+            INS
+            INS
+            INS
+            RTS
+        """
+        result = assembler.assemble(source)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_cursor_on_off_assembles(self, assembler):
+        """_cursor_on and _cursor_off should assemble without errors."""
+        source = """
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+
+            ORG $2100
+            JSR _cursor_on
+            JSR _cursor_off
+            RTS
+        """
+        result = assembler.assemble(source)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_kstat_assembles(self, assembler):
+        """_kstat function should assemble without errors."""
+        source = """
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+
+            ORG $2100
+            LDD #2
+            PSHB
+            PSHA
+            JSR _kstat
+            INS
+            INS
+            RTS
+        """
+        result = assembler.assemble(source)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_off_assembles(self, assembler):
+        """_off function should assemble without errors."""
+        source = """
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+
+            ORG $2100
+            JSR _off
+            RTS
+        """
+        result = assembler.assemble(source)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_pause_assembles(self, assembler):
+        """_pause function should assemble without errors."""
+        source = """
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+
+            ORG $2100
+            LDD #50
+            PSHB
+            PSHA
+            JSR _pause
+            INS
+            INS
+            RTS
+        """
+        result = assembler.assemble(source)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_rand_srand_assembles(self, assembler):
+        """_srand, _rand, _randomize should assemble without errors."""
+        source = """
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+
+            ORG $2100
+            JSR _randomize
+            JSR _rand
+            LDD #12345
+            PSHB
+            PSHA
+            JSR _srand
+            INS
+            INS
+            JSR _rand
+            RTS
+        """
+        result = assembler.assemble(source)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_input_str_assembles(self, assembler):
+        """_input_str function should assemble without errors."""
+        source = """
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+
+            ORG $2100
+            LDD #19
+            PSHB
+            PSHA
+            LDD #BUF
+            PSHB
+            PSHA
+            JSR _input_str
+            INS
+            INS
+            INS
+            INS
+            RTS
+
+BUF:        RMB 20
+        """
+        result = assembler.assemble(source)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_edit_str_assembles(self, assembler):
+        """_edit_str function should assemble without errors."""
+        source = """
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+
+            ORG $2100
+            LDD #19
+            PSHB
+            PSHA
+            LDD #BUF
+            PSHB
+            PSHA
+            JSR _edit_str
+            INS
+            INS
+            INS
+            INS
+            RTS
+
+BUF:        FCC "Hello"
+            FCB 0
+            RMB 14
+        """
+        result = assembler.assemble(source)
+        assert result is not None
+        assert len(result) > 0
+
+
+# =============================================================================
+# OPL Function Bridge - Full Pipeline Tests
+# =============================================================================
+
+class TestOPLBridgePipeline:
+    """
+    Test complete compilation pipeline for OPL bridge functions.
+    """
+
+    def test_input_program_compiles_and_assembles(self, compiler, assembler):
+        """A program using input functions should compile and assemble."""
+        c_source = """
+        #include <psion.h>
+
+        void main() {
+            char buf[20];
+            int len;
+            cls();
+            locate(0, 0);
+            print("Enter name:");
+            locate(0, 1);
+            cursor_on();
+            len = input_str(buf, 19);
+            cursor_off();
+            if (len >= 0) {
+                cls();
+                print("Hello ");
+                print(buf);
+            }
+            getkey();
+        }
+        """
+        asm_source = compile_c_to_asm(c_source, compiler)
+        assert asm_source is not None
+
+        result = assembler.assemble(asm_source)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_random_program_compiles_and_assembles(self, compiler, assembler):
+        """A program using random functions should compile and assemble."""
+        c_source = """
+        #include <psion.h>
+
+        void main() {
+            int r;
+            int i;
+            randomize();
+            i = 0;
+            while (i < 5) {
+                r = rand();
+                print_int(r);
+                print(" ");
+                i = i + 1;
+            }
+            getkey();
+        }
+        """
+        asm_source = compile_c_to_asm(c_source, compiler)
+        assert asm_source is not None
+
+        result = assembler.assemble(asm_source)
+        assert result is not None
+        assert len(result) > 0
+
+    def test_pause_program_compiles_and_assembles(self, compiler, assembler):
+        """A program using pause should compile and assemble."""
+        c_source = """
+        #include <psion.h>
+
+        void main() {
+            int key;
+            cls();
+            print("Press a key...");
+            key = pause(-100);
+            if (key) {
+                print("Got key!");
+            } else {
+                print("Timed out");
+            }
+            pause(50);
+        }
+        """
+        asm_source = compile_c_to_asm(c_source, compiler)
+        assert asm_source is not None
+
+        result = assembler.assemble(asm_source)
+        assert result is not None
+        assert len(result) > 0
