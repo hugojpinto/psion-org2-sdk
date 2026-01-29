@@ -258,7 +258,7 @@ class CodeGenerator(ASTVisitor):
     }
 
     def __init__(self, target_model: str = "XP", has_float_support: bool = False,
-                 has_stdio_support: bool = False):
+                 has_stdio_support: bool = False, has_db_support: bool = False):
         """
         Initialize the code generator.
 
@@ -269,6 +269,8 @@ class CodeGenerator(ASTVisitor):
                               True if float.h was included, False otherwise.
             has_stdio_support: Whether to include extended stdio functions.
                               True if stdio.h was included, False otherwise.
+            has_db_support: Whether to include database file access functions.
+                           True if db.h was included, False otherwise.
         """
         # Target model for generated code
         self._target_model = target_model.upper() if target_model else "XP"
@@ -278,6 +280,9 @@ class CodeGenerator(ASTVisitor):
 
         # Whether to include stdio support (stdio.inc)
         self._has_stdio_support = has_stdio_support
+
+        # Whether to include database file access support (dbruntime.inc)
+        self._has_db_support = has_db_support
 
         # Assembly output lines
         self._output: list[str] = []
@@ -407,6 +412,8 @@ class CodeGenerator(ASTVisitor):
         self._emit("        INCLUDE \"runtime.inc\"")
         if self._has_stdio_support:
             self._emit("        INCLUDE \"stdio.inc\"       ; Extended string functions (strrchr, strstr, sprintf, etc.)")
+        if self._has_db_support:
+            self._emit("        INCLUDE \"dbruntime.inc\"   ; Database file access (db_create, db_open, db_read, etc.)")
         if self._has_float_support:
             self._emit("        INCLUDE \"float.inc\"       ; FP constants and macros")
             self._emit("        INCLUDE \"fpruntime.inc\"  ; Floating point support")

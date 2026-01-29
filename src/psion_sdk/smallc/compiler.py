@@ -124,7 +124,7 @@ class SmallCCompiler:
         try:
             # Stage 1: Preprocessing
             # Returns preprocessed source, effective target model, and optional library flags
-            preprocessed, effective_model, has_float_support, has_stdio_support = self._preprocess(source, filename)
+            preprocessed, effective_model, has_float_support, has_stdio_support, has_db_support = self._preprocess(source, filename)
             result.preprocessed_source = preprocessed
             result.target_model = effective_model
 
@@ -137,7 +137,7 @@ class SmallCCompiler:
             result.ast = ast
 
             # Stage 4: Code generation (with target model and optional library awareness)
-            assembly = self._generate(ast, effective_model, has_float_support, has_stdio_support)
+            assembly = self._generate(ast, effective_model, has_float_support, has_stdio_support, has_db_support)
             result.assembly = assembly
             result.success = True
 
@@ -180,7 +180,7 @@ class SmallCCompiler:
 
         return self.compile_source(source, filepath)
 
-    def _preprocess(self, source: str, filename: str) -> tuple[str, str, bool, bool]:
+    def _preprocess(self, source: str, filename: str) -> tuple[str, str, bool, bool, bool]:
         """
         Run the preprocessor on source code.
 
@@ -189,7 +189,8 @@ class SmallCCompiler:
             filename: Source filename
 
         Returns:
-            Tuple of (preprocessed_source, effective_model, has_float_support, has_stdio_support)
+            Tuple of (preprocessed_source, effective_model, has_float_support,
+                      has_stdio_support, has_db_support)
         """
         preprocessor = Preprocessor(
             source,
@@ -201,7 +202,8 @@ class SmallCCompiler:
         effective_model = preprocessor.get_effective_model()
         has_float_support = preprocessor.has_float_support()
         has_stdio_support = preprocessor.has_stdio_support()
-        return preprocessed, effective_model, has_float_support, has_stdio_support
+        has_db_support = preprocessor.has_db_support()
+        return preprocessed, effective_model, has_float_support, has_stdio_support, has_db_support
 
     def _lex(self, source: str, filename: str) -> list:
         """Tokenize preprocessed source."""
@@ -215,7 +217,8 @@ class SmallCCompiler:
 
     def _generate(
         self, ast: ProgramNode, target_model: str = "XP",
-        has_float_support: bool = False, has_stdio_support: bool = False
+        has_float_support: bool = False, has_stdio_support: bool = False,
+        has_db_support: bool = False
     ) -> str:
         """
         Generate assembly from AST.
@@ -225,6 +228,7 @@ class SmallCCompiler:
             target_model: Target Psion model (CM, XP, LA, LZ, LZ64)
             has_float_support: Whether float.h was included
             has_stdio_support: Whether stdio.h was included
+            has_db_support: Whether db.h was included
 
         Returns:
             Generated HD6303 assembly code
@@ -232,7 +236,8 @@ class SmallCCompiler:
         generator = CodeGenerator(
             target_model=target_model,
             has_float_support=has_float_support,
-            has_stdio_support=has_stdio_support
+            has_stdio_support=has_stdio_support,
+            has_db_support=has_db_support
         )
         return generator.generate(ast)
 

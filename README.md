@@ -252,6 +252,7 @@ Comprehensive documentation is available in the `docs/` directory:
 | [Assembly Programming](docs/asm-prog.md) | HD6303 assembly reference, instruction set, system calls |
 | [Core Library (stdlib)](docs/stdlib.md) | String functions, character classification (ctype.h) |
 | [Extended Library (stdio)](docs/stdio.md) | sprintf, strrchr, strstr, strncat |
+| [Database Library (db)](docs/db.md) | Database file access, record CRUD, OPL interoperability |
 | [Testkit Framework](docs/testkit.md) | Automated testing framework for emulator-based integration tests |
 
 ## Example Programs

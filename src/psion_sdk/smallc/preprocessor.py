@@ -678,6 +678,19 @@ class Preprocessor:
         """
         return "stdio.h" in self._included_files
 
+    def has_db_support(self) -> bool:
+        """
+        Return True if the source code uses database file access functions.
+
+        This checks if db.h was included during preprocessing.
+        Used by codegen to conditionally include dbruntime.inc which provides
+        db_create, db_open, db_read, db_append, and related database functions.
+
+        Returns:
+            True if db.h was included, False otherwise.
+        """
+        return "db.h" in self._included_files
+
     def get_included_files(self) -> set[str]:
         """
         Return the set of included file basenames.
