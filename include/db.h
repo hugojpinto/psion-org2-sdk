@@ -558,4 +558,42 @@ int db_update(void);
  */
 int db_erase(void);
 
+
+/* =============================================================================
+ * File Catalog Functions
+ * =============================================================================
+ */
+
+/*
+ * db_catalog - Get list of files on a device
+ *
+ * Retrieves the names of data files on the specified device. Call repeatedly
+ * to iterate through all files: first call with first=1, subsequent calls
+ * with first=0 until -1 is returned (no more files).
+ *
+ * Wraps FL$CATL system service for ordinary file catalog.
+ *
+ * Args:
+ *   device: Device letter ('A', 'B', or 'C')
+ *   buffer: Destination buffer for filename (at least 10 bytes: "D:FILENAME")
+ *   maxlen: Maximum bytes to copy including null terminator
+ *   first:  1 for first call (start iteration), 0 for subsequent calls
+ *
+ * Returns:
+ *   Length of filename on success (>0)
+ *   0 if buffer too small
+ *   -1 if no more files (end of catalog)
+ *
+ * Example - List all files on A:
+ *   char name[12];
+ *   int len;
+ *   len = db_catalog('A', name, 12, 1);
+ *   while (len > 0) {
+ *       print(name);
+ *       getkey();
+ *       len = db_catalog('A', name, 12, 0);
+ *   }
+ */
+int db_catalog(char device, char *buffer, int maxlen, int first);
+
 #endif /* _DB_H */

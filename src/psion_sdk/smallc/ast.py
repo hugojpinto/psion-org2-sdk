@@ -366,6 +366,27 @@ class LabelStatement(Statement):
     statement: Statement = None
 
 
+@dataclass
+class AsmStatement(Statement):
+    """
+    Inline assembly statement.
+
+    Allows embedding raw HD6303 assembly instructions directly in C code.
+    The assembly code is passed through to the output with minimal processing.
+
+    Variable references using %varname syntax are resolved to their stack
+    offsets at code generation time.
+
+    Example:
+        asm("        LDX     #$1234");
+        asm("        STD     %result");  /* %result replaced with offset */
+
+    Attributes:
+        code: The assembly code string (without quotes)
+    """
+    code: str = ""
+
+
 # =============================================================================
 # Expression Nodes
 # =============================================================================

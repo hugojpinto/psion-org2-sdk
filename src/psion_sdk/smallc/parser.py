@@ -93,6 +93,7 @@ from psion_sdk.smallc.ast import (
     ContinueStatement,
     GotoStatement,
     LabelStatement,
+    AsmStatement,
     Expression,
     BinaryExpression,
     UnaryExpression,
@@ -1530,6 +1531,8 @@ class CParser:
             return self._parse_continue_statement()
         if token.type == CTokenType.GOTO:
             return self._parse_goto_statement()
+        if token.type == CTokenType.ASM:
+            return self._parse_asm_statement()
         if token.type == CTokenType.LBRACE:
             return self._parse_block()
         if token.type == CTokenType.SEMICOLON:
@@ -1736,6 +1739,42 @@ class CParser:
             name=name_token.value,
             statement=statement,
         )
+
+    def _parse_asm_statement(self) -> AsmStatement:
+        """
+        Parse inline assembly statement.
+
+        Syntax:
+            asm("assembly code");
+
+        The assembly code string is passed through to the output with minimal
+        processing. Variable references using %varname are resolved at code
+        generation time.
+
+        Examples:
+            asm("        LDX     #$1234");
+            asm("        STD     %result");   /* %result -> stack offset */
+        """
+        location = self._peek().location
+        self._expect(CTokenType.ASM, "'asm'")
+        self._expect(CTokenType.LPAREN, "'('")
+
+        # Expect a string literal containing the assembly code
+        if self._peek().type != CTokenType.STRING:
+            raise CSyntaxError(
+                "expected string literal for asm()",
+                self._peek().location,
+                self._get_source_line(self._peek().location.line),
+                hint="asm() requires a string argument, e.g., asm(\"LDX #0\")",
+            )
+
+        code_token = self._advance()
+        code = code_token.value
+
+        self._expect(CTokenType.RPAREN, "')'")
+        self._expect(CTokenType.SEMICOLON, "';'")
+
+        return AsmStatement(location=location, code=code)
 
     def _parse_expression_statement(self) -> ExpressionStatement:
         """Parse expression statement."""

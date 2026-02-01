@@ -903,6 +903,161 @@ BUFFER:     RMB 20
         result = assembler.assemble(source)
         assert result is not None
 
+    def test_db_catalog_from_asm(self, assembler):
+        """db_catalog called from assembly should assemble."""
+        source = """
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+            INCLUDE "dbruntime.inc"
+
+            ORG $2100
+
+            ; db_catalog('A', buffer, 12, 1) - first file
+            LDD     #1              ; first = 1
+            PSHB
+            PSHA
+            LDD     #12             ; maxlen = 12
+            PSHB
+            PSHA
+            LDD     #BUFFER         ; buffer
+            PSHB
+            PSHA
+            LDD     #'A'            ; device = 'A'
+            PSHB
+            PSHA
+            JSR     _db_catalog
+            ; Clean up 8 bytes
+            INS
+            INS
+            INS
+            INS
+            INS
+            INS
+            INS
+            INS
+            ; D = length or -1
+            RTS
+
+BUFFER:     RMB 12
+        """
+        result = assembler.assemble(source)
+        assert result is not None
+
+    def test_db_catalog_macro_assembles(self, assembler):
+        """DB_CATALOG macro should assemble."""
+        source = """
+            INCLUDE "psion.inc"
+            INCLUDE "runtime.inc"
+            INCLUDE "dbruntime.inc"
+
+            ORG $2100
+
+            ; First file on A:
+            DB_CATALOG 'A', BUFFER, 12, 1
+            ; D = length or -1
+
+            ; Next file on A:
+            DB_CATALOG 'A', BUFFER, 12, 0
+            RTS
+
+BUFFER:     RMB 12
+        """
+        result = assembler.assemble(source)
+        assert result is not None
+
+
+# =============================================================================
+# db_catalog Compilation Tests
+# =============================================================================
+
+class TestDbCatalog:
+    """Tests for db_catalog - list files on device."""
+
+    def test_db_catalog_compiles(self, compiler):
+        """db_catalog basic usage should compile."""
+        source = """
+        #include <psion.h>
+        #include <db.h>
+
+        void main() {
+            char name[12];
+            int len;
+            len = db_catalog('A', name, 12, 1);
+        }
+        """
+        asm = compile_c(source, compiler)
+        assert "_db_catalog" in asm
+
+    def test_db_catalog_iteration_compiles(self, compiler):
+        """db_catalog iteration pattern should compile."""
+        source = """
+        #include <psion.h>
+        #include <db.h>
+
+        void main() {
+            char name[12];
+            int len;
+
+            len = db_catalog('A', name, 12, 1);
+            while (len > 0) {
+                print(name);
+                len = db_catalog('A', name, 12, 0);
+            }
+        }
+        """
+        asm = compile_c(source, compiler)
+        assert "_db_catalog" in asm
+
+    def test_db_catalog_all_devices(self, compiler):
+        """db_catalog should compile for all device letters."""
+        source = """
+        #include <psion.h>
+        #include <db.h>
+
+        void main() {
+            char buf[12];
+            db_catalog('A', buf, 12, 1);
+            db_catalog('B', buf, 12, 1);
+            db_catalog('C', buf, 12, 1);
+        }
+        """
+        asm = compile_c(source, compiler)
+        assert "_db_catalog" in asm
+
+    def test_db_catalog_full_pipeline(self, compiler, assembler):
+        """db_catalog should compile and assemble end-to-end."""
+        source = """
+        #include <psion.h>
+        #include <db.h>
+
+        void main() {
+            char name[12];
+            int len;
+            int count;
+
+            cls();
+            count = 0;
+
+            len = db_catalog('A', name, 12, 1);
+            while (len > 0) {
+                print(name);
+                getkey();
+                count = count + 1;
+                len = db_catalog('A', name, 12, 0);
+            }
+
+            print("Total: ");
+            print_int(count);
+            getkey();
+        }
+        """
+        asm = compile_c(source, compiler)
+        assert asm is not None
+
+        result = assembler.assemble(asm)
+        assert result is not None
+        assert len(result) > 0
+
 
 # =============================================================================
 # Integration Tests

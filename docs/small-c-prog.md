@@ -661,6 +661,117 @@ int bigger = MAX(x, y);
 | `DISP_ROWS` | Number of display rows (2 or 4) |
 | `DISP_COLS` | Number of display columns (16 or 20) |
 
+### 4.10 Inline Assembly
+
+The `asm()` statement allows embedding raw HD6303 assembly instructions directly in C code. This is useful for:
+- Calling system services (SWI) not exposed by the C library
+- Performance-critical sections
+- Direct hardware access
+
+#### Basic Syntax
+
+```c
+asm("        instruction");
+```
+
+The string is inserted directly into the generated assembly output. Include proper indentation (8 spaces) for instructions:
+
+```c
+void main() {
+    asm("        NOP");              /* No-operation */
+    asm("        LDAA    #$42");     /* Load A with 0x42 */
+    asm("        STAA    $20");      /* Store A to address $20 */
+}
+```
+
+#### Variable Substitution
+
+Use `%varname` to reference C variables from inline assembly. The compiler automatically resolves:
+
+- **Local variables and parameters** → stack-relative offsets (e.g., `2,X`)
+- **Global variables** → symbol references (e.g., `_my_global`)
+
+```c
+int global_var;
+
+void process(int param) {
+    int local;
+
+    asm("        LDD     %param");   /* Load parameter (becomes "4,X" or similar) */
+    asm("        ADDD    #100");     /* Add 100 */
+    asm("        STD     %local");   /* Store in local variable */
+    asm("        STD     %global_var");  /* Store in global (becomes "_global_var") */
+}
+```
+
+#### System Call Example
+
+Call Psion OS services directly:
+
+```c
+#include <psion.h>
+
+void main() {
+    int result;
+
+    /* Call FL$BOPN system service */
+    asm("        LDX     #$1234");    /* X = parameter */
+    asm("        LDAB    #$83");      /* B = sub-function */
+    asm("        SWI");               /* Software interrupt */
+    asm("        FCB     $24");       /* Service number: FL$BOPN */
+    asm("        STD     %result");   /* Save return value */
+
+    print_int(result);
+    getkey();
+}
+```
+
+#### Labels and Control Flow
+
+You can define labels and use branch instructions:
+
+```c
+void main() {
+    asm("_myloop:");
+    asm("        NOP");
+    asm("        BRA     _myloop");   /* Infinite loop */
+}
+```
+
+**Warning:** Be careful with control flow. The compiler doesn't know about your labels, so jumping into or out of C code may corrupt the stack.
+
+#### Assembly Comments
+
+Assembly comments are preserved:
+
+```c
+asm("        NOP     ; This comment appears in output");
+```
+
+#### Multiple Instructions
+
+Each `asm()` generates one line in the output. For multiple instructions:
+
+```c
+asm("        LDAA    #$FF");
+asm("        LDAB    #$00");
+asm("        STD     $80");
+```
+
+#### Best Practices
+
+1. **Preserve registers**: If you modify X or SP, restore them before returning to C code
+2. **Use %varname**: Don't hard-code stack offsets; let the compiler resolve them
+3. **Keep it short**: For complex assembly, use separate .asm files
+4. **Test carefully**: The compiler can't validate your assembly
+
+#### Limitations
+
+- No automatic register allocation or optimization
+- The compiler doesn't track what registers you've modified
+- Variable substitution only works with simple `%name` syntax (no expressions)
+- Assembly errors are caught by the assembler, not the C compiler
+
 ---
 
 ## 5. Standard Library
@@ -1439,6 +1550,7 @@ emu.run(5_000_000)
 - [asm-prog.md](asm-prog.md) - Assembly Programming Manual
 - [stdlib.md](stdlib.md) - Core string and character functions
 - [stdio.md](stdio.md) - Extended string functions and sprintf
+- [db.md](db.md) - Database file access functions
 - [cli-tools.md](cli-tools.md) - CLI Tools Manual (psbuild, pscc, psasm, psopk, pslink, psdisasm)
 - `include/psion.h` - C library header
 - `include/float.h` - Floating point header

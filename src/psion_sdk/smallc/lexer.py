@@ -115,6 +115,7 @@ class CTokenType(Enum):
     EXTERNAL = auto()       # external (OPL procedure declaration)
     TYPEDEF = auto()        # typedef (type alias)
     STRUCT = auto()         # struct (aggregate type definition)
+    ASM = auto()            # asm (inline assembly)
 
     # === Arithmetic Operators ===
     PLUS = auto()           # +
@@ -211,6 +212,7 @@ KEYWORDS: dict[str, CTokenType] = {
     "external": CTokenType.EXTERNAL,
     "typedef": CTokenType.TYPEDEF,
     "struct": CTokenType.STRUCT,
+    "asm": CTokenType.ASM,
 }
 
 

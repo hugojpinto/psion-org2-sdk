@@ -329,6 +329,38 @@ MACRO DB_EOF
     JSR     _db_eof
 ENDM
 
+; -----------------------------------------------------------------------------
+; DB_CATALOG - List files on device
+; -----------------------------------------------------------------------------
+; Args: device (char), buffer (address), maxlen, first (1=start, 0=continue)
+; Output: D = length if found, -1 if no more files
+; Example:
+;   DB_CATALOG 'A', FNAME_BUF, 12, 1  ; First file
+;   DB_CATALOG 'A', FNAME_BUF, 12, 0  ; Next file
+MACRO DB_CATALOG device, buffer, maxlen, first
+    LDD     #\first
+    PSHB
+    PSHA
+    LDD     #\maxlen
+    PSHB
+    PSHA
+    LDD     #\buffer
+    PSHB
+    PSHA
+    LDD     #\device
+    PSHB
+    PSHA
+    JSR     _db_catalog
+    INS
+    INS
+    INS
+    INS
+    INS
+    INS
+    INS
+    INS
+ENDM
+
 ; =============================================================================
 ; C API ENTRY POINTS (jump table)
 ; =============================================================================
@@ -364,6 +396,7 @@ _db_count:      JMP     __db_count
 _db_pos:        JMP     __db_pos
 _db_update:     JMP     __db_update
 _db_erase:      JMP     __db_erase
+_db_catalog:    JMP     __db_catalog
 
 ; =============================================================================
 ; STACK LAYOUT REFERENCE
@@ -2174,6 +2207,123 @@ __dber_ret:
 __dber_err:
         LDAB    #DB_E_IO
         JMP     __db_set_err
+
+
+; =============================================================================
+; __db_catalog - List files on device
+; =============================================================================
+; int db_catalog(char device, char *buffer, int maxlen, int first)
+;
+; Stack layout after PSHX+TSX:
+;   X+0, X+1: saved X
+;   X+2, X+3: return address
+;   X+4, X+5: device (char in low byte at X+5)
+;   X+6, X+7: buffer (pointer to destination)
+;   X+8, X+9: maxlen
+;   X+10, X+11: first (1=start iteration, 0=continue)
+;
+; Uses FL$CATL (service $26) to get file catalog entries.
+; FL$CATL parameters:
+;   A = 1 for first call, 0 for subsequent
+;   B = pack number (0=A, 1=B, 2=C)
+;   X = address to store result (LBC string: D:FILENAME)
+;
+; Returns length in D, or -1 if no more files.
+; -----------------------------------------------------------------------------
+
+; Local storage for db_catalog
+_dbcat_srclen:  RMB     1       ; Source string length
+_dbcat_maxcpy:  RMB     1       ; Max chars to copy
+_dbcat_dest:    RMB     2       ; Destination buffer pointer
+
+__db_catalog:
+        PSHX
+        TSX
+
+        ; Save buffer pointer for later
+        LDD     6,X
+        STD     _dbcat_dest
+
+        ; Get 'first' flag into A
+        LDAA    11,X            ; Low byte of 'first' argument
+        ANDA    #$01            ; Ensure 0 or 1
+
+        ; Convert device letter to pack number in B
+        ; 'A' (0x41) -> 0, 'B' (0x42) -> 1, 'C' (0x43) -> 2
+        LDAB    5,X             ; Get device letter
+        ANDB    #$DF            ; Force uppercase
+        SUBB    #'A'            ; Convert to pack number 0-2
+
+        ; Calculate maxcpy = maxlen - 1 (for null terminator)
+        PSHA                    ; Save first flag
+        PSHB                    ; Save pack number
+        LDAA    9,X             ; Low byte of maxlen
+        DECA                    ; maxlen - 1
+        STAA    _dbcat_maxcpy
+        PULB                    ; Restore pack number
+        PULA                    ; Restore first flag
+
+        ; Set X to internal LBC buffer for FL$CATL result
+        LDX     #_db_lbc_buf
+
+        ; Call FL$CATL
+        SWI
+        FCB     FL_CATL
+
+        ; Check for error (no more files)
+        BCS     __dbcat_nomore
+
+        ; Success - copy LBC string to user buffer as null-terminated
+        ; LBC format: [length_byte][chars...] at _db_lbc_buf
+
+        ; Get length from LBC buffer and save it
+        LDX     #_db_lbc_buf
+        LDAA    0,X             ; A = LBC length (includes D: prefix)
+        STAA    _dbcat_srclen
+
+        ; Determine copy length: min(srclen, maxcpy)
+        CMPA    _dbcat_maxcpy
+        BLS     __dbcat_use_src ; srclen <= maxcpy, use srclen
+        LDAA    _dbcat_maxcpy   ; else use maxcpy
+__dbcat_use_src:
+        ; A = number of chars to copy
+        TSTA
+        BEQ     __dbcat_null_only
+
+        ; Copy loop
+        TAB                     ; B = counter
+        LDX     #_db_lbc_buf
+        INX                     ; Skip length byte, X = source
+
+__dbcat_copy:
+        LDAA    0,X             ; Get source char
+        INX                     ; Advance source
+        PSHX                    ; Save source
+        LDX     _dbcat_dest     ; Get dest
+        STAA    0,X             ; Store char
+        INX                     ; Advance dest
+        STX     _dbcat_dest     ; Save dest
+        PULX                    ; Restore source
+        DECB
+        BNE     __dbcat_copy
+
+__dbcat_null_only:
+        ; Null terminate
+        LDX     _dbcat_dest
+        CLR     0,X
+
+        ; Return source length (what was available, not what was copied)
+        LDAB    _dbcat_srclen
+        CLRA                    ; D = length (positive = success)
+        PULX
+        RTS
+
+__dbcat_nomore:
+        ; No more files - return -1
+        CLR     _db_last_err    ; Not an error, just end of list
+        LDD     #-1
+        PULX
+        RTS
 
 ; =============================================================================
 ; End of DBRUNTIME.INC

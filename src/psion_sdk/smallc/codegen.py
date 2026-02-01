@@ -112,6 +112,7 @@ from psion_sdk.smallc.ast import (
     ContinueStatement,
     GotoStatement,
     LabelStatement,
+    AsmStatement,
     Expression,
     BinaryExpression,
     UnaryExpression,
@@ -1439,6 +1440,8 @@ class CodeGenerator(ASTVisitor):
             self._generate_goto(stmt)
         elif isinstance(stmt, LabelStatement):
             self._generate_label(stmt)
+        elif isinstance(stmt, AsmStatement):
+            self._generate_asm(stmt)
 
     def _generate_if(self, stmt: IfStatement) -> None:
         """Generate code for if statement."""
@@ -1655,6 +1658,55 @@ class CodeGenerator(ASTVisitor):
         """Generate code for labeled statement."""
         self._emit_label(f"_lbl_{stmt.name}")
         self._generate_statement(stmt.statement)
+
+    def _generate_asm(self, stmt: AsmStatement) -> None:
+        """
+        Generate code for inline assembly statement.
+
+        The assembly code is emitted directly to the output with variable
+        reference substitution. Variables are referenced using %varname
+        syntax, which is replaced with the appropriate stack offset.
+
+        For local variables and parameters, %varname becomes "offset,X"
+        where offset is the stack frame offset.
+
+        For global variables, %varname becomes the global symbol name
+        with underscore prefix.
+
+        Examples:
+            asm("LDX #$1234");       -> emits "LDX #$1234"
+            asm("STD %result");      -> emits "STD 4,X" (if result is at offset 4)
+            asm("LDD %global_var");  -> emits "LDD _global_var"
+        """
+        import re
+
+        code = stmt.code
+
+        # Find all %varname references and substitute them
+        # Pattern: % followed by identifier characters
+        def substitute_var(match):
+            varname = match.group(1)
+
+            # Check locals first
+            if varname in self._locals:
+                info = self._locals[varname]
+                # Return stack frame reference: offset,X
+                return f"{info.offset},X"
+
+            # Check globals
+            if varname in self._globals:
+                # Return global symbol with underscore prefix
+                return f"_{varname}"
+
+            # Unknown variable - leave as-is with warning comment
+            # The assembler will catch undefined symbols
+            return f"_{varname}"
+
+        # Substitute all %varname patterns
+        code = re.sub(r'%(\w+)', substitute_var, code)
+
+        # Emit the assembly code directly
+        self._emit(code)
 
     # =========================================================================
     # Expression Code Generation
