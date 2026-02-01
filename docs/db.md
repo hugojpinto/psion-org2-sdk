@@ -316,6 +316,71 @@ if (db < 0) {
 
 ---
 
+### db_catalog - List Files on a Device
+
+Iterates through files on a device, returning one filename at a time. Use with `first=1` to start enumeration, then `first=0` for subsequent files.
+
+**C Declaration:**
+```c
+int db_catalog(char device, char *buffer, int maxlen, int first);
+```
+
+**Parameters:**
+- `device` - Device letter: `'A'` (internal RAM), `'B'` (pack slot 0), `'C'` (pack slot 1)
+- `buffer` - Destination buffer for the filename (null-terminated)
+- `maxlen` - Maximum bytes to copy (including null terminator)
+- `first` - `1` to start from beginning, `0` to get next file
+
+**Returns:**
+- Length of filename on success
+- `0` when no more files
+
+**Example - List all files on A:**
+```c
+#include <psion.h>
+#include <db.h>
+
+void main() {
+    char namebuf[16];
+    int len;
+
+    cls();
+    print("Files on A:\n");
+
+    /* Get first file */
+    len = db_catalog('A', namebuf, 16, 1);
+
+    while (len > 0) {
+        print(namebuf);
+        print("\n");
+        /* Get next file */
+        len = db_catalog('A', namebuf, 16, 0);
+    }
+
+    getkey();
+}
+```
+
+**Assembly Usage:**
+```asm
+        ; List files on device A:
+        DB_CATALOG 'A', BUFFER, 16, 1   ; First file
+        ; D = length or 0
+
+        ; Get next file
+        DB_CATALOG 'A', BUFFER, 16, 0
+        ; D = length or 0
+
+BUFFER: RMB     16
+```
+
+**Notes:**
+- Wraps the FL$CATL system service
+- Returns all file types (OPL, data files, etc.)
+- Filenames are returned as null-terminated C strings
+
+---
+
 ## Record Building Functions
 
 Records are built in an internal buffer before writing. This matches OPL's model where you assign to fields, then call APPEND.
@@ -1030,6 +1095,7 @@ The following macros are available for assembly programmers:
 | `DB_CREATE` | device, name, schema | Create new database file |
 | `DB_OPEN` | device, name, schema | Open existing database file |
 | `DB_CLOSE` | - | Close database file |
+| `DB_CATALOG` | device, buffer, maxlen, first | List files on device |
 | `DB_CLEAR` | - | Clear record buffer |
 | `DB_SET_IDX` | index, value | Set field by index (string) |
 | `DB_APPEND` | - | Append record buffer to file |
@@ -1260,6 +1326,7 @@ void main() {
 | `db_open(dev, name, schema)` | Open existing file | Handle or -1 |
 | `db_close(handle)` | Close file | - |
 | `db_error()` | Get last error code | Error code |
+| `db_catalog(dev, buf, max, first)` | List files on device | Length or 0 |
 
 ### Record Building
 
