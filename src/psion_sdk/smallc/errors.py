@@ -441,6 +441,63 @@ class InvalidBreakContinueError(CSemanticError):
         )
 
 
+class ExternMismatchError(CSemanticError):
+    """
+    Extern declaration doesn't match its definition.
+
+    Raised during cross-file validation when an 'extern' declaration
+    in one file doesn't match the actual definition in another file.
+
+    This can catch errors like:
+    - Return type mismatch: extern int foo() but definition is void foo()
+    - Parameter count mismatch: extern int bar(int) but bar() takes two params
+    - Parameter type mismatch: extern int baz(int) but parameter is char*
+    - Variable type mismatch: extern int x but definition is char x
+    """
+
+    def __init__(
+        self,
+        name: str,
+        mismatch_type: str,  # "return_type", "param_count", "param_type", "var_type"
+        extern_location: Optional[SourceLocation] = None,
+        definition_location: Optional[SourceLocation] = None,
+        extern_info: Optional[str] = None,
+        definition_info: Optional[str] = None,
+    ):
+        self.name = name
+        self.mismatch_type = mismatch_type
+        self.extern_location = extern_location
+        self.definition_location = definition_location
+        self.extern_info = extern_info
+        self.definition_info = definition_info
+
+        # Build descriptive message
+        if mismatch_type == "return_type":
+            message = f"extern function '{name}' return type doesn't match definition"
+        elif mismatch_type == "param_count":
+            message = f"extern function '{name}' parameter count doesn't match definition"
+        elif mismatch_type == "param_type":
+            message = f"extern function '{name}' parameter type doesn't match definition"
+        elif mismatch_type == "var_type":
+            message = f"extern variable '{name}' type doesn't match definition"
+        else:
+            message = f"extern '{name}' doesn't match definition"
+
+        # Build hint with details
+        hint_parts = []
+        if extern_info and definition_info:
+            hint_parts.append(f"extern declares '{extern_info}' but definition is '{definition_info}'")
+        if definition_location:
+            hint_parts.append(f"definition at {definition_location}")
+        hint = "; ".join(hint_parts) if hint_parts else None
+
+        super().__init__(
+            message,
+            location=extern_location,
+            hint=hint,
+        )
+
+
 # =============================================================================
 # Preprocessor Errors
 # =============================================================================

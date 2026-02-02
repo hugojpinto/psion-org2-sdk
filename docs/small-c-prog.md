@@ -241,6 +241,58 @@ void main() {
 - Assembly routines must use the C calling convention (parameters at stack offsets 4,X, 6,X, etc.)
 - Assembly labels must start with underscore to match C names (e.g., `_fast_mul` for `fast_mul()`)
 
+#### Cross-File Type Checking
+
+When building multi-file C projects, the compiler validates that `extern` declarations match their actual definitions. This catches type mismatches at compile time rather than causing mysterious runtime crashes.
+
+**Checked Mismatches:**
+
+| Mismatch Type | Example |
+|---------------|---------|
+| Return type | `extern int f()` vs `char f() { ... }` |
+| Parameter count | `extern int f(int, int)` vs `int f(int x) { ... }` |
+| Parameter type | `extern int f(int x)` vs `int f(char *s) { ... }` |
+| Variable type | `extern int counter` vs `char counter;` |
+
+**Example:**
+
+```c
+/* main.c - declares helper with int parameter */
+extern int helper(int x);
+
+void main() {
+    int r = helper(42);
+}
+```
+
+```c
+/* helper.c - defines helper with char* parameter (MISMATCH!) */
+int helper(char *s) {
+    return strlen(s);
+}
+```
+
+Build error:
+```
+Error: extern 'helper' parameter type mismatch
+  main.c:2: extern declares parameter 1 as 'int'
+  helper.c:2: definition has parameter 1 as 'char *'
+```
+
+**Array/Pointer Compatibility:**
+
+Unsized array declarations correctly match pointer and sized array definitions, following standard C array-to-pointer decay rules:
+
+```c
+/* main.c */
+extern char buffer[];      /* Unsized array (incomplete type) */
+
+/* data.c */
+char buffer[64];           /* OK: sized array matches unsized extern */
+/* OR */
+char *buffer;              /* OK: pointer also matches (decay rule) */
+```
+
 ---
 
 ## 4. Language Reference
@@ -530,6 +582,32 @@ void main() {
     print_int(sum);
 }
 ```
+
+#### Void Function Type Safety
+
+Functions declared as `void` cannot be used in expressions. The compiler enforces this at compile time:
+
+```c
+void do_nothing() {}
+
+void main() {
+    int x;
+
+    do_nothing();           /* OK: called as statement */
+    x = do_nothing();       /* ERROR: void used in expression */
+    x = 1 + do_nothing();   /* ERROR: void in arithmetic */
+}
+```
+
+**Error message:**
+```
+error: void function 'do_nothing' used in expression
+```
+
+This applies to all void functions including:
+- User-defined void functions
+- OPL procedures declared as `opl void func()`
+- Standard library void functions like `cls()`, `print()`
 
 #### The main Function
 
@@ -1607,6 +1685,8 @@ void main() {
 | Garbage output | String not terminated | Add null terminator |
 | 4-line not working | Missing `-m LZ` | Add `-m LZ` to both pscc and psasm |
 | Immediate exit on CM/XP | Built for LZ | Build without `-m LZ` |
+| "void function used in expression" | Void return used as value | Call void function as statement, not in assignment/arithmetic |
+| "extern mismatch" | Declaration doesn't match definition | Fix extern declaration to match actual function/variable type |
 
 ### 11.2 Mixed Type Errors
 
@@ -1624,15 +1704,53 @@ a = b;           /* ERROR: use struct_copy */
 struct_copy(&a, &b, sizeof(struct Point));  /* OK */
 ```
 
-### 11.4 Debugging Tips
+### 11.4 Type Safety Errors
+
+#### Void Function in Expression
+
+```c
+void setup() { cls(); }
+
+void main() {
+    int x = setup();    /* ERROR: void used in expression */
+}
+```
+
+**Fix:** Call void functions as statements, don't assign their "return value":
+
+```c
+void main() {
+    setup();            /* OK: called as statement */
+}
+```
+
+#### Extern Type Mismatch
+
+```c
+/* In main.c */
+extern int get_value();     /* Declares int return */
+
+/* In helper.c */
+char get_value() { ... }    /* ERROR: defined as char return */
+```
+
+**Fix:** Ensure extern declarations exactly match definitions:
+
+```c
+/* In main.c */
+extern char get_value();    /* Must match definition */
+```
+
+### 11.5 Debugging Tips
 
 1. **Use `-v` flag** for verbose build output
 2. **Use `-k` flag** to keep intermediate files
 3. **Examine generated assembly** (`.asm` file)
-4. **Test in emulator** before real hardware
-5. **Add print statements** for tracing
+4. **Use `-g` flag** to generate debug symbols for source-level debugging
+5. **Test in emulator** before real hardware
+6. **Add print statements** for tracing
 
-### 11.5 Emulator Testing
+### 11.6 Emulator Testing
 
 Test programs in the SDK emulator before transferring to hardware:
 

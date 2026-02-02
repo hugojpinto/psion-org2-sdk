@@ -123,7 +123,8 @@ class Assembler:
                  defines: dict[str, int] | None = None,
                  relocatable: bool = False,
                  target_model: str | None = None,
-                 optimize: bool = True):
+                 optimize: bool = True,
+                 debug: bool = False):
         """
         Initialize the assembler.
 
@@ -140,6 +141,10 @@ class Assembler:
                      optimizations like converting LDAA #0 to CLRA, eliminating
                      redundant push/pull pairs, etc. Disable for debugging or
                      when exact instruction sequences must be preserved.
+            debug: Enable debug symbol generation. When True, the assembler tracks
+                   symbol definitions and source line mappings for generating a
+                   .dbg file alongside the OB3 output. Use write_debug() to output
+                   the debug file after assembly.
         """
         self._verbose = verbose
         self._relocatable = relocatable
@@ -167,6 +172,12 @@ class Assembler:
             model_callback=self.set_model,
             target=self._initial_model
         )
+
+        # Enable debug symbol generation if requested
+        # This must be done before any assembly to collect symbols
+        self._debug_enabled = debug
+        if debug:
+            self._codegen.enable_debug(True)
 
         # Initialize model-specific symbols
         self._setup_model_symbols(self._initial_model)
@@ -300,6 +311,32 @@ class Assembler:
         """
         self._defines[name] = value
         self._codegen.define_symbol(name, value)
+
+    def enable_debug(self, enabled: bool = True) -> None:
+        """
+        Enable or disable debug symbol generation.
+
+        When enabled, the assembler tracks symbol definitions and source
+        line mappings that can be written to a .dbg file after assembly.
+        This enables source-level debugging with external tools.
+
+        Note: Debug must be enabled BEFORE calling assemble methods to
+        collect debug information during code generation.
+
+        Args:
+            enabled: True to enable debug tracking, False to disable
+        """
+        self._debug_enabled = enabled
+        self._codegen.enable_debug(enabled)
+
+    def is_debug_enabled(self) -> bool:
+        """
+        Check if debug symbol generation is enabled.
+
+        Returns:
+            True if debug symbols are being collected
+        """
+        return self._debug_enabled
 
     # =========================================================================
     # Assembly Methods
@@ -573,6 +610,44 @@ class Assembler:
 
         if self._verbose:
             print(f"Wrote procedure to {filepath}")
+
+    def write_debug(self, filepath: str | Path) -> None:
+        """
+        Write debug symbol file (.dbg).
+
+        The debug file contains symbol addresses and source line mappings
+        that enable source-level debugging with external tools. The file
+        format is human-readable text.
+
+        Note: Debug must be enabled (via constructor or enable_debug())
+        before assembly for debug information to be collected.
+
+        The debug file format is:
+        ```
+        # Psion SDK Debug Symbols
+        VERSION 1.0
+        TARGET <model>
+        ORIGIN $<hex_addr>
+
+        [SYMBOLS]
+        <name> $<hex_addr> <type> <file>:<line>
+        ...
+
+        [SOURCE_MAP]
+        $<hex_addr> <file>:<line> [<label>]
+        ...
+        ```
+
+        Args:
+            filepath: Output file path (.dbg extension recommended)
+
+        Raises:
+            RuntimeError: If debug mode was not enabled before assembly
+        """
+        self._codegen.write_debug_file(filepath)
+
+        if self._verbose:
+            print(f"Wrote debug symbols to {filepath}")
 
     # =========================================================================
     # Error Handling

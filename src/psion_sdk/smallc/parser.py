@@ -620,8 +620,9 @@ class CParser:
                 if self._check(CTokenType.NUMBER):
                     array_size = self._advance().value
                 elif self._check(CTokenType.RBRACKET):
-                    # extern int arr[]; - unsized array (size determined by definition)
-                    array_size = 0  # 0 means unsized
+                    # extern int arr[]; - unsized/incomplete array (size determined by definition)
+                    # Use -1 as sentinel for unsized arrays (0 = not an array, >0 = sized array)
+                    array_size = -1
                 else:
                     raise CSyntaxError(
                         "expected array size or ']'",

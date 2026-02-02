@@ -151,7 +151,9 @@ import click
 
 from psion_sdk import __version__
 from psion_sdk.smallc import SmallCCompiler, CompilerOptions
-from psion_sdk.smallc.compiler import source_has_main
+from psion_sdk.smallc.compiler import source_has_main, parse_source_with_main_check
+from psion_sdk.smallc.cross_file_checker import validate_extern_signatures
+from psion_sdk.smallc.ast import ProgramNode
 from psion_sdk.assembler import Assembler
 from psion_sdk.opk import PackBuilder, validate_ob3
 from psion_sdk.cli.errors import handle_cli_exception
@@ -230,11 +232,14 @@ class MainFileResult:
         library_c_files: C files that don't contain main() (library mode)
         found: True if a main file was successfully identified
         error: Error message if detection failed (multiple main(), etc.)
+        parsed_asts: List of (filename, ProgramNode) tuples for all parsed C files.
+                    Used for cross-file extern validation.
     """
     main_file: Optional[Path] = None
     library_c_files: list[Path] = field(default_factory=list)
     found: bool = False
     error: Optional[str] = None
+    parsed_asts: list[tuple[str, ProgramNode]] = field(default_factory=list)
 
 
 # =============================================================================
@@ -314,6 +319,7 @@ def find_main_file(
         - library_c_files: Files not containing main()
         - found: True if exactly one main was found
         - error: Error message if detection failed
+        - parsed_asts: List of (filename, ProgramNode) for cross-file validation
 
     Notes:
         - If no C files contain main(), found=False and error is set
@@ -336,7 +342,11 @@ def find_main_file(
 
         try:
             source = c_file.read_text(encoding='utf-8')
-            has_main = source_has_main(source, str(c_file), include_paths)
+            # Parse the source and check for main() in one pass
+            ast, has_main = parse_source_with_main_check(source, str(c_file), include_paths)
+
+            # Collect the AST for cross-file validation
+            result.parsed_asts.append((str(c_file), ast))
 
             if has_main:
                 files_with_main.append(c_file)
@@ -842,6 +852,8 @@ def assemble_to_ob3(
     relocatable: bool,
     optimize: bool,
     verbose: bool,
+    debug: bool = False,
+    debug_output: Optional[Path] = None,
 ) -> None:
     """
     Assemble HD6303 source to OB3 object file using psasm.
@@ -854,6 +866,8 @@ def assemble_to_ob3(
         relocatable: If True, generate self-relocating code
         optimize: If True, enable peephole optimization
         verbose: If True, print detailed progress
+        debug: If True, generate debug symbol file
+        debug_output: Path for the .dbg file (only used if debug=True)
 
     Raises:
         AssemblerError: If assembly fails
@@ -867,12 +881,13 @@ def assemble_to_ob3(
         click.echo(f"      Relocatable: {relocatable}")
         click.echo(f"      Optimization: {'enabled' if optimize else 'disabled'}")
 
-    # Create assembler instance
+    # Create assembler instance with debug support if requested
     asm = Assembler(
         verbose=False,  # We handle our own verbosity
         relocatable=relocatable,
         target_model=model.upper() if model else None,
         optimize=optimize,
+        debug=debug,  # Enable debug symbol generation
     )
 
     # Add include paths
@@ -884,6 +899,12 @@ def assemble_to_ob3(
 
     # Write OB3 output
     asm.write_ob3(output_ob3)
+
+    # Write debug file if requested
+    if debug and debug_output:
+        asm.write_debug(debug_output)
+        if verbose:
+            click.echo(f"      Debug symbols: {debug_output.name}")
 
     if verbose:
         code_size = len(asm.get_code())
@@ -996,6 +1017,13 @@ def package_to_opk(
     is_flag=True,
     help="Show detailed progress for each build stage",
 )
+@click.option(
+    "-g", "--debug",
+    is_flag=True,
+    help="Generate debug symbol file (.dbg) alongside the OPK output. "
+         "The debug file contains symbol addresses and source line mappings "
+         "for source-level debugging.",
+)
 @click.version_option(version=__version__, prog_name="psbuild")
 def main(
     input_files: tuple[Path, ...],
@@ -1006,6 +1034,7 @@ def main(
     keep: bool,
     optimize: bool,
     verbose: bool,
+    debug: bool,
 ) -> None:
     """
     Build a Psion Organiser II program from C or assembly source(s).
@@ -1080,6 +1109,12 @@ def main(
         first_input = classified.all_files[0]
         output_opk = resolve_output_path(output, first_input)
 
+        # Compute debug output path if debug mode is enabled
+        # The debug file is placed alongside the OPK with a .dbg extension
+        debug_output: Optional[Path] = None
+        if debug:
+            debug_output = output_opk.with_suffix('.dbg')
+
         # Build include paths from all source file directories
         include_paths = build_include_paths(include, classified.all_files)
 
@@ -1150,6 +1185,8 @@ def main(
                         relocatable=True,
                         optimize=optimize,
                         verbose=verbose,
+                        debug=debug,
+                        debug_output=debug_output,
                     )
 
                     package_to_opk(
@@ -1169,6 +1206,8 @@ def main(
                         relocatable=use_relocatable,
                         optimize=optimize,
                         verbose=verbose,
+                        debug=debug,
+                        debug_output=debug_output,
                     )
 
                     package_to_opk(
@@ -1249,6 +1288,35 @@ def main(
                             click.echo(f"      Library files: {lib_names}")
                         click.echo()
 
+                    # ---------------------------------------------------------
+                    # Step 3a.1: Cross-file extern type checking (multi-file only)
+                    # ---------------------------------------------------------
+                    if len(classified.c_files) > 1 and main_result.parsed_asts:
+                        current_step += 1
+                        if verbose:
+                            click.echo(f"{step_label()} Validating extern declarations...")
+
+                        extern_errors, extern_warnings = validate_extern_signatures(
+                            main_result.parsed_asts,
+                            warn_undefined=verbose,  # Only show undefined warnings in verbose mode
+                        )
+
+                        # Report warnings in verbose mode
+                        if verbose and extern_warnings:
+                            for warning in extern_warnings:
+                                click.echo(f"      {warning}")
+
+                        # Errors are fatal
+                        if extern_errors:
+                            click.echo(click.style("Error: Extern declaration mismatches:", fg="red"), err=True)
+                            for error in extern_errors:
+                                click.echo(f"  {error}", err=True)
+                            raise click.ClickException("Cross-file type checking failed")
+
+                        if verbose:
+                            click.echo("      All extern declarations match their definitions.")
+                            click.echo()
+
                 # ---------------------------------------------------------
                 # Step 3b: Compile library C files (emit_runtime=False)
                 # ---------------------------------------------------------
@@ -1322,6 +1390,8 @@ def main(
                     relocatable=use_relocatable,
                     optimize=optimize,
                     verbose=verbose,
+                    debug=debug,
+                    debug_output=debug_output,
                 )
 
                 # ---------------------------------------------------------

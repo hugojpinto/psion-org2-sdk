@@ -104,6 +104,11 @@ from psion_sdk.cli.errors import handle_cli_exception
     is_flag=True,
     help="Verbose output",
 )
+@click.option(
+    "-g", "--debug",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Generate debug symbol file (.dbg) with symbol addresses and source mappings",
+)
 @click.version_option(version=__version__, prog_name="psasm")
 def main(
     input_file: Path,
@@ -118,6 +123,7 @@ def main(
     model: Optional[str],
     optimize: bool,
     verbose: bool,
+    debug: Optional[Path],
 ) -> None:
     """
     Assemble HD6303 source code for Psion Organiser II.
@@ -154,12 +160,13 @@ def main(
         output_mode = "ob3"
         output_file = output if output is not None else input_file.with_suffix(".ob3")
 
-    # Create assembler with optional target model
+    # Create assembler with optional target model and debug support
     asm = Assembler(
         verbose=verbose,
         relocatable=relocatable,
         target_model=model.upper() if model else None,
         optimize=optimize,
+        debug=debug is not None,  # Enable debug if output path specified
     )
 
     if verbose:
@@ -171,6 +178,8 @@ def main(
             click.echo("Peephole optimization: enabled")
         else:
             click.echo("Peephole optimization: disabled")
+        if debug:
+            click.echo(f"Debug symbols: {debug}")
 
     # Add include paths
     for inc_path in include:
@@ -235,6 +244,11 @@ def main(
             asm.write_symbols(symbols)
             if verbose:
                 click.echo(f"Wrote symbols to {symbols}")
+
+        if debug:
+            asm.write_debug(debug)
+            if verbose:
+                click.echo(f"Wrote debug symbols to {debug}")
 
         # Print summary
         if verbose:

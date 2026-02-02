@@ -230,6 +230,63 @@ class Symbol:
 
 
 # =============================================================================
+# Debug Symbol Information
+# =============================================================================
+#
+# These dataclasses support the optional debug symbol generation feature.
+# When enabled (-g/--debug flag), the assembler produces a .dbg file containing:
+# - Symbol addresses and types (CODE, DATA, EQU)
+# - Source line mappings for debugging
+#
+# The debug file format is human-readable text for easy parsing by tools
+# and manual inspection during debugging sessions.
+# =============================================================================
+
+@dataclass
+class DebugSymbol:
+    """
+    Debug symbol entry for the .dbg file.
+
+    Records a named symbol with its resolved address and classification.
+    Used to generate the [SYMBOLS] section of the debug file.
+
+    Attributes:
+        name: Symbol name (as it appears in source)
+        address: Resolved address value
+        symbol_type: Classification - "CODE" for labels in code sections,
+                    "DATA" for data labels, "EQU" for constants
+        source_file: Source file where defined
+        source_line: Line number where defined (1-based)
+    """
+    name: str
+    address: int
+    symbol_type: str  # "CODE", "DATA", "EQU"
+    source_file: str
+    source_line: int
+
+
+@dataclass
+class SourceMapEntry:
+    """
+    Source location mapping entry for the .dbg file.
+
+    Maps a machine code address to its source location, enabling
+    source-level debugging by correlating runtime addresses with
+    the original assembly source.
+
+    Attributes:
+        address: Machine code address
+        source_file: Source file name
+        source_line: Line number in source file (1-based)
+        label: Optional label at this address (for reference)
+    """
+    address: int
+    source_file: str
+    source_line: int
+    label: Optional[str] = None
+
+
+# =============================================================================
 # Code Generator
 # =============================================================================
 
@@ -323,6 +380,15 @@ class CodeGenerator:
         if self._target not in self.VALID_TARGETS:
             self._target = self.DEFAULT_TARGET
 
+        # Debug symbol generation support
+        # --------------------------------
+        # When enabled, the assembler tracks symbols and source mappings
+        # for generating a .dbg file alongside the OB3 output.
+        # This enables source-level debugging with external tools.
+        self._debug_enabled: bool = False
+        self._debug_symbols: list[DebugSymbol] = []
+        self._source_map: list[SourceMapEntry] = []
+
         # Macro support
         # -------------
         # _macros: Dictionary of macro name -> MacroDef object
@@ -357,6 +423,26 @@ class CodeGenerator:
         )
         self._evaluator.set_symbol(name, value)
 
+    def enable_debug(self, enabled: bool = True) -> None:
+        """
+        Enable or disable debug symbol generation.
+
+        When enabled, the assembler tracks:
+        - Symbol definitions with addresses and types
+        - Source line mappings for each instruction
+
+        This information can be written to a .dbg file using write_debug_file()
+        after code generation completes.
+
+        Args:
+            enabled: True to enable debug tracking, False to disable
+        """
+        self._debug_enabled = enabled
+        if enabled:
+            # Clear any existing debug info when enabling
+            self._debug_symbols = []
+            self._source_map = []
+
     def generate(self, statements: list[Statement]) -> bytes:
         """
         Generate object code from parsed statements.
@@ -385,6 +471,10 @@ class CodeGenerator:
         # (will accumulate during relaxation iterations, but starts empty)
         self._long_branches.clear()
         self._branch_locations.clear()
+        # Clear debug info - this ensures clean state even through branch relaxation
+        # (debug info will be re-populated during the final pass 2)
+        self._debug_symbols.clear()
+        self._source_map.clear()
 
         # =====================================================================
         # Iterative Branch Relaxation
@@ -691,6 +781,108 @@ class CodeGenerator:
             for name, sym in sorted(self._symbols.items()):
                 f.write(f"{name} ${sym.value:04X}\n")
 
+    def write_debug_file(self, filepath: str | Path) -> None:
+        """
+        Write debug symbol file (.dbg).
+
+        The debug file contains:
+        - Header with version, target model, and origin address
+        - [SYMBOLS] section with named symbols and their addresses
+        - [SOURCE_MAP] section mapping addresses to source locations
+
+        This file is used by debugging tools to correlate machine code
+        addresses with source file locations for source-level debugging.
+
+        The file format is human-readable text:
+        ```
+        # Psion SDK Debug Symbols
+        VERSION 1.0
+        TARGET <model>
+        ORIGIN $<hex_addr>
+        RELOCATABLE <true|false>
+
+        [SYMBOLS]
+        <name> $<hex_addr> <type> <file>:<line>
+        ...
+
+        [SOURCE_MAP]
+        $<hex_addr> <file>:<line> [<label>]
+        ...
+        ```
+
+        For relocatable code (RELOCATABLE true):
+            All addresses are offsets from ORIGIN. To compute runtime addresses,
+            add the actual load address to each symbol/source map address:
+            runtime_addr = debug_addr + load_address
+
+        For non-relocatable code (RELOCATABLE false):
+            Addresses are absolute and can be used directly.
+
+        Args:
+            filepath: Path to write the .dbg file
+
+        Raises:
+            RuntimeError: If debug mode was not enabled before generate()
+        """
+        if not self._debug_enabled:
+            raise RuntimeError(
+                "Debug mode must be enabled before generate() to collect debug info. "
+                "Call enable_debug(True) before generating code."
+            )
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            # Header section
+            f.write("# Psion SDK Debug Symbols\n")
+            f.write("# Generated by psasm\n")
+            f.write("#\n")
+            f.write("VERSION 1.0\n")
+            f.write(f"TARGET {self._target}\n")
+            f.write(f"ORIGIN ${self._origin:04X}\n")
+            # RELOCATABLE flag tells debuggers how to interpret addresses:
+            # - true: addresses are offsets, add load_address to get runtime addr
+            # - false: addresses are absolute, use directly
+            relocatable_str = "true" if self._relocatable else "false"
+            f.write(f"RELOCATABLE {relocatable_str}\n")
+            f.write("\n")
+
+            # Symbols section
+            f.write("[SYMBOLS]\n")
+            # Sort symbols by address for easier reading
+            for sym in sorted(self._debug_symbols, key=lambda s: s.address):
+                f.write(
+                    f"{sym.name} ${sym.address:04X} {sym.symbol_type} "
+                    f"{sym.source_file}:{sym.source_line}\n"
+                )
+            f.write("\n")
+
+            # Source map section
+            f.write("[SOURCE_MAP]\n")
+            # Sort by address for sequential reading during debugging
+            for entry in sorted(self._source_map, key=lambda e: e.address):
+                label_suffix = f" [{entry.label}]" if entry.label else ""
+                f.write(
+                    f"${entry.address:04X} {entry.source_file}:{entry.source_line}"
+                    f"{label_suffix}\n"
+                )
+
+    def get_debug_symbols(self) -> list[DebugSymbol]:
+        """
+        Get the collected debug symbols.
+
+        Returns:
+            List of DebugSymbol entries (empty if debug not enabled)
+        """
+        return list(self._debug_symbols)
+
+    def get_source_map(self) -> list[SourceMapEntry]:
+        """
+        Get the collected source map entries.
+
+        Returns:
+            List of SourceMapEntry entries (empty if debug not enabled)
+        """
+        return list(self._source_map)
+
     # =========================================================================
     # Pass 1: Symbol Collection
     # =========================================================================
@@ -840,6 +1032,10 @@ class CodeGenerator:
         if label.is_local and name not in self._symbols:
             self._symbols[name] = self._symbols[full_name]
             self._evaluator.set_symbol(name, self._pc)
+
+        # Note: Debug symbols are collected at the start of pass 2, not here.
+        # This is because pass 1 runs multiple times during branch relaxation,
+        # but we only want to record symbols once from their final state.
 
     def _calculate_instruction_size(self, inst: Instruction) -> int:
         """Calculate the size of an instruction."""
@@ -1101,6 +1297,10 @@ class CodeGenerator:
         )
         self._evaluator.set_symbol(name, value)
 
+        # Note: Debug symbols are collected at the start of pass 2, not here.
+        # This is because pass 1 runs multiple times during branch relaxation,
+        # but we only want to record symbols once from their final state.
+
     def _evaluate_constant(self, tokens: list[Token], location: SourceLocation) -> int:
         """Evaluate an expression that must be constant (no forward refs)."""
         try:
@@ -1125,6 +1325,40 @@ class CodeGenerator:
         - Handles data directives
         """
         self._pc = self._origin
+
+        # Collect debug symbols from the finalized symbol table
+        # We do this at the start of pass 2 because:
+        # 1. Pass 1 may run multiple times during branch relaxation
+        # 2. All symbols and their addresses are finalized after pass 1 completes
+        # 3. Pass 2 only runs once, so we collect exactly once
+        if self._debug_enabled:
+            self._debug_symbols.clear()  # Clear any stale data
+            self._source_map.clear()
+
+            for name, sym in self._symbols.items():
+                # Skip local labels (implementation details)
+                if sym.is_local:
+                    continue
+                # Skip external symbols (OS addresses, system vars from includes)
+                if sym.is_external:
+                    continue
+                # Skip predefined symbols
+                if sym.location.filename == "<predefined>":
+                    continue
+
+                # Determine symbol type
+                if sym.is_constant:
+                    symbol_type = "EQU"
+                else:
+                    symbol_type = "CODE"  # Labels in code sections
+
+                self._debug_symbols.append(DebugSymbol(
+                    name=name,
+                    address=sym.value,
+                    symbol_type=symbol_type,
+                    source_file=sym.location.filename,
+                    source_line=sym.location.line,
+                ))
 
         for i, stmt in enumerate(statements):
             try:
@@ -1153,6 +1387,17 @@ class CodeGenerator:
 
         elif isinstance(stmt, Instruction):
             self._generate_instruction(stmt)
+
+            # Record source map entry if debug mode is enabled
+            # This maps the instruction's machine code address to its source location
+            if self._debug_enabled:
+                self._source_map.append(SourceMapEntry(
+                    address=start_pc,
+                    source_file=stmt.location.filename,
+                    source_line=stmt.location.line,
+                    label=self._current_global_label,
+                ))
+
             # Add listing line for instruction
             code_bytes = self._code[code_start:]
             hex_str = " ".join(f"{b:02X}" for b in code_bytes) if code_bytes else ""

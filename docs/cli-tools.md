@@ -157,6 +157,7 @@ psbuild [OPTIONS] INPUT_FILES...
 | `-I, --include PATH` | Add include search path (can be repeated) |
 | `-r, --relocatable` | Generate self-relocating code (assembly only; always enabled for C) |
 | `-k, --keep` | Keep intermediate files (.asm, .ob3) |
+| `-g, --debug FILE` | Generate debug symbol file (.dbg) for source-level debugging |
 | `-O, --optimize` | Enable peephole optimization (default: enabled) |
 | `--no-optimize` | Disable peephole optimization |
 | `-v, --verbose` | Show detailed progress for each build stage |
@@ -262,6 +263,37 @@ int helper_func(int x) {
 - Exactly one C file must contain `main()`
 - Assembly routines must follow C calling convention (args at 4,X, 6,X, etc.)
 - Assembly labels must use underscore prefix (`_funcname` for `funcname()`)
+
+#### Cross-File Type Checking
+
+When building multi-file C projects, `psbuild` validates that `extern` declarations match their actual definitions. This catches type mismatches at compile time rather than causing mysterious runtime crashes.
+
+**Checked Mismatches:**
+- Function return type mismatch
+- Function parameter count mismatch
+- Function parameter type mismatch
+- Variable type mismatch
+
+**Example Error:**
+
+```c
+/* main.c */
+extern int helper(int x);  /* Expects int parameter */
+
+/* helper.c */
+int helper(char *s) { ... }  /* Actual: char* parameter */
+```
+
+```
+$ psbuild main.c helper.c -o MYAPP.opk
+Error: extern 'helper' parameter type mismatch
+  main.c:2: extern declares parameter 1 as 'int'
+  helper.c:2: definition has parameter 1 as 'char *'
+```
+
+**Array/Pointer Decay:**
+
+Unsized arrays (`extern char buffer[];`) correctly match both pointer declarations (`char *buffer`) and sized array definitions (`char buffer[16]`), following standard C semantics.
 
 ### Procedure Name Derivation
 
@@ -380,6 +412,7 @@ psasm [OPTIONS] INPUT_FILE
 | `-o, --output FILE` | Output OB3 file (default: input.ob3) |
 | `-l, --listing FILE` | Generate listing file |
 | `-s, --symbols FILE` | Generate symbol file |
+| `-g, --debug FILE` | Generate debug symbol file (.dbg) for source-level debugging |
 | `-b, --binary FILE` | Generate raw binary (machine code only) |
 | `-p, --proc FILE` | Generate procedure (OPL wrapper, no OB3 header) |
 | `-I, --include PATH` | Add include search path (can be repeated) |
@@ -450,6 +483,53 @@ The `-r` flag generates self-relocating code:
 **When NOT to use `-r`:**
 - Simple assembly using only relative branches
 - Programs calling only system services (fixed ROM addresses)
+
+### Debug Symbol Generation (-g Flag)
+
+The `-g` flag generates a debug symbol file (`.dbg`) containing:
+
+- **Symbol addresses**: Labels, EQU constants, and their memory locations
+- **Source mappings**: Machine address to source file/line relationships
+- **Relocation info**: Whether addresses are absolute or relocatable
+
+**Debug File Format:**
+
+```
+# Psion SDK Debug Symbols
+VERSION 1.0
+TARGET XP
+ORIGIN $2100
+RELOCATABLE false
+
+[SYMBOLS]
+START $2100 CODE hello.asm:5
+LOOP $2105 CODE hello.asm:8
+COUNTER $0080 EQU hello.asm:3
+
+[SOURCE_MAP]
+$2100 hello.asm:5 [start]
+$2101 hello.asm:6 [start]
+$2105 hello.asm:8 [loop]
+```
+
+**RELOCATABLE Field:**
+- `false`: Addresses are absolute (non-relocatable code)
+- `true`: Addresses are offsets from ORIGIN (relocatable code)
+
+For relocatable code, add ORIGIN to each address to get the runtime address after relocation.
+
+**Examples:**
+
+```bash
+# Generate debug file alongside OB3
+psasm -g hello.dbg hello.asm -o hello.ob3
+
+# Debug file for relocatable code
+psasm -r -g hello.dbg hello.asm -o hello.ob3
+
+# With psbuild
+psbuild -g HELLO.dbg hello.c -o HELLO.opk
+```
 
 ### Optimizations
 
@@ -1000,4 +1080,4 @@ JSR     <my_func        # WRONG - won't be relocated, will crash
 
 ---
 
-*Last updated: January 2026*
+*Last updated: February 2026*

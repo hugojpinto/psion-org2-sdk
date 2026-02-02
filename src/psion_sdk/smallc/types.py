@@ -93,7 +93,10 @@ class CType:
         is_unsigned: True for unsigned types
         is_pointer: True if this is a pointer type
         pointer_depth: Number of indirection levels (e.g., ** = 2)
-        array_size: For arrays, the element count (0 = not array)
+        array_size: For arrays, the element count. Special values:
+                   - 0 = not an array
+                   - -1 = unsized/incomplete array (e.g., extern char buf[];)
+                   - >0 = array with known size
         struct_name: For struct types, the name of the struct (None = not a struct)
         struct_size_resolver: Optional callback to resolve struct sizes at runtime.
                              This is set by the code generator to allow size lookups.
@@ -104,14 +107,17 @@ class CType:
         - int *            : CType(INT, False, True, 1, 0, None)
         - char **          : CType(CHAR, False, True, 2, 0, None)
         - int arr[10]      : CType(INT, False, False, 0, 10, None)
+        - extern int arr[] : CType(INT, False, False, 0, -1, None)  # unsized
         - struct Point     : CType(VOID, struct_name="Point")
         - struct Point *   : CType(VOID, struct_name="Point", is_pointer=True)
         - struct Point[3]  : CType(VOID, struct_name="Point", array_size=3)
 
     Note:
-        For array types, is_pointer is False but array_size > 0.
+        For array types, is_pointer is False but array_size != 0.
         When an array decays to a pointer (in expressions), a new
         CType is created with is_pointer=True, pointer_depth=1.
+        Both sized arrays (array_size > 0) and unsized arrays (array_size == -1)
+        decay to pointers identically.
 
         For struct types, base_type is typically VOID (ignored), and
         struct_name identifies the struct definition. The actual struct
@@ -122,7 +128,7 @@ class CType:
     is_unsigned: bool = False
     is_pointer: bool = False
     pointer_depth: int = 0
-    array_size: int = 0  # 0 = not an array
+    array_size: int = 0  # 0 = not an array, -1 = unsized/incomplete array, >0 = sized array
     struct_name: Optional[str] = None  # None = not a struct type
     # Callback to resolve struct sizes. Set by code generator.
     # Signature: (struct_name: str) -> int
@@ -248,11 +254,20 @@ class CType:
         """
         Return the total size in bytes including array elements.
 
-        For arrays, this is element_count * element_size.
+        For sized arrays (array_size > 0), this is element_count * element_size.
         For non-arrays, this equals size.
+        For unsized/incomplete arrays (array_size == -1), raises ValueError.
 
         For struct arrays, returns array_size * struct_size.
+
+        Raises:
+            ValueError: If called on an unsized/incomplete array type
         """
+        if self.array_size == -1:
+            raise ValueError(
+                "Cannot compute total_size of unsized/incomplete array type. "
+                "Unsized arrays (e.g., extern int arr[];) have unknown size."
+            )
         if self.array_size > 0:
             if self.struct_name is not None:
                 # Struct array
@@ -270,8 +285,13 @@ class CType:
 
     @property
     def is_array(self) -> bool:
-        """Return True if this is an array type."""
-        return self.array_size > 0
+        """
+        Return True if this is an array type.
+
+        Both sized arrays (array_size > 0) and unsized/incomplete arrays
+        (array_size == -1, e.g., extern int arr[];) are considered arrays.
+        """
+        return self.array_size != 0
 
     @property
     def is_void(self) -> bool:
@@ -525,6 +545,10 @@ class CType:
         if self.array_size > 0:
             result = " ".join(parts)
             return f"{result}[{self.array_size}]"
+        elif self.array_size == -1:
+            # Unsized/incomplete array (e.g., extern int arr[];)
+            result = " ".join(parts)
+            return f"{result}[]"
 
         return " ".join(parts)
 

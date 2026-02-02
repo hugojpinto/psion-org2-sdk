@@ -376,6 +376,80 @@ def source_has_main(source: str, filename: str = "<input>",
     return False
 
 
+def parse_source(source: str, filename: str = "<input>",
+                 include_paths: Optional[list[str]] = None) -> 'ProgramNode':
+    """
+    Parse a C source file and return the AST.
+
+    This is a utility function for parsing C source code without generating
+    assembly. Used by cross-file validation to collect type information.
+
+    Args:
+        source: C source code string
+        filename: Source filename for error messages
+        include_paths: Directories to search for includes
+
+    Returns:
+        ProgramNode representing the parsed AST
+
+    Raises:
+        SmallCError: If the source has syntax errors
+    """
+    from psion_sdk.smallc.ast import ProgramNode
+
+    # Run preprocessing and parsing only (no code generation)
+    preprocessor = Preprocessor(
+        source,
+        filename,
+        include_paths or ["."],
+        target_model=None,
+    )
+    preprocessed = preprocessor.process()
+
+    lexer = CLexer(preprocessed, filename)
+    tokens = list(lexer.tokenize())
+
+    parser = CParser(tokens, filename, preprocessed.splitlines())
+    return parser.parse()
+
+
+def parse_source_with_main_check(source: str, filename: str = "<input>",
+                                  include_paths: Optional[list[str]] = None
+                                  ) -> tuple['ProgramNode', bool]:
+    """
+    Parse a C source file and check for main() function.
+
+    Returns both the AST and whether the source contains main(), useful for
+    multi-file builds where we need to collect ASTs for cross-file validation.
+
+    Args:
+        source: C source code string
+        filename: Source filename for error messages
+        include_paths: Directories to search for includes
+
+    Returns:
+        Tuple of (ProgramNode, has_main) where has_main is True if the
+        source contains a `void main()` function definition.
+
+    Raises:
+        SmallCError: If the source has syntax errors
+    """
+    from psion_sdk.smallc.ast import FunctionNode, ProgramNode
+
+    # Parse the source
+    ast = parse_source(source, filename, include_paths)
+
+    # Check for main() function definition
+    has_main = False
+    for decl in ast.declarations:
+        if isinstance(decl, FunctionNode):
+            if decl.name == "main" and not decl.is_forward_decl and not decl.is_opl:
+                has_main = True
+                break
+
+    return ast, has_main
+
+
 def file_has_main(filepath: str) -> bool:
     """
     Check if a C source file contains a main() function definition.

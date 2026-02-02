@@ -134,7 +134,10 @@ from psion_sdk.smallc.ast import (
     StructField,
     MemberAccessExpression,
 )
-from psion_sdk.smallc.types import CType, BaseType, TYPE_CHAR, TYPE_INT
+from psion_sdk.smallc.types import (
+    CType, BaseType, TYPE_CHAR, TYPE_INT, TYPE_VOID,
+    TYPE_CHAR_PTR, TYPE_VOID_PTR, TYPE_UINT,
+)
 from psion_sdk.smallc.errors import CCodeGenError, CTypeError
 
 
@@ -205,6 +208,28 @@ class OplFuncInfo:
 
 
 @dataclass
+class CFunctionSignature:
+    """
+    Signature of a user-defined C function for type inference.
+
+    Used to track declared return types of functions so that _get_expression_type()
+    can return accurate types for function calls instead of always assuming int.
+
+    Attributes:
+        name: Function name
+        return_type: The declared return type
+        param_count: Number of parameters
+        param_types: List of parameter types
+        is_forward_decl: True if this is a forward declaration
+    """
+    name: str
+    return_type: CType
+    param_count: int
+    param_types: list[CType]
+    is_forward_decl: bool = False
+
+
+@dataclass
 class StructFieldInfo:
     """
     Information about a struct field for code generation.
@@ -258,6 +283,185 @@ class CodeGenerator(ASTVisitor):
         "LA": (4, 20),
         "LZ": (4, 20),
         "LZ64": (4, 20),
+    }
+
+    # ==========================================================================
+    # Built-in Function Return Types
+    # ==========================================================================
+    # Split by header file for clarity. Functions from optional headers
+    # (float.h, stdio.h, db.h) are merged in __init__ based on compiler options.
+    # Functions not in these tables default to TYPE_INT (implicit declaration).
+
+    # psion.h - Core functions (always available)
+    BUILTIN_TYPES_PSION = {
+        # Display functions - void returns
+        "cls": TYPE_VOID,
+        "print": TYPE_VOID,
+        "putchar": TYPE_VOID,
+        "cursor": TYPE_VOID,
+        "at": TYPE_VOID,
+        "locate": TYPE_VOID,
+        "cursor_on": TYPE_VOID,
+        "cursor_off": TYPE_VOID,
+        "udg_define": TYPE_VOID,
+        "setmode": TYPE_VOID,
+        "pushmode": TYPE_VOID,
+        "popmode": TYPE_VOID,
+        # Display functions - int returns
+        "gcursor": TYPE_INT,
+        "getmode": TYPE_INT,
+        # Keyboard functions - char returns
+        "getkey": TYPE_CHAR,
+        "testkey": TYPE_CHAR,
+        # Keyboard functions - int returns
+        "kbhit": TYPE_INT,
+        "input_str": TYPE_INT,
+        "edit_str": TYPE_INT,
+        # Keyboard functions - void returns
+        "flushkb": TYPE_VOID,
+        "kstat": TYPE_VOID,
+        # Sound functions - void returns
+        "beep": TYPE_VOID,
+        "alarm": TYPE_VOID,
+        "tone": TYPE_VOID,
+        # Time functions - void returns
+        "delay": TYPE_VOID,
+        "gettime": TYPE_VOID,
+        "settime": TYPE_VOID,
+        # Time functions - int returns
+        "pause": TYPE_INT,
+        "getticks": TYPE_UINT,
+        # Number output - void returns
+        "print_int": TYPE_VOID,
+        "print_uint": TYPE_VOID,
+        "print_hex": TYPE_VOID,
+        # String functions - int returns
+        "strlen": TYPE_INT,
+        "strcmp": TYPE_INT,
+        "strncmp": TYPE_INT,
+        # String functions - char* returns
+        "strcpy": TYPE_CHAR_PTR,
+        "strcat": TYPE_CHAR_PTR,
+        "strchr": TYPE_CHAR_PTR,
+        "strncpy": TYPE_CHAR_PTR,
+        # Memory functions - void* returns
+        "memcpy": TYPE_VOID_PTR,
+        "struct_copy": TYPE_VOID_PTR,
+        "memset": TYPE_VOID_PTR,
+        # Memory functions - int returns
+        "memcmp": TYPE_INT,
+        # Number conversion - int returns
+        "atoi": TYPE_INT,
+        # Number conversion - char* returns
+        "itoa": TYPE_CHAR_PTR,
+        # Utility functions - int returns
+        "abs": TYPE_INT,
+        "min": TYPE_INT,
+        "max": TYPE_INT,
+        "rand": TYPE_INT,
+        # Utility functions - void returns
+        "off": TYPE_VOID,
+        "srand": TYPE_VOID,
+        "randomize": TYPE_VOID,
+        "exit": TYPE_VOID,
+        # OPL interoperability - void returns
+        "_call_opl_setup": TYPE_VOID,
+        # OPL interoperability - int returns
+        "call_opl": TYPE_INT,
+    }
+
+    # float.h - Floating point functions (optional)
+    BUILTIN_TYPES_FLOAT = {
+        # Error handling - int/void returns
+        "fp_get_error": TYPE_INT,
+        "fp_clear_error": TYPE_VOID,
+        # Initialization and conversion - void returns
+        "fp_zero": TYPE_VOID,
+        "fp_from_int": TYPE_VOID,
+        "fp_from_str": TYPE_VOID,
+        "fp_to_str": TYPE_VOID,
+        # Conversion - int returns
+        "fp_to_int": TYPE_INT,
+        # Arithmetic functions - void returns
+        "fp_add": TYPE_VOID,
+        "fp_sub": TYPE_VOID,
+        "fp_mul": TYPE_VOID,
+        "fp_div": TYPE_VOID,
+        "fp_neg": TYPE_VOID,
+        # Mathematical functions - void returns
+        "fp_sin": TYPE_VOID,
+        "fp_cos": TYPE_VOID,
+        "fp_tan": TYPE_VOID,
+        "fp_atan": TYPE_VOID,
+        "fp_sqrt": TYPE_VOID,
+        "fp_exp": TYPE_VOID,
+        "fp_ln": TYPE_VOID,
+        "fp_log": TYPE_VOID,
+        "fp_pow": TYPE_VOID,
+        "fp_rnd": TYPE_VOID,
+        # LZ-only functions - void returns
+        "fp_asin": TYPE_VOID,
+        "fp_acos": TYPE_VOID,
+        # Comparison functions - int returns
+        "fp_cmp": TYPE_INT,
+        "fp_sign": TYPE_INT,
+        "fp_is_zero": TYPE_INT,
+        # Output functions - void returns
+        "fp_print": TYPE_VOID,
+        "fp_print_sci": TYPE_VOID,
+    }
+
+    # stdio.h - Extended string functions (optional)
+    BUILTIN_TYPES_STDIO = {
+        # String functions - char* returns
+        "strrchr": TYPE_CHAR_PTR,
+        "strstr": TYPE_CHAR_PTR,
+        "strncat": TYPE_CHAR_PTR,
+        # Formatted output - int returns
+        "sprintf": TYPE_INT,
+        "sprintf0": TYPE_INT,
+        "sprintf1": TYPE_INT,
+        "sprintf2": TYPE_INT,
+        "sprintf3": TYPE_INT,
+    }
+
+    # db.h - Database functions (optional)
+    BUILTIN_TYPES_DB = {
+        # File management - int returns
+        "db_create": TYPE_INT,
+        "db_open": TYPE_INT,
+        "db_error": TYPE_INT,
+        # File management - void returns
+        "db_close": TYPE_VOID,
+        # Record building - void returns
+        "db_clear": TYPE_VOID,
+        # Record building - int returns
+        "db_set_str": TYPE_INT,
+        "db_set_int": TYPE_INT,
+        "db_set_idx": TYPE_INT,
+        "db_set_int_idx": TYPE_INT,
+        "db_append": TYPE_INT,
+        # Record reading - int returns
+        "db_read": TYPE_INT,
+        "db_get_str": TYPE_INT,
+        "db_get_int": TYPE_INT,
+        "db_get_idx": TYPE_INT,
+        "db_get_int_idx": TYPE_INT,
+        "db_field_count": TYPE_INT,
+        "db_recsize": TYPE_INT,
+        # Navigation - int returns
+        "db_first": TYPE_INT,
+        "db_next": TYPE_INT,
+        "db_back": TYPE_INT,
+        "db_find": TYPE_INT,
+        "db_eof": TYPE_INT,
+        "db_count": TYPE_INT,
+        "db_pos": TYPE_INT,
+        # Modification - int returns
+        "db_update": TYPE_INT,
+        "db_erase": TYPE_INT,
+        # Catalog - int returns
+        "db_catalog": TYPE_INT,
     }
 
     def __init__(self, target_model: str = "XP", has_float_support: bool = False,
@@ -357,6 +561,22 @@ class CodeGenerator(ASTVisitor):
         # have been pushed so we can compensate when computing local addresses.
         self._arg_push_depth: int = 0
 
+        # C function signatures for type inference
+        # Maps function name -> CFunctionSignature for tracking return types.
+        # Populated during first pass from FunctionNode declarations.
+        # Used by _get_expression_type() to return accurate types for calls.
+        self._c_funcs: dict[str, CFunctionSignature] = {}
+
+        # Build the combined builtin function types map
+        # Start with core psion.h functions, add optional headers as enabled
+        self._builtin_function_types: dict[str, CType] = dict(self.BUILTIN_TYPES_PSION)
+        if has_float_support:
+            self._builtin_function_types.update(self.BUILTIN_TYPES_FLOAT)
+        if has_stdio_support:
+            self._builtin_function_types.update(self.BUILTIN_TYPES_STDIO)
+        if has_db_support:
+            self._builtin_function_types.update(self.BUILTIN_TYPES_DB)
+
     def generate(self, program: ProgramNode) -> str:
         """
         Generate assembly code from AST.
@@ -373,12 +593,14 @@ class CodeGenerator(ASTVisitor):
         self._label_counter = 0
         self._opl_funcs = {}
         self._structs = {}
+        self._c_funcs = {}  # Reset user-defined function signatures
         self._last_expr_size = 2  # Reset expression size tracking
 
         # Emit header (includes)
         self._emit_header()
 
-        # First pass: collect struct definitions, global variables, and OPL declarations
+        # First pass: collect struct definitions, global variables, OPL declarations,
+        # and C function signatures for type inference
         for decl in program.declarations:
             if isinstance(decl, StructDefinition):
                 self._add_struct(decl)
@@ -397,6 +619,20 @@ class CodeGenerator(ASTVisitor):
                     param_count=len(decl.parameters),
                     param_types=[p.param_type for p in decl.parameters],
                 )
+            elif isinstance(decl, FunctionNode) and not decl.is_opl:
+                # Track C function signatures for type inference
+                # This includes both forward declarations and full definitions.
+                # If we see the same function twice (forward decl + definition),
+                # the definition takes precedence (is_forward_decl=False).
+                existing = self._c_funcs.get(decl.name)
+                if existing is None or (existing.is_forward_decl and not decl.is_forward_decl):
+                    self._c_funcs[decl.name] = CFunctionSignature(
+                        name=decl.name,
+                        return_type=decl.return_type,
+                        param_count=len(decl.parameters),
+                        param_types=[p.param_type for p in decl.parameters],
+                        is_forward_decl=decl.is_forward_decl,
+                    )
 
         # Collect all functions, separating main from others
         main_func = None
@@ -794,8 +1030,44 @@ class CodeGenerator(ASTVisitor):
             return self._get_array_subscript_type(expr)
 
         if isinstance(expr, CallExpression):
-            # For now, assume all functions return int
-            # TODO: Track function return types for better type checking
+            # Determine function return type using tracked signatures
+            func_name = expr.function_name
+
+            if func_name:
+                # 1. Check OPL functions first (declared with 'opl' keyword)
+                if func_name in self._opl_funcs:
+                    opl_info = self._opl_funcs[func_name]
+                    # Void functions can't be used in expressions
+                    if opl_info.return_type.is_void:
+                        raise CCodeGenError(
+                            f"void OPL procedure '{func_name}' used in expression",
+                            location=expr.location
+                        )
+                    return opl_info.return_type
+
+                # 2. Check user-defined C functions
+                if func_name in self._c_funcs:
+                    c_func = self._c_funcs[func_name]
+                    # Void functions can't be used in expressions
+                    if c_func.return_type.is_void:
+                        raise CCodeGenError(
+                            f"void function '{func_name}' used in expression",
+                            location=expr.location
+                        )
+                    return c_func.return_type
+
+                # 3. Check built-in runtime functions
+                if func_name in self._builtin_function_types:
+                    builtin_type = self._builtin_function_types[func_name]
+                    # Void functions can't be used in expressions
+                    if builtin_type.is_void:
+                        raise CCodeGenError(
+                            f"void function '{func_name}' used in expression",
+                            location=expr.location
+                        )
+                    return builtin_type
+
+            # Unknown function - implicit declaration, assume int return (standard C behavior)
             return TYPE_INT
 
         if isinstance(expr, TernaryExpression):
@@ -887,30 +1159,32 @@ class CodeGenerator(ASTVisitor):
             return TYPE_INT
 
         # For arrays (which decay to pointers), preserve the decayed pointer type
-        if left_type.array_size > 0 or right_type.array_size > 0:
+        # Note: is_array includes both sized arrays (array_size > 0) and unsized/incomplete
+        # arrays (array_size == -1, e.g., extern declarations)
+        if left_type.is_array or right_type.is_array:
             if op == BinaryOperator.ADD:
-                if left_type.array_size > 0:
+                if left_type.is_array:
                     return left_type.decay()  # Array decays to pointer
                 else:
                     return right_type.decay()
             elif op == BinaryOperator.SUBTRACT:
-                if left_type.array_size > 0 and right_type.array_size == 0:
+                if left_type.is_array and not right_type.is_array:
                     return left_type.decay()
             return TYPE_INT
 
-        # Determine operand types
+        # Determine operand types (scalar char or int, not pointer or array)
         left_is_char = (left_type.base_type == BaseType.CHAR and
                         not left_type.is_pointer and
-                        left_type.array_size == 0)
+                        not left_type.is_array)
         right_is_char = (right_type.base_type == BaseType.CHAR and
                          not right_type.is_pointer and
-                         right_type.array_size == 0)
+                         not right_type.is_array)
         left_is_int = (left_type.base_type == BaseType.INT and
                        not left_type.is_pointer and
-                       left_type.array_size == 0)
+                       not left_type.is_array)
         right_is_int = (right_type.base_type == BaseType.INT and
                         not right_type.is_pointer and
-                        right_type.array_size == 0)
+                        not right_type.is_array)
 
         # Mixed char/int handling
         # For + and -, we allow mixing char and int. The result is char (8-bit)
@@ -1015,7 +1289,8 @@ class CodeGenerator(ASTVisitor):
         """
         array_type = self._get_expression_type(expr.array)
 
-        if array_type.is_pointer or array_type.array_size > 0:
+        # Check if it's a pointer or array (including unsized/incomplete arrays)
+        if array_type.is_pointer or array_type.is_array:
             return array_type.dereference()
 
         # Not an array or pointer - return int as fallback
@@ -1077,7 +1352,7 @@ class CodeGenerator(ASTVisitor):
         """
         return (ctype.base_type == BaseType.CHAR and
                 not ctype.is_pointer and
-                ctype.array_size == 0)
+                not ctype.is_array)
 
     def _is_int_type(self, ctype: CType) -> bool:
         """
@@ -1091,7 +1366,7 @@ class CodeGenerator(ASTVisitor):
         """
         return (ctype.base_type == BaseType.INT and
                 not ctype.is_pointer and
-                ctype.array_size == 0)
+                not ctype.is_array)
 
     # =========================================================================
     # Header and Footer Generation
@@ -2566,6 +2841,16 @@ class CodeGenerator(ASTVisitor):
 
     def _generate_assignment(self, expr: AssignmentExpression) -> None:
         """Generate code for assignment expression."""
+        # =========================================================================
+        # Type Validation: Ensure RHS expression has a valid (non-void) type
+        # =========================================================================
+        # This is critical for catching void function calls used in assignments.
+        # The _get_expression_type() method will raise CCodeGenError if the
+        # expression is a call to a void function (checked in lines 1051-1056).
+        # Without this validation, void function calls would silently compile
+        # and produce incorrect code.
+        self._get_expression_type(expr.value)
+
         # Generate the value
         self._generate_expression(expr.value)
 
