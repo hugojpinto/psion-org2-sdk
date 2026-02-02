@@ -694,7 +694,7 @@ class Pack:
         Returns:
             Configured Pack instance
         """
-        if isinstance(path_or_data, (str, bytes)) and isinstance(path_or_data, str):
+        if isinstance(path_or_data, str):
             from pathlib import Path
             data = Path(path_or_data).read_bytes()
             name = Path(path_or_data).stem

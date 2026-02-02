@@ -51,7 +51,11 @@ from psion_sdk.smallc.lexer import CLexer
 from psion_sdk.smallc.parser import CParser
 from psion_sdk.smallc.codegen import CodeGenerator
 from psion_sdk.smallc.ast import ProgramNode
-from psion_sdk.smallc.errors import SmallCError, CErrorCollector
+from psion_sdk.smallc.errors import (
+    SmallCError,
+    SmallCCompilationError,
+    CErrorCollector,
+)
 
 
 @dataclass
@@ -158,7 +162,11 @@ class SmallCCompiler:
             result.assembly = assembly
             result.success = True
 
+        except SmallCCompilationError:
+            # Aggregate error from parser - already formatted, just re-raise
+            raise
         except SmallCError as e:
+            # Individual error - add to collector for later reporting
             self._errors.add(e)
             result.success = False
 
@@ -166,7 +174,7 @@ class SmallCCompiler:
         result.warnings = list(self._errors.warnings)
 
         if self._errors.has_errors():
-            raise SmallCError(self._errors.report())
+            raise SmallCCompilationError(self._errors.report())
 
         return result
 

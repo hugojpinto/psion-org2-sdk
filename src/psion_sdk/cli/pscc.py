@@ -24,7 +24,6 @@ Verbose mode:
     $ pscc -v hello.c
 """
 
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -32,7 +31,7 @@ import click
 
 from psion_sdk import __version__
 from psion_sdk.smallc import SmallCCompiler, CompilerOptions
-from psion_sdk.smallc.errors import SmallCError
+from psion_sdk.cli.errors import handle_cli_exception
 
 
 # =============================================================================
@@ -207,18 +206,8 @@ def main(
         # Print success message
         click.echo(f"Compiled {input_file} -> {output}")
 
-    except SmallCError as e:
-        click.echo(str(e), err=True)
-        sys.exit(1)
-    except FileNotFoundError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
     except Exception as e:
-        click.echo(f"Internal error: {e}", err=True)
-        if verbose:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
+        handle_cli_exception(e, verbose=verbose, error_type="Compilation")
 
 
 if __name__ == "__main__":

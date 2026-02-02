@@ -142,7 +142,6 @@ Notes
   files have main() (all assembly), assembly order determines the entry point.
 """
 
-import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -153,10 +152,9 @@ import click
 from psion_sdk import __version__
 from psion_sdk.smallc import SmallCCompiler, CompilerOptions
 from psion_sdk.smallc.compiler import source_has_main
-from psion_sdk.smallc.errors import SmallCError
 from psion_sdk.assembler import Assembler
-from psion_sdk.errors import PsionError, OPKError
 from psion_sdk.opk import PackBuilder, validate_ob3
+from psion_sdk.cli.errors import handle_cli_exception
 
 
 # =============================================================================
@@ -1384,32 +1382,8 @@ def main(
         else:
             click.echo(f"Built {output_opk}")
 
-    except SmallCError as e:
-        # Compilation error (C → ASM stage)
-        click.echo(f"Compilation error: {e}", err=True)
-        sys.exit(1)
-
-    except PsionError as e:
-        # Assembly or packaging error
-        click.echo(f"Build error: {e}", err=True)
-        sys.exit(1)
-
-    except click.BadParameter as e:
-        # Invalid arguments
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(2)
-
-    except FileNotFoundError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(2)
-
     except Exception as e:
-        # Unexpected error - show traceback in verbose mode
-        click.echo(f"Internal error: {e}", err=True)
-        if verbose:
-            import traceback
-            traceback.print_exc()
-        sys.exit(1)
+        handle_cli_exception(e, verbose=verbose, error_type="Build")
 
 
 # =============================================================================

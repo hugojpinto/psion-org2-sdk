@@ -153,12 +153,14 @@ class SymbolInfo:
         is_global: True for global variables
         offset: Stack offset for locals (negative from X)
         is_parameter: True for function parameters
+        is_extern: True for extern declarations (no storage allocated)
     """
     name: str
     sym_type: CType
     is_global: bool = False
     offset: int = 0
     is_parameter: bool = False
+    is_extern: bool = False
 
 
 @dataclass
@@ -1125,8 +1127,19 @@ class CodeGenerator(ASTVisitor):
         self._emit("        END")
 
     def _emit_globals(self) -> None:
-        """Emit global variable declarations."""
-        if not self._globals:
+        """Emit global variable declarations.
+
+        Only emits storage (RMB) for actual definitions, not extern declarations.
+        Extern declarations are in the symbol table for type checking but their
+        storage is defined in another translation unit.
+        """
+        # Filter out extern declarations - they don't allocate storage
+        definitions = {
+            name: info for name, info in self._globals.items()
+            if not info.is_extern
+        }
+
+        if not definitions:
             return
 
         self._emit("")
@@ -1135,7 +1148,7 @@ class CodeGenerator(ASTVisitor):
         self._emit("; -----------------------------------------------------------------------------")
         self._emit("")
 
-        for name, info in self._globals.items():
+        for name, info in definitions.items():
             size = info.sym_type.total_size
             self._emit_label(f"_{name}")
             if size == 1:
@@ -1168,11 +1181,16 @@ class CodeGenerator(ASTVisitor):
     # =========================================================================
 
     def _add_global(self, decl: VariableDeclaration) -> None:
-        """Add a global variable to the symbol table."""
+        """Add a global variable to the symbol table.
+
+        For extern declarations, we add to the symbol table for type checking
+        but mark is_extern=True so no storage is allocated in _emit_globals().
+        """
         self._globals[decl.name] = SymbolInfo(
             name=decl.name,
             sym_type=decl.var_type,
             is_global=True,
+            is_extern=decl.is_extern,
         )
 
     def _add_struct(self, defn: StructDefinition) -> None:
@@ -1876,6 +1894,159 @@ class CodeGenerator(ASTVisitor):
                 self._emit_instruction("LDD", f"{offset},X")
                 self._last_expr_size = 2  # Int: full D register
 
+    # =========================================================================
+    # Binary Expression Helper Methods
+    # =========================================================================
+    # These methods support _generate_binary() by handling specific optimization
+    # paths. Each _try_* method returns True if it handled the expression,
+    # False otherwise (allowing fallthrough to the next optimization or default).
+
+    def _try_generate_comparison_immediate(
+        self, expr: BinaryExpression, op: BinaryOperator, both_char: bool
+    ) -> bool:
+        """
+        Try to generate optimized comparison with immediate constant.
+
+        When the right operand is a constant, we can avoid pushing the left
+        operand to the stack and use immediate comparison instead.
+
+        Args:
+            expr: The binary expression
+            op: The comparison operator
+            both_char: True if both operands are char type
+
+        Returns:
+            True if handled, False to try other paths
+        """
+        if op not in self._COMPARISON_OPS:
+            return False
+        if not isinstance(expr.right, (NumberLiteral, CharLiteral)):
+            return False
+
+        # Generate left operand (result in D or B depending on type)
+        self._generate_expression(expr.left)
+
+        # Use 8-bit or 16-bit comparison based on operand types
+        if both_char:
+            self._generate_comparison_immediate_char(op, expr.right.value)
+        else:
+            self._generate_comparison_immediate(op, expr.right.value)
+
+        self._last_expr_size = 2  # Comparisons always produce 16-bit boolean
+        return True
+
+    def _try_generate_logical_operator(
+        self, expr: BinaryExpression, op: BinaryOperator
+    ) -> bool:
+        """
+        Try to generate short-circuit logical operator (&& or ||).
+
+        Logical operators use short-circuit evaluation and always produce
+        a 16-bit boolean result.
+
+        Args:
+            expr: The binary expression
+            op: The operator
+
+        Returns:
+            True if handled, False to try other paths
+        """
+        if op == BinaryOperator.LOGICAL_AND:
+            self._generate_expression(expr.left)
+            self._generate_logical_and(expr)
+            self._last_expr_size = 2
+            return True
+        elif op == BinaryOperator.LOGICAL_OR:
+            self._generate_expression(expr.left)
+            self._generate_logical_or(expr)
+            self._last_expr_size = 2
+            return True
+        return False
+
+    def _try_generate_power_of_2_optimization(
+        self, expr: BinaryExpression, op: BinaryOperator
+    ) -> bool:
+        """
+        Try to optimize multiply/divide by power of 2 as shifts.
+
+        When multiplying or dividing by a power of 2 (2, 4, 8, ..., 256),
+        we can use shift instructions instead of expensive mul/div routines.
+
+        Args:
+            expr: The binary expression
+            op: MULTIPLY or DIVIDE operator
+
+        Returns:
+            True if handled, False to try other paths
+        """
+        if op not in (BinaryOperator.MULTIPLY, BinaryOperator.DIVIDE):
+            return False
+
+        const_val = self._try_eval_constant(expr.right)
+        if const_val is None or const_val <= 0:
+            return False
+        if not self._is_power_of_2(const_val):
+            return False
+
+        shift_count = self._log2(const_val)
+        if shift_count > 8:
+            return False  # Too many shifts, use regular mul/div
+
+        # Generate left operand
+        self._generate_expression(expr.left)
+
+        # Emit shift instructions
+        if op == BinaryOperator.MULTIPLY:
+            for _ in range(shift_count):
+                self._emit_instruction("ASLD", "")
+        else:  # DIVIDE
+            for _ in range(shift_count):
+                self._emit_instruction("LSRD", "")
+
+        self._last_expr_size = 2
+        return True
+
+    def _generate_binary_by_type(
+        self, expr: BinaryExpression, op: BinaryOperator,
+        left_type: CType, right_type: CType
+    ) -> None:
+        """
+        Route to 8-bit or 16-bit code generation based on operand types.
+
+        This is the default path when no optimizations apply.
+
+        Args:
+            expr: The binary expression
+            op: The operator
+            left_type: Type of left operand
+            right_type: Type of right operand
+        """
+        left_is_char = self._is_char_type(left_type)
+        right_is_char = self._is_char_type(right_type)
+        left_is_int = self._is_int_type(left_type)
+        right_is_int = self._is_int_type(right_type)
+        both_char = left_is_char and right_is_char
+
+        # Check for mixed char/int in + or - (allowed, uses 8-bit with overflow)
+        is_mixed_add_sub = (
+            op in (BinaryOperator.ADD, BinaryOperator.SUBTRACT) and
+            ((left_is_char and right_is_int) or (left_is_int and right_is_char))
+        )
+
+        if both_char and op in self._CHAR_SUPPORTED_OPS:
+            # 8-bit path: both operands are char and operation supports 8-bit
+            self._generate_binary_char(expr, op)
+        elif is_mixed_add_sub:
+            # Mixed char/int for + or -: use 8-bit with overflow
+            self._generate_binary_char_int(expr, op, left_is_char)
+        else:
+            # 16-bit path: either int operands or operation requires 16-bit
+            self._generate_binary_int(expr, op)
+
+    # =========================================================================
+    # Main Binary Expression Generator
+    # =========================================================================
+
     def _generate_binary(self, expr: BinaryExpression) -> None:
         """
         Generate code for binary expression.
@@ -1895,95 +2066,25 @@ class CodeGenerator(ASTVisitor):
         """
         op = expr.operator
 
-        # =====================================================================
-        # Phase 1: Type Checking
-        # =====================================================================
-        # Determine operand types and check for mixed type errors.
-        # This is done BEFORE generating any code to fail fast on errors.
+        # Phase 1: Type Checking (validate types before generating code)
+        # This will raise CTypeError for invalid mixed types
+        self._get_binary_expression_type(expr)
 
-        # Get the result type - this will raise CTypeError for mixed types
-        # Note: _get_binary_expression_type validates and returns the result type
-        result_type = self._get_binary_expression_type(expr)
-
-        # Determine if both operands are char (for 8-bit path)
+        # Get operand types for routing decisions
         left_type = self._get_expression_type(expr.left)
         right_type = self._get_expression_type(expr.right)
-        both_char = (self._is_char_type(left_type) and
-                     self._is_char_type(right_type))
+        both_char = self._is_char_type(left_type) and self._is_char_type(right_type)
 
-        # =====================================================================
-        # Phase 2: Special Cases (handled before general code gen)
-        # =====================================================================
-
-        # Comparisons with immediate constant - optimization to avoid stack push
-        if op in self._COMPARISON_OPS:
-            if isinstance(expr.right, (NumberLiteral, CharLiteral)):
-                # Generate left operand (result in D or B depending on type)
-                self._generate_expression(expr.left)
-                # If left is char, we need to ensure proper comparison
-                # CharLiteral.value is already int, works for both
-                if both_char:
-                    # 8-bit comparison with immediate
-                    self._generate_comparison_immediate_char(op, expr.right.value)
-                else:
-                    # 16-bit comparison with immediate
-                    self._generate_comparison_immediate(op, expr.right.value)
-                self._last_expr_size = 2  # Comparisons always produce 16-bit boolean
-                return
-
-        # Logical operators - short-circuit evaluation, always 16-bit result
-        if op == BinaryOperator.LOGICAL_AND:
-            self._generate_expression(expr.left)
-            self._generate_logical_and(expr)
-            self._last_expr_size = 2
+        # Phase 2: Try optimized code paths (early return if handled)
+        if self._try_generate_comparison_immediate(expr, op, both_char):
             return
-        elif op == BinaryOperator.LOGICAL_OR:
-            self._generate_expression(expr.left)
-            self._generate_logical_or(expr)
-            self._last_expr_size = 2
+        if self._try_generate_logical_operator(expr, op):
+            return
+        if self._try_generate_power_of_2_optimization(expr, op):
             return
 
-        # Power-of-2 multiply/divide optimization (16-bit shifts)
-        if op in (BinaryOperator.MULTIPLY, BinaryOperator.DIVIDE):
-            const_val = self._try_eval_constant(expr.right)
-            if const_val is not None and const_val > 0 and self._is_power_of_2(const_val):
-                shift_count = self._log2(const_val)
-                if shift_count <= 8:
-                    # Generate left operand
-                    self._generate_expression(expr.left)
-                    # If char, promote to 16-bit first (CLRA already done by char load)
-                    # Emit shifts
-                    if op == BinaryOperator.MULTIPLY:
-                        for _ in range(shift_count):
-                            self._emit_instruction("ASLD", "")
-                    else:  # DIVIDE
-                        for _ in range(shift_count):
-                            self._emit_instruction("LSRD", "")
-                    self._last_expr_size = 2
-                    return
-
-        # =====================================================================
-        # Phase 3: Route to 8-bit or 16-bit code generation
-        # =====================================================================
-
-        # Determine if we have mixed char/int for + or -
-        left_is_char = self._is_char_type(left_type)
-        right_is_char = self._is_char_type(right_type)
-        left_is_int = self._is_int_type(left_type)
-        right_is_int = self._is_int_type(right_type)
-        is_mixed_add_sub = (op in (BinaryOperator.ADD, BinaryOperator.SUBTRACT) and
-                           ((left_is_char and right_is_int) or
-                            (left_is_int and right_is_char)))
-
-        if both_char and op in self._CHAR_SUPPORTED_OPS:
-            # 8-bit path: both operands are char and operation supports 8-bit
-            self._generate_binary_char(expr, op)
-        elif is_mixed_add_sub:
-            # Mixed char/int for + or -: use 8-bit with overflow
-            self._generate_binary_char_int(expr, op, left_is_char)
-        else:
-            # 16-bit path: either int operands or operation requires 16-bit
-            self._generate_binary_int(expr, op)
+        # Phase 3: Standard code generation path
+        self._generate_binary_by_type(expr, op, left_type, right_type)
 
     def _generate_binary_char(self, expr: BinaryExpression, op: BinaryOperator) -> None:
         """

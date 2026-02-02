@@ -1143,8 +1143,10 @@ class FileTransfer:
         self.link.send_data(bytes([CMD_CLOSE]))
         try:
             self.link.receive_data()
-        except Exception:
-            pass
+        except TimeoutError:
+            pass  # Expected when connection closes
+        except Exception as e:
+            logger.debug("Unexpected error during directory close: %s", e)
 
         logger.debug("Found %d files", len(files))
         return files

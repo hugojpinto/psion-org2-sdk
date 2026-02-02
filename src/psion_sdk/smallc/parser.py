@@ -1976,6 +1976,39 @@ class CParser:
 
         return expr
 
+    # =========================================================================
+    # Binary Expression Precedence (lowest to highest)
+    # =========================================================================
+    #
+    # The following methods implement C operator precedence using recursive
+    # descent. Each level calls the next higher precedence level as its
+    # operand parser, ensuring correct parsing of expressions like:
+    #     a + b * c    -> a + (b * c)     (multiplicative binds tighter)
+    #     a || b && c  -> a || (b && c)   (AND binds tighter than OR)
+    #
+    # Precedence table (standard C):
+    #
+    # Level  Method                   Operators    Associativity
+    # -----  -----------------------  -----------  -------------
+    #   2    _parse_ternary           ?:           Right-to-left
+    #   3    _parse_logical_or        ||           Left-to-right
+    #   4    _parse_logical_and       &&           Left-to-right
+    #   5    _parse_bitwise_or        |            Left-to-right
+    #   6    _parse_bitwise_xor       ^            Left-to-right
+    #   7    _parse_bitwise_and       &            Left-to-right
+    #   8    _parse_equality          == !=        Left-to-right
+    #   9    _parse_relational        < > <= >=    Left-to-right
+    #  10    _parse_shift             << >>        Left-to-right
+    #  11    _parse_additive          + -          Left-to-right
+    #  12    _parse_multiplicative    * / %        Left-to-right
+    #  13    _parse_unary             - + ! ~ & *  Right-to-left
+    #  14    _parse_postfix           ++ -- [] ()  Left-to-right
+    #  15    _parse_primary           literals     N/A
+    #
+    # Note: Level 1 (comma operator) and level 0 (assignment) are handled
+    # separately in expression statement parsing, not in this precedence chain.
+    # =========================================================================
+
     def _parse_logical_or(self) -> Expression:
         """Parse logical OR expression (||)."""
         return self._parse_binary(

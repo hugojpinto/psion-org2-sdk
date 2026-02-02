@@ -108,6 +108,23 @@ class SmallCError(PsionError):
         return "\n".join(parts)
 
 
+class SmallCCompilationError(SmallCError):
+    """
+    Aggregate compilation error containing multiple errors.
+
+    Used when the compiler collects multiple errors during compilation
+    and reports them together. The message is already a formatted report
+    from ErrorReporter and should not have another prefix added.
+
+    Unlike SmallCError which formats a single error with location and hint,
+    this class passes through the pre-formatted aggregate report.
+    """
+
+    def _format_message(self) -> str:
+        """Return message as-is - it's already a formatted aggregate report."""
+        return self.message
+
+
 # =============================================================================
 # Syntax Errors (Lexer and Parser)
 # =============================================================================
@@ -640,6 +657,6 @@ class CErrorCollector:
         self.warnings.clear()
 
     def raise_if_errors(self) -> None:
-        """Raise a SmallCError if any errors were collected."""
+        """Raise a SmallCCompilationError if any errors were collected."""
         if self.has_errors():
-            raise SmallCError(self.report())
+            raise SmallCCompilationError(self.report())
