@@ -140,12 +140,12 @@ pslink send HELLO.opk
 
 ## 3. psbuild - Unified Build Tool
 
-The `psbuild` tool combines the entire toolchain into a single command, automatically detecting source type and running the appropriate pipeline.
+The `psbuild` tool combines the entire toolchain into a single command, automatically detecting source type and running the appropriate pipeline. It supports both single-file and multi-file builds.
 
 ### Synopsis
 
 ```
-psbuild [OPTIONS] INPUT_FILE
+psbuild [OPTIONS] INPUT_FILES...
 ```
 
 ### Options
@@ -210,6 +210,58 @@ psbuild -I ./mylibs -I ./vendor hello.c -o HELLO.opk
 # Disable optimization (for debugging)
 psbuild --no-optimize hello.c -o HELLO.opk
 ```
+
+### Multi-File Builds
+
+`psbuild` supports building from multiple source files, enabling modular code organization:
+
+```bash
+# Multiple C files
+psbuild main.c utils.c math.c -o MYAPP.opk
+
+# C with assembly helpers
+psbuild main.c fast_routines.asm -o MYAPP.opk
+
+# Verbose multi-file build
+psbuild -v main.c helpers.c -o MYAPP.opk
+```
+
+#### How Multi-File Linking Works
+
+1. **File Classification**: Input files are sorted by type (.c vs .asm)
+2. **Main Detection**: For C files, `psbuild` identifies which one contains `main()`
+3. **Library Compilation**: Non-main C files are compiled in "library mode":
+   - No entry point generated
+   - No runtime includes (provided by main file)
+4. **Assembly Merge**: All assembly is concatenated in order:
+   - Library files first (from non-main C files)
+   - User assembly files
+   - Main file last (with entry point and runtime)
+5. **Final Build**: Merged assembly is assembled and packaged
+
+#### Cross-File References
+
+Use `extern` in C files to reference functions/variables from other files:
+
+```c
+/* main.c */
+extern int helper_func(int x);  /* From utils.c */
+extern int counter;              /* From state.c */
+
+void main() { /* ... */ }
+```
+
+```c
+/* utils.c */
+int helper_func(int x) {
+    return x * 2;
+}
+```
+
+**Requirements:**
+- Exactly one C file must contain `main()`
+- Assembly routines must follow C calling convention (args at 4,X, 6,X, etc.)
+- Assembly labels must use underscore prefix (`_funcname` for `funcname()`)
 
 ### Procedure Name Derivation
 

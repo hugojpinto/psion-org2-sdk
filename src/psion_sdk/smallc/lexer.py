@@ -110,9 +110,14 @@ class CTokenType(Enum):
     RETURN = auto()         # return
     GOTO = auto()           # goto
 
+    # === Keywords - Storage Class ===
+    EXTERN = auto()         # extern (C storage class - external linkage)
+
+    # === Keywords - Psion Extensions ===
+    OPL = auto()            # opl (OPL procedure declaration - Psion-specific)
+
     # === Keywords - Other ===
     SIZEOF = auto()         # sizeof (limited support)
-    EXTERNAL = auto()       # external (OPL procedure declaration)
     TYPEDEF = auto()        # typedef (type alias)
     STRUCT = auto()         # struct (aggregate type definition)
     ASM = auto()            # asm (inline assembly)
@@ -207,9 +212,14 @@ KEYWORDS: dict[str, CTokenType] = {
     "return": CTokenType.RETURN,
     "goto": CTokenType.GOTO,
 
+    # Storage class
+    "extern": CTokenType.EXTERN,
+
+    # Psion extensions
+    "opl": CTokenType.OPL,
+
     # Other
     "sizeof": CTokenType.SIZEOF,
-    "external": CTokenType.EXTERNAL,
     "typedef": CTokenType.TYPEDEF,
     "struct": CTokenType.STRUCT,
     "asm": CTokenType.ASM,

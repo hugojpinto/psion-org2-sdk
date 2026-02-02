@@ -1,9 +1,9 @@
 /*
- * ext_param_test.c - Test external OPL procedure parameter passing
+ * ext_param_test.c - Test opl OPL procedure parameter passing
  *
  * This program tests calling OPL procedures with integer parameters.
  * It demonstrates the new parameter passing feature added to the Small-C
- * compiler for external OPL procedure declarations.
+ * compiler for opl OPL procedure declarations.
  *
  * Build with:
  *   python -m psion_sdk.cli.pscc -m LZ -I include examples/ext_param_test.c -o /tmp/ext_param_test.asm
@@ -24,8 +24,8 @@
 #include <psion.h>
 
 /* External OPL procedures with parameters */
-external int ADDNUM(int a, int b);   /* Calls ADDNUM% with two integer params */
-external void SHOWVAL(int v);         /* Calls SHOWVAL with one integer param */
+opl int ADDNUM(int a, int b);   /* Calls ADDNUM% with two integer params */
+opl void SHOWVAL(int v);         /* Calls SHOWVAL with one integer param */
 
 void main() {
     int result;

@@ -14,7 +14,7 @@ This manual provides a comprehensive guide to programming the Psion Organiser II
 4. [Language Reference](#4-language-reference)
 5. [Standard Library](#5-standard-library)
 6. [Optional Libraries](#6-optional-libraries)
-7. [External OPL Procedures](#7-external-opl-procedures)
+7. [OPL Procedures](#7-opl-procedures)
 8. [Target Models](#8-target-models)
 9. [Memory and Optimization](#9-memory-and-optimization)
 10. [Examples](#10-examples)
@@ -160,6 +160,87 @@ python -m psion_sdk.cli.psopk create -o HELLO.opk /tmp/HELLO.ob3
 | `-v` | psbuild, pscc | Verbose output |
 | `-k` | psbuild | Keep intermediate files |
 
+### 3.5 Multi-File Builds
+
+For larger projects, you can split code across multiple C files and/or assembly files. `psbuild` handles multi-file linking automatically:
+
+```bash
+# Build from multiple C files
+psbuild main.c utils.c math.c -o MYAPP.opk
+
+# Mix C and assembly
+psbuild main.c fast_routines.asm -o MYAPP.opk
+```
+
+#### How It Works
+
+1. **Main Detection**: `psbuild` identifies which C file contains `main()`
+2. **Library Compilation**: Non-main C files are compiled in "library mode" (no entry point, no runtime)
+3. **Assembly Merge**: All assembly is concatenated in the correct order
+4. **Single Binary**: The merged assembly is assembled into one OB3/OPK
+
+#### Using `extern` for Cross-File References
+
+Use the `extern` keyword to declare functions or variables defined in other files:
+
+```c
+/* utils.c - Helper functions */
+int helper_add(int a, int b) {
+    return a + b;
+}
+
+int shared_counter = 0;
+```
+
+```c
+/* main.c - Main program */
+#include <psion.h>
+
+/* Declare functions/variables from utils.c */
+extern int helper_add(int a, int b);
+extern int shared_counter;
+
+void main() {
+    shared_counter = helper_add(10, 20);
+    /* ... */
+}
+```
+
+Build both files together:
+```bash
+psbuild main.c utils.c -o MYAPP.opk
+```
+
+#### Assembly Helpers
+
+You can also call hand-written assembly routines from C:
+
+```asm
+; fast_mul.asm - Fast multiply routine
+; C calling convention: arg1 at 4,X, arg2 at 6,X after PSHX/TSX
+_fast_mul:
+        PSHX
+        TSX
+        LDD     4,X       ; First argument
+        ; ... implementation ...
+        PULX
+        RTS
+```
+
+```c
+/* main.c */
+extern int fast_mul(int a, int b);  /* Declare the assembly function */
+
+void main() {
+    int result = fast_mul(6, 7);
+}
+```
+
+**Important Notes:**
+- Exactly one C file must contain `main()`
+- Assembly routines must use the C calling convention (parameters at stack offsets 4,X, 6,X, etc.)
+- Assembly labels must start with underscore to match C names (e.g., `_fast_mul` for `fast_mul()`)
+
 ---
 
 ## 4. Language Reference
@@ -221,6 +302,28 @@ name[5] = 'X';
 ```
 
 **Note:** Multi-dimensional arrays are NOT supported.
+
+#### External Declarations (`extern`)
+
+The `extern` keyword declares variables or functions that are defined in another source file. This enables multi-file C projects.
+
+```c
+/* Declare a function defined in another .c file */
+extern int helper_func(int x);
+
+/* Declare a variable defined in another .c file */
+extern int shared_counter;
+
+/* Declare an external array (size determined by definition) */
+extern char shared_buffer[];
+```
+
+**Key Points:**
+- `extern` declarations allocate no storage - they just tell the compiler the type
+- The actual definition must exist in another file in the build
+- Use with `psbuild main.c other.c` to link multiple C files
+
+See [Section 3.5: Multi-File Builds](#35-multi-file-builds) for complete examples.
 
 ### 4.3 Operators
 
@@ -1148,33 +1251,33 @@ void main() {
 
 ---
 
-## 7. External OPL Procedures
+## 7. OPL Procedures
 
 Small-C can call OPL procedures that exist on the Psion device.
 
 ### 7.1 Declaration Syntax
 
 ```c
-external void MENU();           /* Void return */
-external int GETVAL();          /* Integer return (calls GETVAL%) */
-external char GETKEY();         /* Char return (calls GETKEY$) */
-external int ADDNUM(int a, int b);  /* With parameters */
+opl void MENU();           /* Void return */
+opl int GETVAL();          /* Integer return (calls GETVAL%) */
+opl char GETKEY();         /* Char return (calls GETKEY$) */
+opl int ADDNUM(int a, int b);  /* With parameters */
 ```
 
 ### 7.2 Return Type Mapping
 
 | C Declaration | OPL Procedure | Notes |
 |---------------|---------------|-------|
-| `external void FUNC()` | `FUNC` | No return |
-| `external int FUNC()` | `FUNC%` | Returns integer |
-| `external char FUNC()` | `FUNC$` | Returns first char of string |
+| `opl void FUNC()` | `FUNC` | No return |
+| `opl int FUNC()` | `FUNC%` | Returns integer |
+| `opl char FUNC()` | `FUNC$` | Returns first char of string |
 
 ### 7.3 Parameters
 
 External procedures support up to 4 integer parameters:
 
 ```c
-external int COMPUTE(int x, int y, int z);
+opl int COMPUTE(int x, int y, int z);
 
 int result = COMPUTE(10, 20, 30);
 ```
@@ -1186,7 +1289,7 @@ int result = COMPUTE(10, 20, 30);
 ```c
 #include <psion.h>
 
-external int ADDNUM(int a, int b);
+opl int ADDNUM(int a, int b);
 
 void main() {
     int result;

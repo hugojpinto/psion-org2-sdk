@@ -66,12 +66,25 @@ class CompilerOptions:
         debug_info: Include debug information (future)
         target_model: Target Psion model (CM, XP, LA, LZ, LZ64).
                      None means use pragma or default (XP).
+        emit_runtime: If True (default), emit runtime library includes and entry
+                     point. Set to False for "library mode" when compiling helper
+                     files that will be linked with a main file.
+
+                     When emit_runtime=False:
+                     - No INCLUDE "runtime.inc" (or other runtime libs)
+                     - No _entry: entry point that calls main
+                     - psion.inc IS still included (constants are idempotent)
+                     - Functions, globals, and strings are still emitted
+
+                     This is used by psbuild when compiling multiple C files:
+                     only the file containing main() should have emit_runtime=True.
     """
     include_paths: list[str] = None
     output_comments: bool = True
     optimize: bool = False
     debug_info: bool = False
     target_model: Optional[str] = None  # None = allow pragma to override, default is XP
+    emit_runtime: bool = True  # False = library mode (no runtime includes, no entry point)
 
     def __post_init__(self):
         if self.include_paths is None:
@@ -137,7 +150,11 @@ class SmallCCompiler:
             result.ast = ast
 
             # Stage 4: Code generation (with target model and optional library awareness)
-            assembly = self._generate(ast, effective_model, has_float_support, has_stdio_support, has_db_support)
+            # emit_runtime=False enables "library mode" for multi-file linking
+            assembly = self._generate(
+                ast, effective_model, has_float_support, has_stdio_support,
+                has_db_support, emit_runtime=self.options.emit_runtime
+            )
             result.assembly = assembly
             result.success = True
 
@@ -218,7 +235,7 @@ class SmallCCompiler:
     def _generate(
         self, ast: ProgramNode, target_model: str = "XP",
         has_float_support: bool = False, has_stdio_support: bool = False,
-        has_db_support: bool = False
+        has_db_support: bool = False, emit_runtime: bool = True
     ) -> str:
         """
         Generate assembly from AST.
@@ -229,6 +246,8 @@ class SmallCCompiler:
             has_float_support: Whether float.h was included
             has_stdio_support: Whether stdio.h was included
             has_db_support: Whether db.h was included
+            emit_runtime: Whether to emit runtime includes and entry point.
+                         Set False for library mode (multi-file linking).
 
         Returns:
             Generated HD6303 assembly code
@@ -237,7 +256,8 @@ class SmallCCompiler:
             target_model=target_model,
             has_float_support=has_float_support,
             has_stdio_support=has_stdio_support,
-            has_db_support=has_db_support
+            has_db_support=has_db_support,
+            emit_runtime=emit_runtime
         )
         return generator.generate(ast)
 
@@ -273,6 +293,118 @@ class CompilerResult:
             self.errors = []
         if self.warnings is None:
             self.warnings = []
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def source_has_main(source: str, filename: str = "<input>",
+                    include_paths: Optional[list[str]] = None) -> bool:
+    """
+    Check if a C source file contains a main() function definition.
+
+    This is a lightweight check used by psbuild to determine which file
+    in a multi-file project should be compiled with the runtime.
+
+    The check uses the full compiler pipeline (preprocess → lex → parse)
+    to ensure accurate detection even with macros, conditional compilation,
+    and includes. While slightly slower than a regex, it's 100% accurate.
+
+    Args:
+        source: C source code string
+        filename: Source filename for error messages
+        include_paths: Directories to search for includes
+
+    Returns:
+        True if the source contains a `void main()` function definition,
+        False otherwise.
+
+    Raises:
+        SmallCError: If the source has syntax errors (can't parse)
+
+    Note:
+        This function will raise errors for invalid C code. Callers should
+        handle SmallCError if the source may be invalid.
+
+    Example:
+        >>> source = 'void main() { }'
+        >>> source_has_main(source)
+        True
+        >>> source = 'int helper() { return 42; }'
+        >>> source_has_main(source)
+        False
+    """
+    from psion_sdk.smallc.ast import FunctionNode
+
+    # Use the compiler to parse the source
+    options = CompilerOptions(
+        include_paths=include_paths or ["."],
+        emit_runtime=True,  # Doesn't matter for parsing
+    )
+    compiler = SmallCCompiler(options)
+
+    # Run preprocessing and parsing only (no code generation)
+    preprocessor = Preprocessor(
+        source,
+        filename,
+        options.include_paths,
+        target_model=None,
+    )
+    preprocessed = preprocessor.process()
+
+    lexer = CLexer(preprocessed, filename)
+    tokens = list(lexer.tokenize())
+
+    parser = CParser(tokens, filename, preprocessed.splitlines())
+    ast = parser.parse()
+
+    # Check for main() function definition
+    for decl in ast.declarations:
+        if isinstance(decl, FunctionNode):
+            if decl.name == "main" and not decl.is_forward_decl and not decl.is_opl:
+                return True
+
+    return False
+
+
+def file_has_main(filepath: str) -> bool:
+    """
+    Check if a C source file contains a main() function definition.
+
+    Convenience wrapper around source_has_main() that reads from a file.
+
+    Args:
+        filepath: Path to the C source file
+
+    Returns:
+        True if the file contains a main() function definition.
+
+    Raises:
+        FileNotFoundError: If the file doesn't exist
+        SmallCError: If the source has syntax errors
+
+    Example:
+        >>> file_has_main("hello.c")
+        True
+        >>> file_has_main("helper.c")
+        False
+    """
+    path = Path(filepath)
+    if not path.exists():
+        raise FileNotFoundError(f"Source file not found: {filepath}")
+
+    source = path.read_text(encoding='utf-8')
+
+    # Add source directory to include paths
+    include_paths = [str(path.parent)]
+
+    # Also add SDK include directory if available
+    sdk_include = Path(__file__).parent.parent.parent.parent / "include"
+    if sdk_include.exists():
+        include_paths.append(str(sdk_include))
+
+    return source_has_main(source, filepath, include_paths)
 
 
 # =============================================================================

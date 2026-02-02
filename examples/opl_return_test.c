@@ -39,7 +39,7 @@
 #include <psion.h>
 
 /*
- * Declare external OPL procedure that returns an integer.
+ * Declare opl OPL procedure that returns an integer.
  *
  * NOTE ON NAMING: In OPL, integer-returning procedures have names ending
  * with '%' (e.g., GETVAL%). However, '%' is not valid in C identifiers.
@@ -48,8 +48,8 @@
  * 1. Create the OPL procedure WITHOUT the '%' suffix:
  *      GETVAL:
  *      RETURN 42
- *    Then call it directly with 'external int':
- *      external int GETVAL();
+ *    Then call it directly with 'opl int':
+ *      opl int GETVAL();
  *
  * 2. Use the legacy call_opl() function with a string:
  *      int result = call_opl("GETVAL%");
@@ -57,7 +57,7 @@
  *
  * For this test, we use option 1 - the OPL procedure is named GETVAL (no %).
  */
-external int GETVAL();
+opl int GETVAL();
 
 void main() {
     int result;

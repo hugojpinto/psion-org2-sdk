@@ -78,6 +78,15 @@ from psion_sdk.smallc.errors import SmallCError
          "PORTABLE: runs on any model. Default: XP. Overrides #pragma. "
          "See dev_docs/TARGET_MODELS.md for details.",
 )
+@click.option(
+    "--library",
+    is_flag=True,
+    default=False,
+    help="Compile in library mode for multi-file projects. "
+         "Omits runtime includes and entry point. The generated assembly "
+         "is intended to be linked with a main file that provides these. "
+         "Use this for helper C files when building with multiple source files.",
+)
 @click.version_option(version=__version__, prog_name="pscc")
 def main(
     input_file: Path,
@@ -87,6 +96,7 @@ def main(
     ast: bool,
     verbose: bool,
     model: Optional[str],
+    library: bool,
 ) -> None:
     """
     Compile Small-C source code for Psion Organiser II.
@@ -103,6 +113,17 @@ def main(
         pscc -I inc/ hello.c         # Add include path
         pscc -E hello.c              # Preprocess only
         pscc -v hello.c              # Verbose output
+        pscc --library helper.c      # Library mode (no runtime/entry point)
+
+    \b
+    Multi-file projects:
+        # Compile helper file in library mode (no runtime)
+        pscc --library helper.c -o helper.asm
+
+        # Main file gets the runtime
+        pscc main.c -o main.asm
+
+        # Concatenate and assemble (psbuild handles this automatically)
 
     \b
     Supported C features:
@@ -132,10 +153,12 @@ def main(
 
     # Create compiler options
     # model=None means "use pragma or default (XP)"
+    # library=True sets emit_runtime=False (no entry point, no runtime includes)
     options = CompilerOptions(
         include_paths=include_paths,
         output_comments=verbose,
         target_model=model.upper() if model else None,
+        emit_runtime=not library,  # Library mode disables runtime emission
     )
 
     try:
@@ -144,6 +167,8 @@ def main(
             click.echo(f"Compiling {input_file}...")
             model_str = model.upper() if model else "XP (default, or from #pragma)"
             click.echo(f"Target model: {model_str}")
+            if library:
+                click.echo("Mode: Library (no runtime includes, no entry point)")
             click.echo(f"Include paths: {', '.join(include_paths)}")
 
         source = input_file.read_text(encoding='utf-8')

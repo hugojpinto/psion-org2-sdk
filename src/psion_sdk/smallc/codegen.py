@@ -179,11 +179,11 @@ class FunctionInfo:
 
 
 @dataclass
-class ExternalFuncInfo:
+class OplFuncInfo:
     """
-    Information about an external OPL procedure declaration.
+    Information about an OPL procedure declaration (Psion-specific).
 
-    External procedures are declared with the 'external' keyword and represent
+    OPL procedures are declared with the 'opl' keyword and represent
     OPL procedures that exist on the Psion device. Calls to these are transformed
     into QCode injection sequences at runtime.
 
@@ -259,7 +259,8 @@ class CodeGenerator(ASTVisitor):
     }
 
     def __init__(self, target_model: str = "XP", has_float_support: bool = False,
-                 has_stdio_support: bool = False, has_db_support: bool = False):
+                 has_stdio_support: bool = False, has_db_support: bool = False,
+                 emit_runtime: bool = True):
         """
         Initialize the code generator.
 
@@ -272,6 +273,20 @@ class CodeGenerator(ASTVisitor):
                               True if stdio.h was included, False otherwise.
             has_db_support: Whether to include database file access functions.
                            True if db.h was included, False otherwise.
+            emit_runtime: Whether to emit runtime library includes and entry point.
+                         Defaults to True. Set to False for "library mode" when
+                         compiling C files that will be linked with other files.
+
+                         When emit_runtime=False:
+                         - No INCLUDE "runtime.inc" (or dbruntime, fpruntime, stdio)
+                         - No _entry: entry point that calls main
+                         - psion.inc IS still included (defines constants/macros)
+                         - Functions, globals, and strings are still emitted
+
+                         This enables multi-file C projects where only the main
+                         file includes the runtime, and helper files are compiled
+                         in library mode. The assembler resolves forward references
+                         to runtime functions when the files are concatenated.
         """
         # Target model for generated code
         self._target_model = target_model.upper() if target_model else "XP"
@@ -284,6 +299,11 @@ class CodeGenerator(ASTVisitor):
 
         # Whether to include database file access support (dbruntime.inc)
         self._has_db_support = has_db_support
+
+        # Whether to emit runtime includes and entry point (True = normal, False = library mode)
+        # Library mode is used for multi-file projects where helper C files are compiled
+        # without the runtime, and then concatenated with the main file that has it.
+        self._emit_runtime = emit_runtime
 
         # Assembly output lines
         self._output: list[str] = []
@@ -309,14 +329,14 @@ class CodeGenerator(ASTVisitor):
         # Switch context
         self._switch_stack: list[str] = []  # break label for switch
 
-        # External OPL procedure declarations
-        # These are procedures declared with 'external' keyword that exist in
+        # OPL procedure declarations (Psion-specific)
+        # These are procedures declared with 'opl' keyword that exist in
         # OPL code on the device. Calls to these are transformed into QCode
         # injection sequences at runtime.
-        # Maps function name -> ExternalFuncInfo for complete procedure info:
+        # Maps function name -> OplFuncInfo for complete procedure info:
         #   - Return type (determines OPL suffix and restore function)
         #   - Parameter count and types (for QCode buffer generation)
-        self._external_funcs: dict[str, ExternalFuncInfo] = {}
+        self._opl_funcs: dict[str, OplFuncInfo] = {}
 
         # Expression size tracking for optimization
         # Tracks the size (in bytes) of the last expression result:
@@ -349,75 +369,106 @@ class CodeGenerator(ASTVisitor):
         self._globals = {}
         self._strings = []
         self._label_counter = 0
-        self._external_funcs = {}
+        self._opl_funcs = {}
         self._structs = {}
         self._last_expr_size = 2  # Reset expression size tracking
 
         # Emit header (includes)
         self._emit_header()
 
-        # First pass: collect struct definitions, global variables, and external declarations
+        # First pass: collect struct definitions, global variables, and OPL declarations
         for decl in program.declarations:
             if isinstance(decl, StructDefinition):
                 self._add_struct(decl)
                 continue
             if isinstance(decl, VariableDeclaration) and decl.is_global:
                 self._add_global(decl)
-            elif isinstance(decl, FunctionNode) and decl.is_external:
-                # Track external OPL procedure declarations with their complete info
+            elif isinstance(decl, FunctionNode) and decl.is_opl:
+                # Track OPL procedure declarations with their complete info
                 # These will be called via QCode injection at runtime
                 # Stored info includes:
                 #   - Return type (determines OPL suffix and restore function)
                 #   - Parameter count and types (for QCode buffer generation)
-                self._external_funcs[decl.name] = ExternalFuncInfo(
+                self._opl_funcs[decl.name] = OplFuncInfo(
                     name=decl.name,
                     return_type=decl.return_type,
                     param_count=len(decl.parameters),
                     param_types=[p.param_type for p in decl.parameters],
                 )
 
-        # Emit startup code - must be first executable code
-        # Uses BSR (relative branch) so _main must follow immediately
-        self._emit("; -----------------------------------------------------------------------------")
-        self._emit("; Entry Point - called by USR()")
-        self._emit("; -----------------------------------------------------------------------------")
-        self._emit("_entry:")
-        self._emit("        BSR     _main           ; Call main (relative branch)")
-        self._emit("        RTS                     ; Return to OPL")
-        self._emit("")
-
-        # Find and emit main() first (so BSR can reach it)
+        # Collect all functions, separating main from others
         main_func = None
         other_funcs = []
         for decl in program.declarations:
-            if isinstance(decl, FunctionNode) and not decl.is_forward_decl:
+            if isinstance(decl, FunctionNode) and not decl.is_forward_decl and not decl.is_opl:
                 if decl.name == "main":
                     main_func = decl
                 else:
                     other_funcs.append(decl)
 
-        # Generate main first
-        if main_func:
-            self._generate_function(main_func)
+        # ---------------------------------------------------------------------
+        # Entry Point Generation
+        # ---------------------------------------------------------------------
+        # Only emit entry point in normal mode (emit_runtime=True).
+        # In library mode, the file containing main() will provide the entry point.
+        if self._emit_runtime:
+            # Emit startup code - must be first executable code
+            # Uses BSR (relative branch) so _main must follow immediately
+            self._emit("; -----------------------------------------------------------------------------")
+            self._emit("; Entry Point - called by USR()")
+            self._emit("; -----------------------------------------------------------------------------")
+            self._emit("_entry:")
+            self._emit("        BSR     _main           ; Call main (relative branch)")
+            self._emit("        RTS                     ; Return to OPL")
+            self._emit("")
 
-        # Then other functions
-        for func in other_funcs:
-            self._generate_function(func)
+            # Generate main first (so BSR can reach it)
+            if main_func:
+                self._generate_function(main_func)
 
-        # Emit includes AFTER user code (so entry point is first)
+            # Then other functions
+            for func in other_funcs:
+                self._generate_function(func)
+        else:
+            # Library mode: no entry point, emit functions in declaration order
+            # (main() might not exist in a library file)
+            self._emit("; -----------------------------------------------------------------------------")
+            self._emit("; Library Functions (compiled with emit_runtime=False)")
+            self._emit("; -----------------------------------------------------------------------------")
+            self._emit("; This file is intended to be linked with a main file that provides")
+            self._emit("; the entry point and runtime includes.")
+            self._emit("")
+
+            if main_func:
+                self._generate_function(main_func)
+            for func in other_funcs:
+                self._generate_function(func)
+
+        # ---------------------------------------------------------------------
+        # Runtime Library Includes
+        # ---------------------------------------------------------------------
+        # Always include psion.inc (defines constants/macros, safe to include multiple times).
+        # Only include runtime libraries in normal mode (emit_runtime=True).
+        # In library mode, the main file's runtime.inc will provide the actual functions.
         self._emit("")
         self._emit("; -----------------------------------------------------------------------------")
-        self._emit("; Runtime Library and System Definitions")
+        self._emit("; System Definitions" + ("" if self._emit_runtime else " (library mode - no runtime)"))
         self._emit("; -----------------------------------------------------------------------------")
         self._emit("        INCLUDE \"psion.inc\"")
-        self._emit("        INCLUDE \"runtime.inc\"")
-        if self._has_stdio_support:
-            self._emit("        INCLUDE \"stdio.inc\"       ; Extended string functions (strrchr, strstr, sprintf, etc.)")
-        if self._has_db_support:
-            self._emit("        INCLUDE \"dbruntime.inc\"   ; Database file access (db_create, db_open, db_read, etc.)")
-        if self._has_float_support:
-            self._emit("        INCLUDE \"float.inc\"       ; FP constants and macros")
-            self._emit("        INCLUDE \"fpruntime.inc\"  ; Floating point support")
+
+        if self._emit_runtime:
+            # Full runtime support - only the main file should have this
+            self._emit("        INCLUDE \"runtime.inc\"")
+            if self._has_stdio_support:
+                self._emit("        INCLUDE \"stdio.inc\"       ; Extended string functions (strrchr, strstr, sprintf, etc.)")
+            if self._has_db_support:
+                self._emit("        INCLUDE \"dbruntime.inc\"   ; Database file access (db_create, db_open, db_read, etc.)")
+            if self._has_float_support:
+                self._emit("        INCLUDE \"float.inc\"       ; FP constants and macros")
+                self._emit("        INCLUDE \"fpruntime.inc\"  ; Floating point support")
+        else:
+            # Library mode - runtime will be provided by the main file
+            self._emit("; Runtime libraries (runtime.inc, etc.) will be provided by the main file")
 
         # Emit global variables
         self._emit_globals()
@@ -1311,14 +1362,14 @@ class CodeGenerator(ASTVisitor):
         self._emit_label(f"_{func.name}")
 
         # =====================================================================
-        # External OPL Support: Inject setup code at start of main()
+        # OPL Call Support: Inject setup code at start of main()
         # =====================================================================
-        # If any external OPL procedures are declared, we need to call
-        # _call_opl_setup at the VERY START of main(), BEFORE any stack
+        # If any OPL procedures are declared (with 'opl' keyword), we need to
+        # call _call_opl_setup at the VERY START of main(), BEFORE any stack
         # modifications (local allocation, PSHX, etc.).
         #
         # This captures the "USR entry SP" which is used later to unwind
-        # the stack when calling external OPL procedures. The setup function
+        # the stack when calling OPL procedures. The setup function
         # calculates SP + 4 to point to the return address that leads back
         # to the OPL interpreter.
         #
@@ -1328,8 +1379,8 @@ class CodeGenerator(ASTVisitor):
         # fail catastrophically.
         #
         # Reference: dev_docs/PROCEDURE_CALL_RESEARCH.md
-        if func.name == "main" and self._external_funcs:
-            self._emit_comment("Initialize external OPL call support")
+        if func.name == "main" and self._opl_funcs:
+            self._emit_comment("Initialize OPL call support")
             self._emit_comment("MUST be first - captures USR entry SP before any stack changes")
             self._emit_instruction("JSR", "_call_opl_setup")
 
@@ -2549,7 +2600,7 @@ class CodeGenerator(ASTVisitor):
         - JSR to the function
         - Clean up stack after return
 
-        For external OPL procedures:
+        For OPL procedures (declared with 'opl' keyword):
         - Push arguments right-to-left (for procedures with parameters)
         - Push name pointer
         - Push parameter count
@@ -2557,9 +2608,9 @@ class CodeGenerator(ASTVisitor):
         - D register contains return value (if any)
         """
         # =====================================================================
-        # Check for external OPL procedure call
+        # Check for OPL procedure call (Psion-specific)
         # =====================================================================
-        # External procedures are called via QCode injection. The runtime
+        # OPL procedures are called via QCode injection. The runtime
         # function builds a synthetic QCode buffer containing:
         #   1. Parameter pushes (if any): $22 HH LL for each int param
         #   2. Parameter count: $20 NN
@@ -2568,24 +2619,24 @@ class CodeGenerator(ASTVisitor):
         # It then unwinds the stack and exits to the OPL interpreter, which
         # executes the buffer, calls the OPL procedure, then calls USR() to
         # resume C execution.
-        if expr.function_name in self._external_funcs:
-            ext_func = self._external_funcs[expr.function_name]
+        if expr.function_name in self._opl_funcs:
+            opl_func = self._opl_funcs[expr.function_name]
 
             # Validate argument count matches declared parameter count
-            if len(expr.arguments) != ext_func.param_count:
+            if len(expr.arguments) != opl_func.param_count:
                 raise CCodeGenError(
-                    f"external procedure '{expr.function_name}' expects "
-                    f"{ext_func.param_count} argument(s), got {len(expr.arguments)}",
+                    f"opl procedure '{expr.function_name}' expects "
+                    f"{opl_func.param_count} argument(s), got {len(expr.arguments)}",
                     expr.location,
                 )
 
             # Create a string literal for the procedure name
             # The C return type determines the OPL name suffix:
-            #   external char GETVAL()  -> calls GETVAL$ in OPL (string)
-            #   external int GETVAL()   -> calls GETVAL% in OPL (integer)
-            #   external void GETVAL()  -> calls GETVAL in OPL (no suffix)
+            #   opl char GETVAL()  -> calls GETVAL$ in OPL (string)
+            #   opl int GETVAL()   -> calls GETVAL% in OPL (integer)
+            #   opl void GETVAL()  -> calls GETVAL in OPL (no suffix)
             proc_name_label = self._new_label("_PROC")
-            return_type = ext_func.return_type
+            return_type = opl_func.return_type
             opl_name = expr.function_name
             if return_type and return_type.base_type == BaseType.CHAR:
                 opl_name = expr.function_name + "$"
@@ -2595,7 +2646,7 @@ class CodeGenerator(ASTVisitor):
             self._strings.append((proc_name_label, opl_name))
 
             # ─────────────────────────────────────────────────────────────────
-            # Handle external procedure with parameters
+            # Handle OPL procedure with parameters
             # ─────────────────────────────────────────────────────────────────
             # Stack layout for _call_opl_param (rightmost argument at lowest address):
             #   SP -> [param_count][name_ptr][param N]...[param 1][return addr]
@@ -2604,9 +2655,9 @@ class CodeGenerator(ASTVisitor):
             #   - param_count from SP+0
             #   - name_ptr from SP+2
             #   - parameters from SP+4 onwards (first param at highest addr)
-            if ext_func.param_count > 0:
-                self._emit_comment(f"Call external OPL procedure: {opl_name} "
-                                   f"({ext_func.param_count} params)")
+            if opl_func.param_count > 0:
+                self._emit_comment(f"Call OPL procedure: {opl_name} "
+                                   f"({opl_func.param_count} params)")
 
                 # Push arguments right-to-left (last argument first)
                 # This places first argument at highest address, matching C convention
@@ -2621,7 +2672,7 @@ class CodeGenerator(ASTVisitor):
                 self._emit_instruction("PSHA", "")
 
                 # Push parameter count
-                self._emit_instruction("LDD", f"#{ext_func.param_count}")
+                self._emit_instruction("LDD", f"#{opl_func.param_count}")
                 self._emit_instruction("PSHB", "")
                 self._emit_instruction("PSHA", "")
 
@@ -2640,11 +2691,11 @@ class CodeGenerator(ASTVisitor):
                 self._emit_instruction("INS", "")
 
             # ─────────────────────────────────────────────────────────────────
-            # Handle external procedure without parameters (original path)
+            # Handle OPL procedure without parameters (simpler path)
             # ─────────────────────────────────────────────────────────────────
             # This uses the simpler _call_opl which doesn't need to read params
             else:
-                self._emit_comment(f"Call external OPL procedure: {opl_name}")
+                self._emit_comment(f"Call OPL procedure: {opl_name}")
 
                 # Push name pointer
                 self._emit_instruction("LDD", f"#{proc_name_label}")
@@ -2668,7 +2719,7 @@ class CodeGenerator(ASTVisitor):
             #   - For int: the integer return value (converted from BCD float)
             #   - For void: garbage (caller should ignore)
             # Execution resumes here after OPL procedure completes
-            self._last_expr_size = 2  # External calls return 16-bit values
+            self._last_expr_size = 2  # OPL calls return 16-bit values
             return
 
         # =====================================================================

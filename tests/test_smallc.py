@@ -937,28 +937,360 @@ int rows = DISP_ROWS;
 
 
 # =============================================================================
-# External OPL Function Tests
+# Extern Declaration Tests (C External Linkage)
 # =============================================================================
 
-class TestExternalKeyword:
-    """Tests for the 'external' keyword that enables OPL procedure calls."""
+class TestExternKeyword:
+    """Tests for the 'extern' keyword for C external linkage (multi-file builds)."""
 
     # -------------------------------------------------------------------------
     # Lexer Tests
     # -------------------------------------------------------------------------
 
-    def test_external_keyword_lexes(self):
-        """'external' keyword should tokenize correctly."""
-        lexer = CLexer("external", "test.c")
+    def test_extern_keyword_lexes(self):
+        """'extern' keyword should tokenize correctly."""
+        lexer = CLexer("extern", "test.c")
         tokens = list(lexer.tokenize())
-        assert tokens[0].type == CTokenType.EXTERNAL
-        assert tokens[0].value == "external"
+        assert tokens[0].type == CTokenType.EXTERN
+        assert tokens[0].value == "extern"
 
-    def test_external_in_declaration(self):
-        """External declaration should tokenize all parts."""
-        lexer = CLexer("external void foo();", "test.c")
+    def test_extern_in_function_declaration(self):
+        """Extern function declaration should tokenize all parts."""
+        lexer = CLexer("extern int foo(int x);", "test.c")
         tokens = list(lexer.tokenize())
-        assert tokens[0].type == CTokenType.EXTERNAL
+        assert tokens[0].type == CTokenType.EXTERN
+        assert tokens[1].type == CTokenType.INT
+        assert tokens[2].type == CTokenType.IDENTIFIER
+        assert tokens[2].value == "foo"
+
+    def test_extern_in_variable_declaration(self):
+        """Extern variable declaration should tokenize all parts."""
+        lexer = CLexer("extern int count;", "test.c")
+        tokens = list(lexer.tokenize())
+        assert tokens[0].type == CTokenType.EXTERN
+        assert tokens[1].type == CTokenType.INT
+        assert tokens[2].type == CTokenType.IDENTIFIER
+        assert tokens[2].value == "count"
+
+    # -------------------------------------------------------------------------
+    # Parser Tests - Function Declarations
+    # -------------------------------------------------------------------------
+
+    def test_extern_function_no_params(self):
+        """Extern function declaration with no params should parse."""
+        source = "extern int foo();"
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 1
+        func = ast.declarations[0]
+        assert isinstance(func, FunctionNode)
+        assert func.name == "foo"
+        assert func.is_extern
+        assert not func.is_opl
+        assert func.return_type.base_type == BaseType.INT
+        assert len(func.parameters) == 0
+        assert func.body is None
+
+    def test_extern_function_with_params(self):
+        """Extern function declaration with parameters should parse."""
+        source = "extern int add(int a, int b);"
+        ast = parse_source(source)
+
+        func = ast.declarations[0]
+        assert func.is_extern
+        assert func.name == "add"
+        assert len(func.parameters) == 2
+        assert func.parameters[0].name == "a"
+        assert func.parameters[1].name == "b"
+
+    def test_extern_function_void_return(self):
+        """Extern function with void return type should parse."""
+        source = "extern void process();"
+        ast = parse_source(source)
+
+        func = ast.declarations[0]
+        assert func.is_extern
+        assert func.return_type.base_type == BaseType.VOID
+
+    def test_extern_function_char_return(self):
+        """Extern function with char return type should parse."""
+        source = "extern char getchar();"
+        ast = parse_source(source)
+
+        func = ast.declarations[0]
+        assert func.is_extern
+        assert func.return_type.base_type == BaseType.CHAR
+
+    def test_extern_function_pointer_return(self):
+        """Extern function returning pointer should parse."""
+        source = "extern char *get_name();"
+        ast = parse_source(source)
+
+        func = ast.declarations[0]
+        assert func.is_extern
+        assert func.return_type.base_type == BaseType.CHAR
+        assert func.return_type.pointer_depth == 1
+
+    def test_extern_function_pointer_param(self):
+        """Extern function with pointer parameter should parse."""
+        source = "extern void print(char *msg);"
+        ast = parse_source(source)
+
+        func = ast.declarations[0]
+        assert func.is_extern
+        assert func.parameters[0].param_type.pointer_depth == 1
+
+    def test_multiple_extern_functions(self):
+        """Multiple extern function declarations should parse."""
+        source = """
+        extern int add(int a, int b);
+        extern int sub(int a, int b);
+        extern int mul(int a, int b);
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 3
+        for func in ast.declarations:
+            assert func.is_extern
+        assert ast.declarations[0].name == "add"
+        assert ast.declarations[1].name == "sub"
+        assert ast.declarations[2].name == "mul"
+
+    def test_extern_mixed_with_local_functions(self):
+        """Extern declarations mixed with local functions should parse."""
+        source = """
+        extern int helper(int x);
+
+        int main() {
+            return helper(42);
+        }
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 2
+        assert ast.declarations[0].is_extern
+        assert ast.declarations[0].name == "helper"
+        assert not ast.declarations[1].is_extern
+        assert ast.declarations[1].name == "main"
+
+    # -------------------------------------------------------------------------
+    # Parser Tests - Variable Declarations
+    # -------------------------------------------------------------------------
+
+    def test_extern_variable_int(self):
+        """Extern int variable declaration should parse."""
+        source = "extern int count;"
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 1
+        var = ast.declarations[0]
+        assert isinstance(var, VariableDeclaration)
+        assert var.name == "count"
+        assert var.is_extern
+        assert var.var_type.base_type == BaseType.INT
+
+    def test_extern_variable_char(self):
+        """Extern char variable declaration should parse."""
+        source = "extern char flag;"
+        ast = parse_source(source)
+
+        var = ast.declarations[0]
+        assert var.is_extern
+        assert var.var_type.base_type == BaseType.CHAR
+
+    def test_extern_variable_pointer(self):
+        """Extern pointer variable declaration should parse."""
+        source = "extern char *buffer;"
+        ast = parse_source(source)
+
+        var = ast.declarations[0]
+        assert var.is_extern
+        assert var.var_type.pointer_depth == 1
+
+    def test_extern_variable_array(self):
+        """Extern array declaration should parse."""
+        source = "extern int data[100];"
+        ast = parse_source(source)
+
+        var = ast.declarations[0]
+        assert var.is_extern
+        assert var.var_type.array_size == 100
+
+    def test_extern_variable_no_initializer(self):
+        """Extern variable should not have initializer."""
+        source = "extern int count;"
+        ast = parse_source(source)
+
+        var = ast.declarations[0]
+        assert var.initializer is None
+
+    def test_multiple_extern_variables(self):
+        """Multiple extern variable declarations should parse."""
+        source = """
+        extern int count;
+        extern char flag;
+        extern int *ptr;
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 3
+        for decl in ast.declarations:
+            assert isinstance(decl, VariableDeclaration)
+            assert decl.is_extern
+
+    def test_extern_variables_mixed_with_functions(self):
+        """Extern variables mixed with extern functions should parse."""
+        source = """
+        extern int count;
+        extern void increment();
+        extern char buffer[80];
+        """
+        ast = parse_source(source)
+
+        assert len(ast.declarations) == 3
+        assert isinstance(ast.declarations[0], VariableDeclaration)
+        assert ast.declarations[0].name == "count"
+        assert isinstance(ast.declarations[1], FunctionNode)
+        assert ast.declarations[1].name == "increment"
+        assert isinstance(ast.declarations[2], VariableDeclaration)
+        assert ast.declarations[2].name == "buffer"
+
+    # -------------------------------------------------------------------------
+    # Parser Tests - Error Cases
+    # -------------------------------------------------------------------------
+
+    def test_extern_variable_with_initializer_error(self):
+        """Extern variable with initializer should error."""
+        source = "extern int count = 5;"
+        with pytest.raises(SmallCError):
+            parse_source(source)
+
+    def test_extern_function_with_body_error(self):
+        """Extern function with body should error."""
+        source = "extern int foo() { return 1; }"
+        with pytest.raises(SmallCError):
+            parse_source(source)
+
+    # -------------------------------------------------------------------------
+    # Code Generation Tests
+    # -------------------------------------------------------------------------
+
+    def test_extern_function_generates_no_code(self):
+        """Extern function declaration should not generate function code."""
+        source = """
+        extern int helper(int x);
+
+        int main() {
+            return helper(42);
+        }
+        """
+        compiler = SmallCCompiler()
+        result = compiler.compile_source(source, "test.c")
+
+        # Should NOT have _helper function definition
+        assert "_helper:" not in result.assembly
+        # But main should call it
+        assert "JSR" in result.assembly and "_helper" in result.assembly
+
+    def test_extern_function_call_generates_jsr(self):
+        """Call to extern function should generate JSR."""
+        source = """
+        extern int double_it(int x);
+
+        int main() {
+            return double_it(21);
+        }
+        """
+        compiler = SmallCCompiler()
+        result = compiler.compile_source(source, "test.c")
+
+        # Should generate JSR to the external function
+        assert "JSR" in result.assembly
+        assert "_double_it" in result.assembly
+
+    def test_extern_variable_generates_no_storage(self):
+        """Extern variable should not allocate storage."""
+        source = """
+        extern int count;
+
+        int main() {
+            return count;
+        }
+        """
+        compiler = SmallCCompiler()
+        result = compiler.compile_source(source, "test.c")
+
+        # Should reference the variable but not define it
+        assert "_count" in result.assembly
+        # Should not have RMB (reserve memory bytes) for count
+        lines = result.assembly.split('\n')
+        count_rmb = [l for l in lines if "_count" in l and "RMB" in l]
+        assert len(count_rmb) == 0
+
+    def test_extern_vs_opl_distinction(self):
+        """Extern and OPL declarations should be distinct."""
+        source = """
+        extern int helper(int x);
+        opl void azMENU();
+
+        int main() {
+            helper(1);
+            azMENU();
+            return 0;
+        }
+        """
+        ast = parse_source(source)
+
+        # First is extern (C external linkage)
+        assert ast.declarations[0].is_extern
+        assert not ast.declarations[0].is_opl
+
+        # Second is OPL (Psion OPL interop)
+        assert not ast.declarations[1].is_extern
+        assert ast.declarations[1].is_opl
+
+    def test_extern_function_with_multiple_params_call(self):
+        """Extern function call with multiple params should generate correct stack setup."""
+        source = """
+        extern int add(int a, int b, int c);
+
+        int main() {
+            return add(1, 2, 3);
+        }
+        """
+        compiler = SmallCCompiler()
+        result = compiler.compile_source(source, "test.c")
+
+        # Should push arguments and call
+        assert "PSHB" in result.assembly
+        assert "PSHA" in result.assembly
+        assert "JSR" in result.assembly
+        assert "_add" in result.assembly
+
+
+# =============================================================================
+# OPL Procedure Declaration Tests
+# =============================================================================
+
+class TestOplKeyword:
+    """Tests for the 'opl' keyword that enables OPL procedure calls."""
+
+    # -------------------------------------------------------------------------
+    # Lexer Tests
+    # -------------------------------------------------------------------------
+
+    def test_opl_keyword_lexes(self):
+        """'opl' keyword should tokenize correctly."""
+        lexer = CLexer("opl", "test.c")
+        tokens = list(lexer.tokenize())
+        assert tokens[0].type == CTokenType.OPL
+        assert tokens[0].value == "opl"
+
+    def test_opl_in_declaration(self):
+        """OPL declaration should tokenize all parts."""
+        lexer = CLexer("opl void foo();", "test.c")
+        tokens = list(lexer.tokenize())
+        assert tokens[0].type == CTokenType.OPL
         assert tokens[1].type == CTokenType.VOID
         assert tokens[2].type == CTokenType.IDENTIFIER
         assert tokens[2].value == "foo"
@@ -967,51 +1299,51 @@ class TestExternalKeyword:
     # Parser Tests - Valid Declarations
     # -------------------------------------------------------------------------
 
-    def test_simple_external_declaration(self):
-        """Simple external declaration should parse correctly."""
-        source = "external void azMENU();"
+    def test_simple_opl_declaration(self):
+        """Simple opl declaration should parse correctly."""
+        source = "opl void azMENU();"
         ast = parse_source(source)
 
         assert len(ast.declarations) == 1
         func = ast.declarations[0]
         assert isinstance(func, FunctionNode)
         assert func.name == "azMENU"
-        assert func.is_external
+        assert func.is_opl
         assert func.return_type.base_type == BaseType.VOID
         assert len(func.parameters) == 0
         assert func.body is None
 
-    def test_multiple_external_declarations(self):
-        """Multiple external declarations should parse correctly."""
+    def test_multiple_opl_declarations(self):
+        """Multiple opl declarations should parse correctly."""
         source = """
-        external void azMENU();
-        external void azHELP();
-        external void azINIT();
+        opl void azMENU();
+        opl void azHELP();
+        opl void azINIT();
         """
         ast = parse_source(source)
 
         assert len(ast.declarations) == 3
         for func in ast.declarations:
             assert isinstance(func, FunctionNode)
-            assert func.is_external
+            assert func.is_opl
 
         assert ast.declarations[0].name == "azMENU"
         assert ast.declarations[1].name == "azHELP"
         assert ast.declarations[2].name == "azINIT"
 
-    def test_external_with_explicit_void_params(self):
-        """External declaration with explicit void params should parse."""
-        source = "external void azMENU(void);"
+    def test_opl_with_explicit_void_params(self):
+        """OPL declaration with explicit void params should parse."""
+        source = "opl void azMENU(void);"
         ast = parse_source(source)
 
         func = ast.declarations[0]
-        assert func.is_external
+        assert func.is_opl
         assert len(func.parameters) == 0
 
-    def test_external_mixed_with_functions(self):
-        """External declarations mixed with regular functions should parse."""
+    def test_opl_mixed_with_functions(self):
+        """OPL declarations mixed with regular functions should parse."""
         source = """
-        external void azMENU();
+        opl void azMENU();
 
         void main() {
             azMENU();
@@ -1020,25 +1352,25 @@ class TestExternalKeyword:
         ast = parse_source(source)
 
         assert len(ast.declarations) == 2
-        assert ast.declarations[0].is_external
+        assert ast.declarations[0].is_opl
         assert ast.declarations[0].name == "azMENU"
-        assert not ast.declarations[1].is_external
+        assert not ast.declarations[1].is_opl
         assert ast.declarations[1].name == "main"
 
-    def test_external_8_char_name(self):
-        """External declaration with exactly 8-char name should parse."""
-        source = "external void PROCNAME();"  # 8 characters
+    def test_opl_8_char_name(self):
+        """OPL declaration with exactly 8-char name should parse."""
+        source = "opl void PROCNAME();"  # 8 characters
         ast = parse_source(source)
 
         func = ast.declarations[0]
         assert func.name == "PROCNAME"
-        assert func.is_external
+        assert func.is_opl
 
     # -------------------------------------------------------------------------
     # Parser Tests - Error Cases
     # -------------------------------------------------------------------------
 
-    def test_external_int_return_allowed(self):
+    def test_opl_int_return_allowed(self):
         """External with int return type should be allowed (for integer-returning OPL procs).
 
         Note: In OPL, integer-returning procedures are named with % suffix (e.g., GETVAL%).
@@ -1046,56 +1378,56 @@ class TestExternalKeyword:
         - Use a C-compatible name (will be passed to OPL as-is)
         - Use the legacy call_opl("GETVAL%") syntax for names with special characters
         """
-        source = "external int GETVAL();"
+        source = "opl int GETVAL();"
         ast = parse_source(source)
         func = ast.declarations[0]
-        assert func.is_external
+        assert func.is_opl
         assert func.name == "GETVAL"
         # return_type should be int
         assert func.return_type.base_type.name == "INT"
 
-    def test_external_char_return_allowed(self):
+    def test_opl_char_return_allowed(self):
         """External with char return type should be allowed (treated as 8-bit int)."""
-        source = "external char GETC();"
+        source = "opl char GETC();"
         ast = parse_source(source)
         func = ast.declarations[0]
-        assert func.is_external
+        assert func.is_opl
         assert func.name == "GETC"
         # return_type should be char
         assert func.return_type.base_type.name == "CHAR"
 
-    def test_external_with_int_parameter(self):
+    def test_opl_with_int_parameter(self):
         """External with integer parameter should be allowed."""
-        source = "external void SETVAL(int x);"
+        source = "opl void SETVAL(int x);"
         ast = parse_source(source)
         func = ast.declarations[0]
-        assert func.is_external
+        assert func.is_opl
         assert func.name == "SETVAL"
         assert len(func.parameters) == 1
         assert func.parameters[0].name == "x"
         assert func.parameters[0].param_type.base_type.name == "INT"
 
-    def test_external_with_multiple_parameters(self):
+    def test_opl_with_multiple_parameters(self):
         """External with multiple parameters should be allowed (up to 4)."""
-        source = "external int ADDNUM(int a, int b);"
+        source = "opl int ADDNUM(int a, int b);"
         ast = parse_source(source)
         func = ast.declarations[0]
-        assert func.is_external
+        assert func.is_opl
         assert func.name == "ADDNUM"
         assert len(func.parameters) == 2
         assert func.parameters[0].name == "a"
         assert func.parameters[1].name == "b"
 
-    def test_external_with_max_parameters(self):
+    def test_opl_with_max_parameters(self):
         """External with 4 parameters (maximum) should be allowed."""
-        source = "external int CALC(int a, int b, int c, int d);"
+        source = "opl int CALC(int a, int b, int c, int d);"
         ast = parse_source(source)
         func = ast.declarations[0]
         assert len(func.parameters) == 4
 
-    def test_external_with_too_many_parameters_error(self):
-        """External with more than MAX_EXTERNAL_PARAMS parameters should raise error with helpful message."""
-        source = "external void FUNC(int a, int b, int c, int d, int e);"
+    def test_opl_with_too_many_parameters_error(self):
+        """External with more than MAX_OPL_PARAMS parameters should raise error with helpful message."""
+        source = "opl void FUNC(int a, int b, int c, int d, int e);"
         with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
             parse_source(source)
         error_msg = str(exc_info.value)
@@ -1104,52 +1436,52 @@ class TestExternalKeyword:
         # Should mention how many were provided
         assert "5" in error_msg or "got 5" in error_msg
         # Should hint at how to increase the limit
-        assert "MAX_EXTERNAL_PARAMS" in error_msg
+        assert "MAX_OPL_PARAMS" in error_msg
         assert "runtime.inc" in error_msg
 
-    def test_external_with_exactly_max_parameters_succeeds(self):
-        """External with exactly MAX_EXTERNAL_PARAMS (4) parameters should succeed."""
-        source = "external void FUNC(int a, int b, int c, int d);"
+    def test_opl_with_exactly_max_parameters_succeeds(self):
+        """External with exactly MAX_OPL_PARAMS (4) parameters should succeed."""
+        source = "opl void FUNC(int a, int b, int c, int d);"
         ast = parse_source(source)
         assert len(ast.declarations) == 1
         func = ast.declarations[0]
         assert len(func.parameters) == 4
 
-    def test_external_with_one_over_max_parameters_fails(self):
-        """External with MAX_EXTERNAL_PARAMS + 1 parameters should fail."""
+    def test_opl_with_one_over_max_parameters_fails(self):
+        """External with MAX_OPL_PARAMS + 1 parameters should fail."""
         # This tests the boundary condition
-        source = "external void FUNC(int a, int b, int c, int d, int e);"
+        source = "opl void FUNC(int a, int b, int c, int d, int e);"
         with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
             parse_source(source)
         assert "at most 4" in str(exc_info.value)
 
-    def test_external_with_pointer_parameter_error(self):
+    def test_opl_with_pointer_parameter_error(self):
         """External with pointer parameter should raise error."""
-        source = "external void FUNC(int *p);"
+        source = "opl void FUNC(int *p);"
         with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
             parse_source(source)
         assert "pointer" in str(exc_info.value).lower()
 
-    def test_external_name_too_long_error(self):
+    def test_opl_name_too_long_error(self):
         """External with name > 8 chars should raise error."""
-        source = "external void VERYLONGNAME();"  # 12 characters
+        source = "opl void VERYLONGNAME();"  # 12 characters
         with pytest.raises((CSyntaxError, SmallCError)) as exc_info:
             parse_source(source)
         assert "8" in str(exc_info.value)
 
-    def test_external_with_body_error(self):
-        """External declaration cannot have a body."""
-        source = "external void azMENU() { }"
+    def test_opl_with_body_error(self):
+        """OPL declaration cannot have a body."""
+        source = "opl void azMENU() { }"
         with pytest.raises((CSyntaxError, SmallCError)):
             parse_source(source)
 
-    def test_external_pointer_return_error(self):
+    def test_opl_pointer_return_error(self):
         """External with pointer return type should raise error.
 
-        Pointers are not valid external return types since OPL procedures
+        Pointers are not valid opl return types since OPL procedures
         cannot return pointers to C code.
         """
-        source = "external int *azMENU();"
+        source = "opl int *azMENU();"
         # This should fail - pointer returns not allowed
         # The parser may fail at the '*' or later, depending on implementation
         with pytest.raises((CSyntaxError, SmallCError)):
@@ -1159,10 +1491,10 @@ class TestExternalKeyword:
     # Code Generator Tests - Setup Injection
     # -------------------------------------------------------------------------
 
-    def test_external_injects_setup_in_main(self):
-        """External declaration should inject setup code in main()."""
+    def test_opl_injects_setup_in_main(self):
+        """OPL declaration should inject setup code in main()."""
         source = """
-        external void azMENU();
+        opl void azMENU();
 
         void main() {
             azMENU();
@@ -1180,8 +1512,8 @@ class TestExternalKeyword:
         setup_pos = asm.find("_call_opl_setup", main_start)
         assert setup_pos > main_start  # Setup is after _main label
 
-    def test_no_setup_without_external(self):
-        """Without external declarations, no setup should be injected."""
+    def test_no_setup_without_opl(self):
+        """Without opl declarations, no setup should be injected."""
         source = """
         void foo() { }
 
@@ -1196,11 +1528,11 @@ class TestExternalKeyword:
         assert "_call_opl_setup" not in asm
 
     def test_setup_only_once(self):
-        """Setup should only be injected once, even with multiple externals."""
+        """Setup should only be injected once, even with multiple opl declarations."""
         source = """
-        external void azMENU();
-        external void azHELP();
-        external void azINIT();
+        opl void azMENU();
+        opl void azHELP();
+        opl void azINIT();
 
         void main() {
             azMENU();
@@ -1220,10 +1552,10 @@ class TestExternalKeyword:
     # Code Generator Tests - External Calls
     # -------------------------------------------------------------------------
 
-    def test_external_call_generates_call_opl(self):
+    def test_opl_call_generates_call_opl(self):
         """External function call should generate _call_opl invocation."""
         source = """
-        external void azMENU();
+        opl void azMENU();
 
         void main() {
             azMENU();
@@ -1240,10 +1572,10 @@ class TestExternalKeyword:
         # The procedure name is in a string constant, not a label
         assert "JSR\t_azMENU" not in asm and "JSR     _azMENU" not in asm
 
-    def test_external_call_generates_string_literal(self):
+    def test_opl_call_generates_string_literal(self):
         """External call should generate procedure name string."""
         source = """
-        external void azMENU();
+        opl void azMENU();
 
         void main() {
             azMENU();
@@ -1258,11 +1590,11 @@ class TestExternalKeyword:
         # Should have FCC directive for the string
         assert "FCC" in asm or "FCB" in asm
 
-    def test_multiple_external_calls(self):
-        """Multiple external calls should each generate _call_opl."""
+    def test_multiple_opl_calls(self):
+        """Multiple opl calls should each generate _call_opl."""
         source = """
-        external void azMENU();
-        external void azHELP();
+        opl void azMENU();
+        opl void azHELP();
 
         void main() {
             azMENU();
@@ -1282,10 +1614,10 @@ class TestExternalKeyword:
                              and 'JSR' in line)
         assert call_opl_count == 2
 
-    def test_external_call_with_parameters_generates_call_opl_param(self):
+    def test_opl_call_with_parameters_generates_call_opl_param(self):
         """External function call with parameters should use _call_opl_param."""
         source = """
-        external int ADDNUM(int a, int b);
+        opl int ADDNUM(int a, int b);
 
         void main() {
             int result;
@@ -1306,10 +1638,10 @@ class TestExternalKeyword:
         # Should have the procedure name string with % suffix
         assert "ADDNUM%" in asm
 
-    def test_external_call_char_param_with_parameters(self):
+    def test_opl_call_char_param_with_parameters(self):
         """External char-returning call with parameters should use _call_opl_str_param."""
         source = """
-        external char GETC(int x);
+        opl char GETC(int x);
 
         void main() {
             char c;
@@ -1325,10 +1657,10 @@ class TestExternalKeyword:
         # Should have the procedure name string with $ suffix
         assert "GETC$" in asm
 
-    def test_external_call_preserves_locals(self):
+    def test_opl_call_preserves_locals(self):
         """External call should work with local variables."""
         source = """
-        external void azMENU();
+        opl void azMENU();
 
         void main() {
             int score;
@@ -1349,11 +1681,11 @@ class TestExternalKeyword:
     # Integration Tests
     # -------------------------------------------------------------------------
 
-    def test_full_compilation_with_external(self):
-        """Full compilation with external should succeed."""
+    def test_full_compilation_with_opl(self):
+        """Full compilation with opl should succeed."""
         source = """
-        external void azMENU();
-        external void azHELP();
+        opl void azMENU();
+        opl void azHELP();
 
         int g_score;
 
@@ -1371,10 +1703,10 @@ class TestExternalKeyword:
         assert "_call_opl" in asm
         assert "_g_score:" in asm
 
-    def test_external_with_helper_functions(self):
+    def test_opl_with_helper_functions(self):
         """External calls from helper functions should work."""
         source = """
-        external void azMENU();
+        opl void azMENU();
 
         void show_menu() {
             azMENU();
@@ -1393,14 +1725,14 @@ class TestExternalKeyword:
         assert "_call_opl_setup" in asm
         assert "_call_opl" in asm
 
-    def test_ast_printer_shows_external(self):
-        """AST printer should indicate external functions."""
-        source = "external void azMENU();"
+    def test_ast_printer_shows_opl(self):
+        """AST printer should indicate opl functions."""
+        source = "opl void azMENU();"
         ast = parse_source(source)
         printer = ASTPrinter()
         output = printer.print(ast)
 
-        assert "External" in output
+        assert "OPL" in output
         assert "azMENU" in output
 
 

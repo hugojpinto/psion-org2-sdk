@@ -161,17 +161,22 @@ class VariableDeclaration(Declaration):
         int y = 10;
         char buf[100];
         int *ptr;
+        extern int shared;  // Defined in another file
 
     Attributes:
         name: Variable name
         var_type: The C type (including pointer/array info)
         initializer: Optional initialization expression
         is_global: True for global variables, False for local
+        is_extern: True if declared with 'extern' (defined elsewhere).
+                   Extern variables don't allocate storage - they reference
+                   a variable defined in another translation unit.
     """
     name: str = ""
     var_type: CType = field(default=None)
     initializer: Optional[Expression] = None
     is_global: bool = False
+    is_extern: bool = False
 
 
 @dataclass
@@ -186,17 +191,21 @@ class FunctionNode(Declaration):
         return_type: The return type
         parameters: List of parameter declarations
         body: The function body (block statement)
-        is_forward_decl: True if this is just a forward declaration
-        is_external: True if this is an external OPL procedure declaration
-                     (declared with 'external' keyword, no body, will be called
-                     via QCode injection at runtime)
+        is_forward_decl: True if this is just a forward declaration (no body)
+        is_extern: True if declared with 'extern' keyword (C storage class).
+                   Extern functions are defined in another translation unit
+                   (another .c file). Used for multi-file C linking.
+        is_opl: True if this is an OPL procedure declaration (Psion-specific).
+                Declared with 'opl' keyword, no body, will be called via
+                QCode injection at runtime to invoke OPL procedures.
     """
     name: str = ""
     return_type: CType = field(default=None)
     parameters: list[ParameterNode] = field(default_factory=list)
     body: Optional["BlockStatement"] = None
     is_forward_decl: bool = False
-    is_external: bool = False
+    is_extern: bool = False
+    is_opl: bool = False
 
 
 # =============================================================================
@@ -819,8 +828,13 @@ class ASTPrinter(ASTVisitor):
 
     def visit_FunctionNode(self, node: FunctionNode):
         params = ", ".join(f"{p.param_type} {p.name}" for p in node.parameters)
-        # Mark external OPL procedures distinctly
-        prefix = "External " if node.is_external else ""
+        # Mark extern and OPL procedures distinctly
+        if node.is_opl:
+            prefix = "OPL "
+        elif node.is_extern:
+            prefix = "Extern "
+        else:
+            prefix = ""
         self._emit(f"{prefix}Function: {node.return_type} {node.name}({params})")
         if node.body:
             self._indent()

@@ -309,7 +309,7 @@ class CParser:
                 CTokenType.INT,
                 CTokenType.CHAR,
                 CTokenType.VOID,
-                CTokenType.EXTERNAL,  # External OPL procedure declarations
+                CTokenType.OPL,  # OPL procedure declarations
             ):
                 if self._peek().type == CTokenType.SEMICOLON:
                     self._advance()  # consume the semicolon
@@ -349,13 +349,23 @@ class CParser:
             return self._parse_struct_or_struct_variable()
 
         # =====================================================================
-        # Check for 'external' keyword - OPL procedure declaration
+        # Check for 'extern' keyword - C external linkage declaration
         # =====================================================================
-        # External declarations allow C code to call OPL procedures.
-        # At runtime, calls to external functions are transformed into
-        # QCode injection sequences that invoke the OPL interpreter.
-        if self._match(CTokenType.EXTERNAL):
-            return self._parse_external_declaration()
+        # Extern declarations specify that a function or variable is defined
+        # in another translation unit (another .c file). Used for multi-file
+        # C linking. The declaration tells the compiler the type signature
+        # but no code or storage is generated.
+        if self._match(CTokenType.EXTERN):
+            return self._parse_extern_declaration()
+
+        # =====================================================================
+        # Check for 'opl' keyword - OPL procedure declaration (Psion-specific)
+        # =====================================================================
+        # OPL declarations allow C code to call OPL procedures installed on
+        # the Psion device. At runtime, calls to OPL functions are transformed
+        # into QCode injection sequences that invoke the OPL interpreter.
+        if self._match(CTokenType.OPL):
+            return self._parse_opl_declaration()
 
         # =====================================================================
         # Check for 'typedef' keyword - type alias
@@ -486,13 +496,13 @@ class CParser:
         return None
 
     # =========================================================================
-    # PARAMETER LIMIT CONFIGURATION
+    # PARAMETER LIMIT CONFIGURATION (for OPL procedure calls)
     # =========================================================================
-    # Maximum parameters allowed for external OPL procedure declarations.
+    # Maximum parameters allowed for OPL procedure declarations.
     # OPL supports up to 16 parameters, but the QCode buffer size limits this.
     #
     # TO INCREASE THE LIMIT:
-    #   1. Change MAX_EXTERNAL_PARAMS below
+    #   1. Change MAX_OPL_PARAMS below
     #   2. Change _COL_MAX_PARAMS in include/runtime.inc to match
     #   3. The runtime buffer will adjust automatically via EQUs
     #
@@ -512,18 +522,143 @@ class CParser:
     #
     # >>> CHANGE THIS VALUE TO INCREASE PARAMETER LIMIT <<<
     # =========================================================================
-    MAX_EXTERNAL_PARAMS = 4
+    MAX_OPL_PARAMS = 4
 
-    def _parse_external_declaration(self) -> FunctionNode:
+    def _parse_extern_declaration(self) -> FunctionNode | list[VariableDeclaration]:
         """
-        Parse an external OPL procedure declaration.
+        Parse a C extern declaration (external linkage).
 
         Syntax:
-            external void procedureName();              // No parameters
-            external void procedureName(int x);         // One integer parameter
-            external int procedureName(int a, int b);   // Multiple parameters
+            extern int helper_func(int x);     // Function in another .c file
+            extern int global_counter;         // Variable in another .c file
 
-        External declarations allow Small-C code to call OPL procedures that
+        Extern declarations are used in multi-file C builds to declare functions
+        or variables that are defined in a different translation unit (another
+        .c file). The declaration tells the compiler the type signature, but
+        no code or storage is generated - the definition comes from another file.
+
+        This is standard C semantics for external linkage, enabling modular
+        code organization across multiple source files.
+
+        Returns:
+            FunctionNode with is_extern=True for function declarations, or
+            list[VariableDeclaration] with is_extern=True for variable declarations.
+
+        Raises:
+            CSyntaxError: If the declaration is invalid
+
+        Example:
+            // In main.c:
+            extern int add(int a, int b);  // Declare function from math.c
+            extern int counter;             // Declare variable from state.c
+
+            void main() {
+                counter = add(1, 2);
+            }
+
+            // In math.c:
+            int add(int a, int b) {
+                return a + b;
+            }
+
+            // In state.c:
+            int counter = 0;
+        """
+        location = self._peek().location
+
+        # Parse type specifier
+        type_info = self._parse_type_specifier()
+        if type_info is None:
+            raise CSyntaxError(
+                "extern declaration requires a type",
+                self._peek().location,
+                hint="extern int funcname(); or extern int varname;",
+            )
+
+        base_type, is_unsigned, ptr_depth, typedef_array_size, struct_name = type_info
+
+        # Parse pointer prefix
+        while self._match(CTokenType.STAR):
+            ptr_depth += 1
+
+        # Parse identifier
+        name_token = self._expect(CTokenType.IDENTIFIER, "identifier")
+        name = name_token.value
+
+        # Check if this is a function or variable declaration
+        if self._check(CTokenType.LPAREN):
+            # Function declaration: extern int foo(int x);
+            self._advance()  # consume '('
+            parameters = self._parse_parameter_list()
+            self._expect(CTokenType.RPAREN, "')'")
+            self._expect(CTokenType.SEMICOLON, "';'")
+
+            # Build return type
+            return_type = CType(
+                base_type=base_type,
+                is_pointer=ptr_depth > 0,
+                pointer_depth=ptr_depth,
+                is_unsigned=is_unsigned,
+            )
+
+            return FunctionNode(
+                location=location,
+                name=name,
+                return_type=return_type,
+                parameters=parameters,
+                body=None,
+                is_forward_decl=True,  # Extern functions are forward declarations
+                is_extern=True,
+                is_opl=False,
+            )
+
+        else:
+            # Variable declaration: extern int counter;
+            # Check for array
+            array_size = typedef_array_size
+            if self._match(CTokenType.LBRACKET):
+                if self._check(CTokenType.NUMBER):
+                    array_size = self._advance().value
+                elif self._check(CTokenType.RBRACKET):
+                    # extern int arr[]; - unsized array (size determined by definition)
+                    array_size = 0  # 0 means unsized
+                else:
+                    raise CSyntaxError(
+                        "expected array size or ']'",
+                        self._peek().location,
+                    )
+                self._expect(CTokenType.RBRACKET, "']'")
+
+            self._expect(CTokenType.SEMICOLON, "';'")
+
+            # Build variable type
+            var_type = CType(
+                base_type=base_type,
+                is_pointer=ptr_depth > 0,
+                pointer_depth=ptr_depth,
+                is_unsigned=is_unsigned,
+                array_size=array_size,
+            )
+
+            return [VariableDeclaration(
+                location=location,
+                name=name,
+                var_type=var_type,
+                initializer=None,  # Extern variables cannot have initializers
+                is_global=True,
+                is_extern=True,
+            )]
+
+    def _parse_opl_declaration(self) -> FunctionNode:
+        """
+        Parse an OPL procedure declaration (Psion-specific).
+
+        Syntax:
+            opl void procedureName();              // No parameters
+            opl void procedureName(int x);         // One integer parameter
+            opl int procedureName(int a, int b);   // Multiple parameters
+
+        OPL declarations allow Small-C code to call OPL procedures that
         exist in the Psion's installed OPL programs. At runtime, the compiler
         generates QCode injection sequences to invoke the OPL interpreter.
 
@@ -533,13 +668,13 @@ class CParser:
         - char: For OPL procedures that return strings (first char returned)
 
         OPL procedure naming determines return type:
-        - PROC%: returns integer (use 'external int PROC();')
-        - PROC:  returns float (use 'external void', value not accessible)
-        - PROC$: returns string (use 'external char PROC();')
+        - PROC%: returns integer (use 'opl int PROC();')
+        - PROC:  returns float (use 'opl void', value not accessible)
+        - PROC$: returns string (use 'opl char PROC();')
 
         Parameter Constraints:
         - Only integer parameters are supported (int, char promoted to int)
-        - Maximum MAX_EXTERNAL_PARAMS parameters (see class constant above)
+        - Maximum MAX_OPL_PARAMS parameters (see class constant above)
         - Parameters are passed via QCode opcodes that push onto language stack
         - To increase the limit, see PARAMETER LIMIT CONFIGURATION above
 
@@ -566,10 +701,10 @@ class CParser:
         Reference: dev_docs/PROCEDURE_CALL_RESEARCH.md
 
         Returns:
-            FunctionNode with is_external=True
+            FunctionNode with is_opl=True
 
         Raises:
-            CSyntaxError: If the declaration violates external constraints
+            CSyntaxError: If the declaration violates OPL constraints
         """
         location = self._peek().location
 
@@ -582,17 +717,17 @@ class CParser:
         type_info = self._parse_type_specifier()
         if type_info is None:
             raise CSyntaxError(
-                "external declaration requires a return type",
+                "opl declaration requires a return type",
                 self._peek().location,
-                hint="external void procedureName(); or external int procedureName();",
+                hint="opl void procedureName(); or opl int procedureName();",
             )
 
         base_type, is_unsigned, ptr_depth, _, struct_name = type_info
 
-        # External OPL procedures cannot have struct return types
+        # OPL procedures cannot have struct return types
         if struct_name is not None:
             raise CSyntaxError(
-                "external OPL procedures cannot return struct types",
+                "opl procedures cannot return struct types",
                 self._peek().location,
             )
 
@@ -600,17 +735,17 @@ class CParser:
         if base_type == BaseType.VOID:
             return_type = TYPE_VOID
         elif base_type == BaseType.INT and ptr_depth == 0:
-            # Allow both int and unsigned int for external returns
+            # Allow both int and unsigned int for OPL returns
             return_type = TYPE_UINT if is_unsigned else TYPE_INT
         elif base_type == BaseType.CHAR and ptr_depth == 0:
             # Allow char (treated as 8-bit int) for return value
             return_type = TYPE_UCHAR if is_unsigned else TYPE_CHAR
         else:
             raise CSyntaxError(
-                f"external procedures can only return void or int, not '{base_type.name.lower()}'",
+                f"opl procedures can only return void, int, or char, not '{base_type.name.lower()}'",
                 location,
                 hint="OPL only supports integer return values to C code; "
-                     "use 'external void' or 'external int'",
+                     "use 'opl void', 'opl int', or 'opl char'",
             )
 
         # =====================================================================
@@ -622,9 +757,9 @@ class CParser:
         # Validate name length (Psion filesystem limit)
         # OPL procedure names are stored as 8-character filenames
         # The C return type determines the OPL name suffix:
-        #   external char GETVAL()  -> calls GETVAL$ in OPL (string)
-        #   external int GETVAL()   -> calls GETVAL% in OPL (integer)
-        #   external void GETVAL()  -> calls GETVAL in OPL (no suffix)
+        #   opl char GETVAL()  -> calls GETVAL$ in OPL (string)
+        #   opl int GETVAL()   -> calls GETVAL% in OPL (integer)
+        #   opl void GETVAL()  -> calls GETVAL in OPL (no suffix)
         opl_name = name
         if return_type.base_type == BaseType.CHAR:
             opl_name = name + "$"
@@ -633,7 +768,7 @@ class CParser:
         # void has no suffix
         if len(opl_name) > 8:
             raise CSyntaxError(
-                f"external procedure name '{name}' (OPL: '{opl_name}') exceeds 8 character limit",
+                f"opl procedure name '{name}' (OPL: '{opl_name}') exceeds 8 character limit",
                 name_token.location,
                 hint="Psion procedure names are limited to 8 characters",
             )
@@ -641,7 +776,7 @@ class CParser:
         # =====================================================================
         # Parse parameter list - supports integer parameters
         # =====================================================================
-        # External OPL procedures can receive parameters via the QCode buffer.
+        # OPL procedures can receive parameters via the QCode buffer.
         # We build $22 HH LL (push word) opcodes for each integer parameter.
         # Parameters are pushed in reverse order before QCO_PROC ($7D).
         self._expect(CTokenType.LPAREN, "'('")
@@ -649,50 +784,50 @@ class CParser:
         self._expect(CTokenType.RPAREN, "')'")
 
         # =====================================================================
-        # Validate parameters for external procedures
+        # Validate parameters for OPL procedures
         # =====================================================================
         # OPL procedure parameters are limited:
         # - Only integer types supported (int, char - no pointers, no arrays)
         # - Maximum 4 parameters (buffer size constraint)
         # - Each parameter is passed as a 16-bit value via QCode $22 opcode
-        if len(parameters) > self.MAX_EXTERNAL_PARAMS:
+        if len(parameters) > self.MAX_OPL_PARAMS:
             raise CSyntaxError(
-                f"external procedures support at most {self.MAX_EXTERNAL_PARAMS} parameters, "
+                f"opl procedures support at most {self.MAX_OPL_PARAMS} parameters, "
                 f"got {len(parameters)}",
                 location,
-                hint=f"To increase the {self.MAX_EXTERNAL_PARAMS}-parameter limit (OPL supports up to 16), "
-                     "change MAX_EXTERNAL_PARAMS in parser.py and _COL_MAX_PARAMS in runtime.inc",
+                hint=f"To increase the {self.MAX_OPL_PARAMS}-parameter limit (OPL supports up to 16), "
+                     "change MAX_OPL_PARAMS in parser.py and _COL_MAX_PARAMS in runtime.inc",
             )
 
         for param in parameters:
             # Check that parameter type is a simple integer type (int or char)
-            # Pointers and arrays are not supported for external parameters
+            # Pointers and arrays are not supported for OPL parameters
             if param.param_type.pointer_depth > 0:
                 raise CSyntaxError(
-                    f"external procedure parameter '{param.name}' cannot be a pointer",
+                    f"opl procedure parameter '{param.name}' cannot be a pointer",
                     param.location,
-                    hint="Only integer types (int, char) are supported for external parameters",
+                    hint="Only integer types (int, char) are supported for opl parameters",
                 )
             if param.param_type.base_type not in (BaseType.INT, BaseType.CHAR):
                 raise CSyntaxError(
-                    f"external procedure parameter '{param.name}' must be int or char type",
+                    f"opl procedure parameter '{param.name}' must be int or char type",
                     param.location,
                     hint="OPL only accepts integer parameters via QCode; "
                          "use int or char (char is promoted to int)",
                 )
 
         # =====================================================================
-        # Expect semicolon - external declarations have no body
+        # Expect semicolon - OPL declarations have no body
         # =====================================================================
         # The actual implementation exists in OPL code on the device.
         # This declaration just tells the C compiler that this name
-        # refers to an external OPL procedure.
+        # refers to an OPL procedure.
         self._expect(CTokenType.SEMICOLON, "';'")
 
         # =====================================================================
         # Create and return the FunctionNode
         # =====================================================================
-        # The is_external flag tells the code generator to emit QCode
+        # The is_opl flag tells the code generator to emit QCode
         # injection sequences instead of normal JSR instructions.
         # The return_type is set based on what the user declared:
         #   - void: return value ignored
@@ -702,10 +837,11 @@ class CParser:
             location=location,
             name=name,
             return_type=return_type,  # Use parsed return type (void or int)
-            parameters=parameters,    # Parameters for external call
+            parameters=parameters,    # Parameters for OPL call
             body=None,
-            is_forward_decl=False,    # Not a forward decl - it's an external decl
-            is_external=True,
+            is_forward_decl=False,    # Not a forward decl - it's an OPL decl
+            is_extern=False,
+            is_opl=True,
         )
 
     def _parse_typedef(self) -> None:
