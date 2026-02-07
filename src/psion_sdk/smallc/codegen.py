@@ -1572,7 +1572,9 @@ class CodeGenerator(ASTVisitor):
           X+3+N -> ret_low
           X+4+N -> param[0]
         """
-        size = var_type.size if var_type.size > 0 else 2
+        size = self._compute_type_size(var_type)
+        if size <= 0:
+            size = 2
 
         if is_param:
             # Parameters are handled separately in _generate_function
@@ -1714,10 +1716,10 @@ class CodeGenerator(ASTVisitor):
             )
             param_offset += param.param_type.size
 
-        # Add local variables to symbol table
+        # Add local variables to symbol table, generate initializers, then body
         if func.body:
             self._collect_locals(func.body)
-            # Generate body
+            self._generate_local_initializers(func.body)
             self._generate_block(func.body)
 
         # Function epilogue
@@ -1735,16 +1737,44 @@ class CodeGenerator(ASTVisitor):
         self._current_local_size = 0
 
     def _calculate_locals_size(self, block: BlockStatement) -> int:
-        """Calculate total size needed for local variables."""
+        """Calculate total size needed for local variables.
+
+        Uses _compute_type_size to get the full storage size, which correctly
+        handles arrays (e.g. char buf[20] = 20 bytes, not 2).
+        """
         total = 0
         for decl in block.declarations:
-            total += decl.var_type.size if decl.var_type.size > 0 else 2
+            size = self._compute_type_size(decl.var_type)
+            total += size if size > 0 else 2
         return total
 
     def _collect_locals(self, block: BlockStatement) -> None:
         """Add local variable declarations to symbol table."""
         for decl in block.declarations:
             self._add_local(decl.name, decl.var_type)
+
+    def _generate_local_initializers(self, block: BlockStatement) -> None:
+        """Generate initialization code for local variables with initializers.
+
+        Called after _collect_locals (so variables are in the symbol table)
+        and before _generate_block (so initializers run before statements).
+        Handles: int x = 5; char *p = "hello"; int y = foo(); etc.
+        """
+        for decl in block.declarations:
+            if decl.initializer is None:
+                continue
+            info = self._locals.get(decl.name)
+            if info is None:
+                continue
+            # Evaluate the initializer expression (result in D)
+            self._generate_expression(decl.initializer)
+            # Refresh frame pointer (expression eval may have corrupted X)
+            self._emit_instruction("TSX", "")
+            # Store to local: STAB for char scalars, STD for int/pointer
+            if info.sym_type.base_type == BaseType.CHAR and not info.sym_type.is_pointer and not info.sym_type.is_array:
+                self._emit_instruction("STAB", f"{info.offset},X")
+            else:
+                self._emit_instruction("STD", f"{info.offset},X")
 
     # =========================================================================
     # Statement Code Generation
@@ -2144,10 +2174,13 @@ class CodeGenerator(ASTVisitor):
                 self._emit_instruction("LDD", f"#_{expr.name}")
             else:
                 # Local array: compute address from frame pointer
-                # Address = X + offset
-                offset = info.offset
-                self._emit_instruction("XGDX", "")  # D = X (frame pointer)
-                self._emit_instruction("ADDD", f"#{offset}")  # D = X + offset
+                # TSX refreshes SP into X (X may have been corrupted by XGDX
+                # or other operations). Adjust offset for any args currently
+                # pushed on the stack, same pattern as address-of operator.
+                adjusted_offset = info.offset + self._arg_push_depth
+                self._emit_instruction("TSX", "")    # X = current SP
+                self._emit_instruction("XGDX", "")   # D = SP
+                self._emit_instruction("ADDD", f"#{adjusted_offset}")  # D = array address
             self._last_expr_size = 2  # Addresses are always 16-bit
         elif info.is_global:
             # Global scalar variable: direct addressing (load value)
@@ -2160,13 +2193,17 @@ class CodeGenerator(ASTVisitor):
                 self._last_expr_size = 2  # Int: full D register
         else:
             # Local scalar variable: indexed from X (load value)
-            offset = info.offset
+            # Refresh frame pointer — X may have been corrupted by XGDX
+            # (from local array access) or other operations. Adjust offset
+            # for any args currently pushed on the stack.
+            adjusted_offset = info.offset + self._arg_push_depth
+            self._emit_instruction("TSX", "")
             if info.sym_type.size == 1:
-                self._emit_instruction("LDAB", f"{offset},X")
+                self._emit_instruction("LDAB", f"{adjusted_offset},X")
                 self._emit_instruction("CLRA", "")
                 self._last_expr_size = 1  # Char: A=0, value in B
             else:
-                self._emit_instruction("LDD", f"{offset},X")
+                self._emit_instruction("LDD", f"{adjusted_offset},X")
                 self._last_expr_size = 2  # Int: full D register
 
     # =========================================================================

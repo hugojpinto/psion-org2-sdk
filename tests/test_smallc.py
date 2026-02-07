@@ -3104,3 +3104,584 @@ class TestStructErrors:
         """
         with pytest.raises(Exception):
             parse_source(source)
+
+
+# =============================================================================
+# Local Array Allocation Tests
+# =============================================================================
+
+def _count_des(asm: str) -> int:
+    """Count DES instructions in generated assembly (one DES = one byte allocated)."""
+    return sum(1 for line in asm.splitlines() if line.strip() == "DES")
+
+
+def _count_epilogue_ins(asm: str) -> int:
+    """Count INS instructions in the function epilogue (after PULX, before RTS)."""
+    lines = asm.splitlines()
+    count = 0
+    in_epilogue = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "PULX":
+            in_epilogue = True
+            count = 0
+        elif in_epilogue and stripped == "INS":
+            count += 1
+        elif in_epilogue and stripped == "RTS":
+            break
+    return count
+
+
+class TestLocalArrayAllocation:
+    """Tests for correct stack allocation of local arrays.
+
+    Bug fix: char buf[20] was only allocating 2 bytes (pointer size)
+    instead of the full 20 bytes needed for the array.
+    """
+
+    def test_char_array_allocates_full_size(self):
+        """char buf[20] should allocate 20 bytes on the stack."""
+        source = "void main() { char buf[20]; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert _count_des(asm) == 20
+        assert _count_epilogue_ins(asm) == 20
+
+    def test_int_array_allocates_full_size(self):
+        """int arr[10] should allocate 20 bytes (10 * 2) on the stack."""
+        source = "void main() { int arr[10]; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert _count_des(asm) == 20
+        assert _count_epilogue_ins(asm) == 20
+
+    def test_char_array_small(self):
+        """char buf[4] should allocate exactly 4 bytes."""
+        source = "void main() { char buf[4]; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert _count_des(asm) == 4
+        assert _count_epilogue_ins(asm) == 4
+
+    def test_int_scalar_still_allocates_2(self):
+        """int x should still allocate 2 bytes (regression check)."""
+        source = "void main() { int x; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert _count_des(asm) == 2
+        assert _count_epilogue_ins(asm) == 2
+
+    def test_char_scalar_allocates_1(self):
+        """char c should allocate 1 byte (regression check)."""
+        source = "void main() { char c; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert _count_des(asm) == 1
+        assert _count_epilogue_ins(asm) == 1
+
+    def test_pointer_allocates_2(self):
+        """char *p should allocate 2 bytes (pointer size, regression check)."""
+        source = "void main() { char *p; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert _count_des(asm) == 2
+        assert _count_epilogue_ins(asm) == 2
+
+    def test_mixed_array_and_scalar(self):
+        """Mixed locals should sum correctly: char buf[10] + int x = 12 bytes."""
+        source = "void main() { char buf[10]; int x; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert _count_des(asm) == 12
+        assert _count_epilogue_ins(asm) == 12
+
+    def test_multiple_arrays(self):
+        """Multiple arrays: char a[8] + char b[4] = 12 bytes."""
+        source = "void main() { char a[8]; char b[4]; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert _count_des(asm) == 12
+
+    def test_array_with_pointer(self):
+        """char buf[16] + char *p = 18 bytes."""
+        source = "void main() { char buf[16]; char *p; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert _count_des(asm) == 18
+
+    def test_no_locals_no_des(self):
+        """Function with no locals should not emit DES (regression check)."""
+        source = "void main() { }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert _count_des(asm) == 0
+
+
+# =============================================================================
+# Local Variable Initializer Tests
+# =============================================================================
+
+class TestLocalVariableInitializers:
+    """Tests for local variable initialization code generation.
+
+    Bug fix: initializers on local variable declarations (e.g. int x = 5;
+    or char *p = "hello";) were silently dropped — the parser stored them
+    but the code generator never emitted the initialization code.
+    """
+
+    def test_int_initializer(self):
+        """int x = 42 should generate LDD #42 then store to local offset."""
+        source = "void main() { int x = 42; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert "#42" in asm
+        # Should store to local at offset 2 (after saved X)
+        assert "STD     2,X" in asm
+
+    def test_char_pointer_initializer_string(self):
+        """char *msg = "Hello" should init msg with string address."""
+        source = 'void main() { char *msg = "Hello"; }'
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # String literal should be emitted
+        assert '"Hello"' in asm or "Hello" in asm
+        # Should load string address and store to msg
+        assert "LDD     #__S1" in asm
+        assert "STD     2,X" in asm
+
+    def test_char_initializer(self):
+        """char c = 65 should use STAB (single byte store)."""
+        source = "void main() { char c = 65; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert "STAB    2,X" in asm
+
+    def test_multiple_initializers(self):
+        """int a = 1, b = 2 should initialize both variables."""
+        source = "void main() { int a = 1; int b = 2; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert "#1" in asm
+        assert "#2" in asm
+        # a at offset 2, b at offset 4
+        assert "STD     2,X" in asm
+        assert "STD     4,X" in asm
+
+    def test_partial_initializers(self):
+        """int a = 10; int b; — only 'a' should get initialization code."""
+        source = "void main() { int a = 10; int b; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert "#10" in asm
+        assert "STD     2,X" in asm
+        # b (offset 4) should NOT have a store from initializer
+        # (it might appear from other code, so just verify init of 'a' works)
+
+    def test_expression_initializer(self):
+        """int x = 3 + 4 should evaluate the expression."""
+        source = "void main() { int x = 3 + 4; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Constant folding should produce 7
+        assert "#7" in asm
+        assert "STD     2,X" in asm
+
+    def test_zero_initializer(self):
+        """int x = 0 should generate initialization."""
+        source = "void main() { int x = 0; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # LDD #0 or CLRA/CLRB + store
+        assert "STD     2,X" in asm
+
+    def test_negative_initializer(self):
+        """int x = -1 should generate initialization with negative value."""
+        source = "void main() { int x = -1; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert "STD     2,X" in asm
+
+    def test_initializer_with_function_call(self):
+        """int x = foo() should call function and store result."""
+        source = "int foo(); void main() { int x = foo(); }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        assert "JSR     _foo" in asm
+        assert "STD     2,X" in asm
+
+    def test_no_initializer_no_store(self):
+        """int x; (no initializer) should not generate initialization code."""
+        source = "void main() { int x; }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should NOT have a store at offset 2 between prologue and epilogue
+        lines = asm.splitlines()
+        # Find the section between TSX (prologue end) and _main_exit
+        in_body = False
+        body_stores = []
+        for line in lines:
+            if "TSX" in line:
+                in_body = True
+                continue
+            if "_main_exit" in line:
+                break
+            if in_body and "STD" in line and "2,X" in line:
+                body_stores.append(line)
+        assert len(body_stores) == 0
+
+    def test_initializer_before_statements(self):
+        """Initializer code should run before the function's statements."""
+        source = """
+            int result;
+            void main() {
+                int x = 99;
+                result = x;
+            }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        lines = asm.splitlines()
+        # Find positions of the init store and the assignment to result
+        init_store_pos = None
+        result_store_pos = None
+        for i, line in enumerate(lines):
+            # Init store: first STD 2,X
+            if init_store_pos is None and "STD     2,X" in line:
+                init_store_pos = i
+            if "STD     _result" in line:
+                result_store_pos = i
+
+        assert init_store_pos is not None, "Init store not found"
+        assert result_store_pos is not None, "Result store not found"
+        assert init_store_pos < result_store_pos, "Init should come before statement"
+
+
+# =============================================================================
+# Integration: Martin's Bug Reports
+# =============================================================================
+
+class TestMartinBugReports:
+    """End-to-end tests for the specific patterns that Martin reported as broken.
+
+    Both cases produced garbage output before the fixes.
+    """
+
+    def test_char_pointer_to_string_literal(self):
+        """char *msg = "Hello"; print(msg) — Martin's case 1.
+
+        Before fix: msg was never initialized (LDD 2,X read garbage).
+        After fix: msg is set to __S1 address, print receives valid pointer.
+        """
+        source = '''
+            void main() {
+                char *msg = "Hello";
+                cls();
+                print(msg);
+                getkey();
+            }
+        '''
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # String literal must be emitted
+        assert "Hello" in asm
+        assert "__S1" in asm
+
+        # msg (at offset 2) must be initialized with string address
+        assert "LDD     #__S1" in asm
+        assert "STD     2,X" in asm
+
+        # print(msg) should load msg's value (the pointer)
+        assert "LDD     2,X" in asm
+        assert "JSR     _print" in asm
+
+    def test_char_array_with_strcpy(self):
+        """char msg[20]; strcpy(msg, "Hello"); print(msg) — Martin's case 2.
+
+        Before fix: only 2 bytes allocated for msg[20], strcpy corrupted stack.
+        After fix: 20 bytes allocated, strcpy has room.
+        """
+        source = '''
+            void main() {
+                char msg[20];
+                strcpy(msg, "Hello");
+                cls();
+                print(msg);
+                getkey();
+            }
+        '''
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Must allocate 20 bytes, not 2
+        assert _count_des(asm) == 20
+
+        # strcpy should be called
+        assert "JSR     _strcpy" in asm
+
+        # print should receive the array address
+        assert "JSR     _print" in asm
+
+    def test_string_literal_direct_still_works(self):
+        """print("Hello") should still work (regression check)."""
+        source = '''
+            void main() {
+                cls();
+                print("Hello");
+                getkey();
+            }
+        '''
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # No locals, no DES
+        assert _count_des(asm) == 0
+
+        # String literal loaded directly
+        assert "LDD     #__S1" in asm
+        assert "JSR     _print" in asm
+
+
+# =============================================================================
+# Frame Pointer Refresh Tests
+# =============================================================================
+
+class TestFramePointerRefresh:
+    """Tests for TSX frame pointer refresh before local variable access.
+
+    Bug fix: XGDX (used for local array address computation) corrupts X.
+    Subsequent local accesses (both array and scalar) must emit TSX to
+    refresh the frame pointer. Also adjusts offset by _arg_push_depth
+    when args are on the stack.
+    """
+
+    def test_local_array_emits_tsx_before_xgdx(self):
+        """Local array access should emit TSX before XGDX."""
+        source = "void main() { char buf[10]; print(buf); }"
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should see TSX then XGDX for the array address computation
+        lines = [l.strip() for l in asm.splitlines()]
+        found_tsx_xgdx = False
+        for i in range(len(lines) - 1):
+            if lines[i] == "TSX" and lines[i + 1] == "XGDX":
+                found_tsx_xgdx = True
+                break
+        assert found_tsx_xgdx, "Expected TSX before XGDX for local array"
+
+    def test_local_scalar_emits_tsx_before_load(self):
+        """Local scalar read should emit TSX before LDD offset,X."""
+        source = """
+            int result;
+            void main() {
+                int x = 5;
+                result = x;
+            }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # The read of x for `result = x` should be preceded by TSX
+        lines = [l.strip() for l in asm.splitlines()]
+        for i in range(len(lines) - 1):
+            if "LDD" in lines[i] and "2,X" in lines[i]:
+                # Check that TSX appears right before
+                assert lines[i - 1] == "TSX", \
+                    f"Expected TSX before 'LDD 2,X', got '{lines[i-1]}'"
+                break
+
+    def test_two_array_refs_both_get_tsx(self):
+        """Two references to a local array should both emit TSX.
+
+        This was the core of Martin's test2 bug: the second array ref
+        used a stale X from the first XGDX.
+        """
+        source = """
+            void main() {
+                char buf[20];
+                strcpy(buf, "hi");
+                print(buf);
+            }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Count TSX+XGDX pairs (one per array address computation)
+        lines = [l.strip() for l in asm.splitlines()]
+        tsx_xgdx_count = 0
+        for i in range(len(lines) - 1):
+            if lines[i] == "TSX" and lines[i + 1] == "XGDX":
+                tsx_xgdx_count += 1
+        assert tsx_xgdx_count >= 2, \
+            f"Expected at least 2 TSX+XGDX pairs, got {tsx_xgdx_count}"
+
+    def test_scalar_after_array_access(self):
+        """Scalar read after array ref should still work (TSX refreshes X).
+
+        Pattern: local array access corrupts X via XGDX, then scalar
+        read needs valid X for LDD offset,X.
+        """
+        source = """
+            int result;
+            void main() {
+                char buf[10];
+                int x = 42;
+                print(buf);
+                result = x;
+            }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Both print(buf) and result=x should compile without error
+        assert "JSR     _print" in asm
+        assert "STD     _result" in asm
+
+        # The read of x (for result = x) must have TSX before it
+        lines = [l.strip() for l in asm.splitlines()]
+        # Find the LDD that loads x (at offset 12: buf=10 bytes at offset 2, x=2 bytes at offset 12)
+        for i in range(len(lines) - 1):
+            if "LDD" in lines[i] and "12,X" in lines[i]:
+                assert lines[i - 1] == "TSX", \
+                    f"Expected TSX before loading x, got '{lines[i-1]}'"
+                break
+
+    def test_multiple_arrays_correct_addresses(self):
+        """Two different local arrays should compute correct distinct addresses."""
+        source = """
+            void main() {
+                char a[8];
+                char b[4];
+                print(a);
+                print(b);
+            }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # a is at offset 2, b is at offset 10 (2 + 8)
+        # Both should use TSX+XGDX+ADDD
+        assert "ADDD    #2" in asm    # address of a
+        assert "ADDD    #10" in asm   # address of b
+
+    def test_array_arg_push_depth_adjustment(self):
+        """When array address is computed while args are on the stack,
+        offset should be adjusted by push depth."""
+        source = """
+            void main() {
+                char buf[10];
+                foo(42, buf);
+            }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Args pushed R-to-L: buf first (push_depth=0), then 42 (push_depth=2)
+        # buf at offset 2 with push_depth=0 -> ADDD #2
+        assert "ADDD    #2" in asm
+
+    def test_char_read_emits_tsx(self):
+        """Local char variable read should also emit TSX."""
+        source = """
+            void main() {
+                char c = 65;
+                foo(c);
+            }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should see TSX before LDAB for the char read
+        lines = [l.strip() for l in asm.splitlines()]
+        for i in range(1, len(lines)):
+            if "LDAB" in lines[i] and "2,X" in lines[i]:
+                assert lines[i - 1] == "TSX", \
+                    f"Expected TSX before char read, got '{lines[i-1]}'"
+                break
+
+    def test_global_array_no_tsx_needed(self):
+        """Global array uses LDD #label, not XGDX — no TSX needed."""
+        source = """
+            char gbuf[20];
+            void main() { print(gbuf); }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should use immediate address, not XGDX
+        assert "LDD     #_gbuf" in asm
+        # XGDX should NOT appear for global array access
+        lines = asm.splitlines()
+        # Find the LDD #_gbuf line and check no XGDX nearby
+        for i, line in enumerate(lines):
+            if "LDD     #_gbuf" in line:
+                # Next line should be PSHB (pushing arg), not XGDX
+                assert "XGDX" not in lines[i + 1]
+                break
+
+    def test_global_scalar_no_tsx_needed(self):
+        """Global scalar uses direct addressing — no TSX needed."""
+        source = """
+            int gvar;
+            void main() { int x; x = gvar; }
+        """
+        ast = parse_source(source)
+        gen = CodeGenerator()
+        asm = gen.generate(ast)
+
+        # Should use direct addressing
+        assert "LDD     _gvar" in asm
